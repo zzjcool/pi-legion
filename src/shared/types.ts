@@ -1216,6 +1216,16 @@ export interface SubagentsSettings {
 	 * the whole block.
 	 */
 	crossMachine?: CrossMachineSettings;
+	/**
+	 * #445: at session start, re-attach the cross-machine children a PREVIOUS
+	 * session left running (so `status` lists them and their completion notice
+	 * arrives without a `recover` call). Default `true`; `false` disables the
+	 * whole pass and leaves the `recover` path exactly as it was.
+	 *
+	 * Parsed EXPLICITLY in `parseSubagentSettings` — that parser drops every key it
+	 * does not read, so leaving this out of the whitelist would silently ignore it.
+	 */
+	reattachLiveChildren?: boolean;
 }
 
 /**

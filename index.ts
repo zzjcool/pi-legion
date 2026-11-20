@@ -171,6 +171,15 @@ import {
 } from "./src/runs/remote-artifact.ts";
 import { findRecoveryLedgerForName, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
 import {
+	createReattachSettle,
+	formatReattachSummary,
+	pendingReattachNotice,
+	pendingReattachNotices,
+	reattachLogSink,
+	ReattachWatcher,
+	runReattachPass,
+} from "./src/runs/reattach.ts";
+import {
 	type AgentConfig,
 	type AgentScope,
 	type ChildRecord,
@@ -1965,6 +1974,108 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			console.error(`[pi-legion] storage sweep failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	};
+	// ── #445: re-attach the previous session's live cross-machine children ─────
+	//
+	// `subagent({action:"status"})` reads run.json, and a child left behind on
+	// another machine has a record in a state that still means "owed" — but nothing
+	// in a FRESH session watches it: no job, no collect, no completion notice. The
+	// only way back was `recover`, one child at a time, which the user is not
+	// supposed to need to know about.
+	//
+	// What runs here is deliberately NOT synchronous: `session_start` must never wait
+	// on another machine (#445 §4 — the pass has its own 5s budget, and a session
+	// that has to wait for a hung SSH is exactly the "startup is stuck" report this
+	// issue is not allowed to create). The pass runs on its own turn of the loop and
+	// reports through ONE `ui.notify` line; the per-child detail lands in the log.
+	let reattachWatcher: ReattachWatcher | undefined;
+	let reattachStarted = false;
+	const reattachNotice = (text: string): boolean => {
+		// The SAME live-channel delivery every other notice uses (#442 A): a captured
+		// `pi` is invalidated by session replacement, so the scope's current channel is
+		// resolved at delivery time and the `pi` of this load stays the last resort.
+		try {
+			const scope = noticeScopeOf(pi);
+			const outcome = deliverNotice({
+				scope,
+				owner: pi,
+				live: liveNoticeChannel(scope),
+				text,
+				fallback: (body) => sendNoticeMessage(pi, body),
+			});
+			return outcome.status === "delivered";
+		} catch {
+			return false;
+		}
+	};
+	const startReattach = (cwd: string, sessionFile: string | undefined, notify: ((text: string) => void) | undefined): void => {
+		if (reattachStarted) return;
+		reattachStarted = true;
+		void (async () => {
+			try {
+				const store = runStoreFor(cwd);
+				const settings = loadSubagentSettings({
+					userSettingsPath: path.join(getAgentDir(), "settings.json"),
+					projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+				});
+				const log = reattachLogSink(store.rootDir);
+				const report = await runReattachPass({ store, sessionFile, settings, log });
+				const summary = formatReattachSummary(report);
+				if (summary) {
+					// ONE line, and NOT the transcript (#445 §6) — the same channel the storage
+					// sweep uses, for the same reason.
+					notify?.(summary);
+				}
+				if (report.adopted.length > 0) {
+					reattachWatcher = new ReattachWatcher({
+						probe: createRemoteTerminalProbe({ crossMachine: settings.crossMachine }),
+						settle: createReattachSettle(settings.crossMachine),
+						notify: (notice) => reattachNotice(notice.content),
+						// #445: the record follows the ledger. `status` reads run.json, so a child
+						// that finished over there must stop claiming `working` HERE.
+						recordSettlement: async (target, recovery) => {
+							await store.updateChild(target.runId, target.name, (child) => {
+								child.state = "retired";
+								child.retiredAt ??= new Date(Date.now()).toISOString();
+								child.execution = recovery.execution;
+								child.acceptance = recovery.acceptance;
+								delete child.orphaned;
+							});
+						},
+						markNotified: async (target, at) => {
+							// #445 §7: write-once, and only after a delivered send.
+							await store.updateChild(target.runId, target.name, (child) => {
+								if (child.reattached) child.reattached.notifiedAt ??= at;
+							});
+						},
+						log,
+					});
+					for (const child of report.adopted) {
+						reattachWatcher.add({
+							runId: child.runId,
+							name: child.name,
+							host: child.host,
+							...(child.nodeId ? { nodeId: child.nodeId } : {}),
+							...(child.terminal ? { remoteTerminal: child.terminal } : {}),
+							ledgerDbPath: child.ledgerDbPath,
+						});
+					}
+					reattachWatcher.start();
+				}
+				// The latch's other half: a notice a previous session could not deliver is
+				// owed, not lost. Delivered here, then latched — once.
+				for (const entry of pendingReattachNotices(store)) {
+					if (!reattachNotice(pendingReattachNotice(entry).content)) continue;
+					const at = Date.now();
+					await store.updateChild(entry.runId, entry.name, (child) => {
+						if (child.reattached) child.reattached.notifiedAt ??= at;
+					});
+				}
+			} catch (error) {
+				// Re-attaching is a convenience: it may never take a session down.
+				console.error(`[pi-legion] reattach failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		})();
+	};
 	// `child-mcp-v1` D4: an in-process child now DOES receive `session_start`
 	// (`defaultSessionFactory` binds the session's extensions once, `child-session.ts`),
 	// so this handler is no longer dead for that transport. The guard is about
@@ -2002,6 +2113,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				timer,
 				notify: (text) => ctx.ui?.notify?.(text, "info"),
 			};
+		}
+		if (!isChild && !hasInjectedChildContext) {
+			// #445: root sessions only — a child session shares this cwd and must not adopt
+			// its parent's leftovers (two watchers, two notices).
+			startReattach(ctx.cwd, ctx.sessionManager?.getSessionFile?.(), (text) => {
+				try { ctx.ui?.notify?.(text, "info"); } catch { /* print mode has no UI */ }
+			});
 		}
 	});
 	const pendingUtilityRetires: Array<(opts?: RetireOptions) => Promise<void>> = [];
@@ -3080,6 +3198,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// answers `holdableChildren()` with `[]`, so this is the explicit half of the same
 		// promise rather than the only guard.)
 		settleHold.dispose();
+		// #445: the watcher is session-scoped. Nothing is written on the way out: the run
+		// record keeps `reattached` (the next session decides whether the child is still
+		// live) and the ledger row keeps running, exactly like any other leftover.
+		try { reattachWatcher?.stop(); } catch { /* a stopped watcher is not a verdict */ }
 		return shutdownRetireAll(event, ctx);
 	});
 }
