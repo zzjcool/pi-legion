@@ -22,7 +22,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -35,9 +35,9 @@ import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import { createRemoteTerminalProbe } from "../../src/runs/remote-artifact.ts";
 import {
 	createReattachSettle,
+	createRemoteLineCount,
 	formatReattachSummary,
 	pendingReattachNotices,
-	REATTACH_BUDGET_MS,
 	type ReattachReport,
 	ReattachWatcher,
 	runReattachPass,
@@ -426,17 +426,45 @@ test("#445 A3: a retired LEDGER row is neither adopted nor announced, even thoug
 	}
 });
 
-// ── acceptance 4: an unreachable machine is bounded ────────────────────────
+// ── acceptance 4: an unreachable machine is a reason, not a crash ──────────
 
-test("#445 A4: an unreachable machine costs ≤5s and a reason, and session start is never held", async () => {
+/**
+ * A core that ACCEPTS the handshake, then dies with our write end still open.
+ *
+ * This is what a crashing/slow `hc` looks like from this side: the NEXT frame is
+ * written into a pipe whose read end is already gone (`write EPIPE`). The old
+ * `exit 3` binary could produce the same fact, but only by winning a race against
+ * the first write — which is exactly how it took CI down once (#447: the test
+ * process died of an uncaught EPIPE instead of the machine being reported).
+ *
+ * Closing stdin BEFORE replying makes the race impossible: by the time the client
+ * sees `hello` answered, the next write is guaranteed to hit a dead pipe.
+ */
+function writeDyingCore(h: Harness): string {
+	const dying = path.join(h.root, "bin", "hc-dying");
+	writeFileSync(
+		dying,
+		[
+			"#!/bin/sh",
+			"IFS= read -r hello",
+			"exec 0<&-",
+			`printf '%s\\n' '{"jsonrpc":"2.0","id":1,"result":{}}'`,
+			"sleep 1",
+			"exit 3",
+			"",
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	chmodSync(dying, 0o755);
+	return dying;
+}
+
+test("#445 A4: an unreachable machine is a reason (never a crash), and its cost is bounded by the injected budget", async () => {
 	const h = harness("reattach-e2e-down-");
 	try {
 		await seedLeftover(h, { remoteTerminal: `${HOST}/lgl-gone` });
 		seedLedger(h, { terminal: `${HOST}/lgl-gone` });
-		// The core cannot be reached at all: a binary that is not a core.
-		const broken = path.join(h.root, "bin", "hc-broken");
-		writeFileSync(broken, "#!/bin/sh\nexit 3\n", { mode: 0o755 });
-		process.env.HC_BIN = broken;
+		process.env.HC_BIN = writeDyingCore(h);
 
 		const started = Date.now();
 		const report = await runReattachPass({
@@ -447,10 +475,33 @@ test("#445 A4: an unreachable machine costs ≤5s and a reason, and session star
 			log: () => {},
 		});
 		const elapsed = Date.now() - started;
-		assert.ok(elapsed < REATTACH_BUDGET_MS, `the pass took ${elapsed}ms, the budget is ${REATTACH_BUDGET_MS}ms`);
+		// NOT a budget assertion: the pass is not promised to finish inside 5s on a
+		// loaded CI box (and a wall clock is not evidence anyway). This is the "did not
+		// hang forever" backstop only; the bound itself is proven below with the clock.
+		assert.ok(elapsed < 30_000, `the pass did not return for ${elapsed}ms — a dead machine must not hang session start`);
+		// A dead pipe is a BUSINESS fact: the report comes back, the machine is named.
+		assert.equal(report.error, undefined, `the pass reported an error instead of a skip: ${report.error}`);
 		assert.equal(report.adopted.length, 0);
 		assert.match(report.skipped[0]!.reason, /no liveness evidence: host 'njbox' could not be asked/);
 		assert.equal(h.store.findChild(h.runId, NAME)!.state, "orphaned", "an unknown machine adopts nothing");
+
+		// "The whole pass is bounded" without a clock: a budget that is already spent
+		// DEFERS the candidate (and names the retry) instead of probing it. The injected
+		// clock advances on every read, so this is deterministic — no sleeping, no ≤5s.
+		let clock = 1_000;
+		const expired = await runReattachPass({
+			store: h.store,
+			sessionFile: h.newSession,
+			settings: { crossMachine: h.settings },
+			listMirrorOrphans: async () => [],
+			budgetMs: 1,
+			now: () => (clock += 10),
+			log: () => {},
+		});
+		assert.equal(expired.considered, 0, "a spent budget must not probe");
+		assert.equal(expired.deferred, 1, "a spent budget defers the leftover to the next start");
+		assert.equal(expired.adopted.length, 0);
+		assert.match(formatReattachSummary(expired) ?? "", /the next start retries/);
 	} finally {
 		h.cleanup();
 	}
@@ -458,7 +509,7 @@ test("#445 A4: an unreachable machine costs ≤5s and a reason, and session star
 
 // ── the growth-only candidate (no terminal address recorded) ────────────────
 
-test("#445: with no recorded terminal, a GROWING transcript on that machine is the evidence (real `file.read`)", async () => {
+test("#445: with no recorded terminal, a GROWING transcript on that machine is the evidence (real `file.read`, driven growth)", async () => {
 	const h = harness("reattach-e2e-growth-");
 	try {
 		const transcript = finishedTranscript("writing slowly");
@@ -467,27 +518,42 @@ test("#445: with no recorded terminal, a GROWING transcript on that machine is t
 		// No terminal address: the record predates `remote_terminal` (schema v4 records).
 		await seedLeftover(h, { state: "working", orphaned: undefined });
 		seedLedger(h);
-		// The child keeps writing while the pass samples twice.
-		let lines = transcript.split("\n").length;
-		const pump = setInterval(() => {
-			lines += 1;
-			writeFileSync(h.localSessionPath, `${transcript}${Array.from({ length: lines - transcript.split("\n").length + 1 }, (_, index) => `line-${index}\n`).join("")}`);
-		}, 60);
-		pump.unref();
-		try {
-			const report = await runReattachPass({
-				store: h.store,
-				sessionFile: h.newSession,
-				settings: { crossMachine: h.settings },
-				listMirrorOrphans: async () => [],
-				growthWaitMs: 400,
-				log: () => {},
-			});
-			assert.equal(report.adopted.length, 1, JSON.stringify(report.skipped));
-			assert.match(report.adopted[0]!.evidence, /transcript .* is growing \(\d+ → \d+ lines in 400ms\)/);
-		} finally {
-			clearInterval(pump);
-		}
+
+		// The REAL production counter against the REAL `file.read`: the evidence is a
+		// fact about the file on that machine, not a number this test made up. This one
+		// sample also fails loudly if the wire is down, instead of being swallowed into
+		// "first sample failed" (the #447 CI shape).
+		const remoteLines = createRemoteLineCount(h.settings);
+		const before = await remoteLines({ host: HOST, remotePath: h.remoteSessionPath });
+		assert.equal(typeof before, "number", `the machine must size its own transcript, got ${String(before)}`);
+
+		// GROWTH IS DRIVEN, NOT RACED. The old shape wrote from a 60ms interval and hoped
+		// the two samples landed around the writes; on CI the first sample could fail
+		// outright (and filesystem/clock granularity was never the point). Here the
+		// transcript gains exactly one line between sample 1 and sample 2 — both samples
+		// are still real `file.read` round trips.
+		const base = before as number;
+		let samples = 0;
+		const report = await runReattachPass({
+			store: h.store,
+			sessionFile: h.newSession,
+			settings: { crossMachine: h.settings },
+			listMirrorOrphans: async () => [],
+			growthWaitMs: 300,
+			remoteLines: async (request) => {
+				const lines = await remoteLines(request);
+				samples += 1;
+				if (samples === 1 && lines !== undefined) appendFileSync(h.localSessionPath, "line-added-between-samples\n");
+				return lines;
+			},
+			log: () => {},
+		});
+		assert.equal(samples, 2, "the growth decision reads two samples");
+		assert.equal(report.adopted.length, 1, JSON.stringify(report.skipped));
+		assert.deepEqual(
+			report.adopted[0]!.evidence,
+			`transcript ${h.remoteSessionPath} is growing (${base} → ${base + 1} lines in 300ms)`,
+		);
 	} finally {
 		h.cleanup();
 	}

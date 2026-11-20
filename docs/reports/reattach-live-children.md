@@ -172,12 +172,16 @@ A 还活着（真起一个 `node -e setTimeout` 进程，把它的 pid 写进 `o
 not announced`、记录原样保留、`formatReattachSummary = undefined`。单测里同样有三条
 （`ledgerGate` 直接红 / `retired` 行不被 probe / 关闭时零 wire）。
 
-### 4.4 A4 不可达（`integration:3xx` #445 A4）
+### 4.4 A4 不可达（`integration` #445 A4）
 
-`HC_BIN` 指向一个立刻 `exit 3` 的"核心" → pass `elapsed < 5000ms`，`skipped` 理由
-`no liveness evidence: host 'njbox' could not be asked …`，记录仍是 `orphaned`。
-单测另有一条：探测永不返回时按 `probeDeadlineMs` 收口（`did not answer within 120ms`），
-并断言 `elapsed <= REATTACH_BUDGET_MS`。
+`HC_BIN` 指向一个「接了握手、随后带着写端死掉」的假核心（`read hello` → `exec 0<&-` →
+回 reply → `sleep 1`）：客户端下一帧必然写进已经关闭的管道（`write EPIPE`）。断言的是**语义**，
+不是墙钟：pass 返回（不崩）、`report.error === undefined`、`adopted = 0`、理由
+`no liveness evidence: host 'njbox' could not be asked …`、记录仍是 `orphaned`；
+「整趟有界」用**注入时钟**验证——`budgetMs: 1` + 每次读都前进的 `now()` ⇒ `considered = 0`、
+`deferred = 1`、摘要含 `the next start retries`。真实耗时只留 `elapsed < 30s` 的
+「没有挂住」兜底。单测另有一条：探测永不返回时按 `probeDeadlineMs` 收口
+（`did not answer within 120ms`），并断言 `elapsed <= REATTACH_BUDGET_MS`。
 
 ### 4.5 变异（实际执行，非纸面）
 
@@ -191,8 +195,24 @@ not announced`、记录原样保留、`formatReattachSummary = undefined`。单�
 
 ### 4.6 额外覆盖
 
-- 无 terminal 地址的老记录（v4）：真 `file.read` 两次采样，transcript 增长 ⇒ 采纳，
-  evidence 是 `transcript … is growing (N → M lines in 400ms)`（`integration:4xx`）。
+- 无 terminal 地址的老记录（v4）：真 `file.read` 两次采样；增长由测试在两次采样之间**显式追加一行**
+  驱动（不再用 60ms interval 与采样赛跑），evidence 精确等于
+  `transcript … is growing (N → N+1 lines in 300ms)`。
+
+### 4.7 #447：CI 上那两条红（EPIPE 与竞态）
+
+同一个根因。假核心（`exit 3`）与第一次写赛跑赢了 ⇒ `child.stdin` 上触发 `EPIPE`；
+`HcCliClient` 没挂 `stdin` 的 `error` 监听 ⇒ `uncaughtException`（CI `not ok 114`）。
+node:test 在 uncaughtException 之后**不等上一条测试的 async body 结束**就开下一条；
+A4 的 `finally` 随后才恢复 `FAKE_HC_*`，把 115 的 remote root 覆盖回 A3 的（已删除）目录 ⇒
+115 的第一次 `file.read` 得到 `bad_path` ⇒ `first sample failed`（CI `not ok 115`）。
+
+改法：`src/hc/client.ts` 给 `child.stdin` 挂 `error` 监听（`onWriteError`：写 `exitReason`、
+拒绝全部 pending、kill 子进程），把 EPIPE 变成「连接已死」这条业务事实；A4 的假核心改成
+**确定性**死管道（先关 stdin 再回 reply，下一帧必 EPIPE）；115 的增长改成显式驱动。
+变异：去掉 `stdin` 监听 ⇒ A4 稳定红（uncaught EPIPE），新增的两条单测也红；把 A4 的断言换回
+`elapsed < REATTACH_BUDGET_MS` 并在一个「预算刚好用完但行为正确」的 pass 上跑
+（5004ms / 2 候选 / 各有理由）⇒ 旧断言红——墙钟断言本身就是这类 flake 的来源。
 - `no-run` 孤儿目录：只进 `mirrorOnly` + 摘要后缀，永不采纳（`integration:4xx`）。
 - 真 wire：断言 fake core 的请求日志里真的有 `terminal.get` 且地址是那个 terminal
   （防止"没连上也算绿"）。
