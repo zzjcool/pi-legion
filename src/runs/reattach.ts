@@ -67,6 +67,16 @@
  *      settles the row through `recoverCrossMachineChild` — the SAME grading and
  *      settle a `collect`/`recover` performs — and delivers ONE completion
  *      notice.
+ *
+ * #450 narrows nothing above; it widens only WHICH STORES this pass reads: the run
+ * store is per-cwd, so a leftover launched from `~/code/anotify` was invisible to a
+ * session started in `~/agents`. The pass now takes `stores` (discovery's order, the
+ * session store first, deduped by resolved rootDir) and reads every store's
+ * leftovers under the SAME one budget; adoption goes back through the store the
+ * candidate was read from, so two stores holding the same child name never
+ * cross-talk. Every candidate, adopted child and watcher target carries its
+ * `storeRoot` (identity = `(storeRoot, runId, name)`), and the one summary line
+ * names a foreign store only when the adoption actually reached into one.
  */
 
 import * as fs from "node:fs";
@@ -94,6 +104,7 @@ import {
 } from "./remote-artifact.ts";
 import { execResultText, normalizeHost, resolveReadTarget, type HcExecResult } from "./remote.ts";
 import { recoverCrossMachineChild, type CrossMachineRecovery } from "./remote-recover.ts";
+import { formatStoreLabel, STORE_DIR, storeCwdOf } from "./store-scan.ts";
 
 // ── frozen bounds (#445 §4) ─────────────────────────────────────────────────
 
@@ -175,6 +186,19 @@ declare module "../shared/types.ts" {
 export interface ReattachCandidate {
 	/** The run whose `run.json` holds the record. */
 	runId: string;
+	/**
+	 * #450: the store this record lives in (resolved `<cwd>/.pi-subagents`).
+	 *
+	 * Candidate identity is `(storeRoot, runId, name)`: the same name may be live in
+	 * two stores at once (`~/agents` and `~/code/anotify`), and adoption must go back
+	 * through the store whose record it read — never a global "the" store.
+	 */
+	storeRoot: string;
+	/**
+	 * #450: the cwd that store's launches share — `run.json`'s existing `cwd` when it
+	 * has one, `dirname(storeRoot)` otherwise. No new run.json field.
+	 */
+	storeCwd: string;
 	name: string;
 	host: string;
 	nodeId?: string;
@@ -200,6 +224,10 @@ export interface ReattachedChild {
 	name: string;
 	host: string;
 	runId: string;
+	/** #450: the store this child was adopted in (the watcher's identity, the summary's label). */
+	storeRoot: string;
+	/** #450: that store's launch cwd (see {@link ReattachCandidate.storeCwd}). */
+	storeCwd: string;
 	nodeId?: string;
 	terminal?: string;
 	/** The evidence sentence (`terminal 'hw-nj/t2' is live (working)`). */
@@ -218,6 +246,25 @@ export interface MirrorOnlyOrphan {
 	growing: boolean;
 }
 
+/**
+ * #450: what the store surface looked like for one pass — the numbers the log
+ * line quotes, and every store/dir discovery refused to look at with its reason.
+ *
+ * `skipped[].store` is a LABEL (`~/code/anotify`), the same spelling the log and
+ * the summary use; `dir` from discovery is a cwd, so the label is its store's.
+ */
+export interface ReattachStoreSurface {
+	/** Stores the pass merged in (the session store first), after dedupe. */
+	scanned: number;
+	/** How many of them actually held runs. */
+	withRuns: number;
+	/** Candidates discovered across every store, before the per-pass cap. */
+	candidates: number;
+	/** Discovery hit one of its own caps (`MAX_LOCAL_STORES` / `MAX_SCAN_DIRS`). */
+	truncated: boolean;
+	skipped: Array<{ store: string; reason: string }>;
+}
+
 export interface ReattachReport {
 	/** `subagents.reattachLiveChildren: false`. */
 	disabled: boolean;
@@ -226,6 +273,10 @@ export interface ReattachReport {
 	adopted: ReattachedChild[];
 	skipped: ReattachSkip[];
 	mirrorOnly: MirrorOnlyOrphan[];
+	/** #450: the session cwd store (`input.store`), resolved — the summary compares against it. */
+	sessionStoreRoot: string;
+	/** #450: the store surface this pass looked at. */
+	stores: ReattachStoreSurface;
 	/** Candidates never probed because the pass budget ran out ("the next start retries"). */
 	deferred: number;
 	elapsedMs: number;
@@ -238,12 +289,24 @@ export interface ReattachReport {
 // ── seams ───────────────────────────────────────────────────────────────────
 
 /**
+ * The run facts candidate discovery reads. Structural, so a test can hand in a
+ * plain object array (and a legacy `run.json` without `cwd` is expressible).
+ */
+export interface ReattachRun {
+	runId: string;
+	createdAt: string;
+	sessionFile?: string;
+	cwd?: string;
+	children: readonly ChildRecord[];
+}
+
+/**
  * The store surface this module needs, spelled structurally so a test can hand in
  * a directory without a supervisor (the same shape `remote-recover.ts` uses).
  */
 export interface ReattachStore {
 	readonly rootDir: string;
-	listRuns(): Array<{ runId: string; createdAt: string; sessionFile?: string; cwd?: string; children: readonly ChildRecord[] }>;
+	listRuns(): ReattachRun[];
 	runDir(runId: string): string;
 	updateChild?(
 		runId: string,
@@ -255,8 +318,32 @@ export interface ReattachStore {
 /** The line counter the growth fallback reads (`file.read limit: 0` → total lines). */
 export type RemoteLineCount = (request: { host: string; remotePath: string }) => Promise<number | undefined>;
 
+/**
+ * #450: the slice of discovery's stats the pass reports. `StoreScanStats` satisfies
+ * it as-is, so `startReattach` can pass `{ ...stats }` without a translation table.
+ */
+export interface ReattachStoreScan {
+	truncated: boolean;
+	scannedDirs: number;
+	skipped: Array<{ dir: string; reason: string }>;
+}
+
 export interface ReattachPassInput {
+	/** The session cwd store. Always looked at first (#450). */
 	store: ReattachStore;
+	/**
+	 * #450: further stores to look at, in order (discovery's own output). The pass
+	 * merges `[store, ...stores]`, deduped by resolved rootDir, and probes every
+	 * store's candidates under the SAME #445 bounds — one budget, not one per store.
+	 */
+	stores?: readonly ReattachStore[] | undefined;
+	/**
+	 * #450: what discovery did, so a bounded surface is REPORTED rather than
+	 * silently narrowed (`truncated` + one sentence per refused dir).
+	 */
+	storeScan?: ReattachStoreScan | undefined;
+	/** `$HOME` override for `store=` labels (tests, and a host where homedir lies). */
+	home?: string | undefined;
 	/** This process's session transcript. A run whose `sessionFile` matches is OURS, never a leftover. */
 	sessionFile?: string | undefined;
 	settings: Pick<SubagentsSettings, "crossMachine" | "reattachLiveChildren"> | undefined;
@@ -292,13 +379,60 @@ export function discoverReattachCandidates(
 	store: ReattachStore,
 	opts: { sessionFile?: string | undefined } = {},
 ): ReattachCandidate[] {
-	const own = opts.sessionFile !== undefined ? path.resolve(opts.sessionFile) : undefined;
-	const runs = [...store.listRuns()].sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
+	return candidatesFromRuns(store, store.listRuns(), opts);
+}
+
+/**
+ * #450: every store's leftovers, in STORE order (the caller's priority), newest run
+ * first INSIDE a store, deduped by resolved rootDir.
+ *
+ * No dedupe across stores: identity is `(storeRoot, runId, name)`, because the same
+ * name in two stores is two different children (`~/agents` and `~/code/anotify` can
+ * both be running `worker-0`) and collapsing them would settle or announce one of
+ * them twice.
+ */
+export function discoverReattachCandidatesAcrossStores(
+	stores: readonly ReattachStore[],
+	opts: { sessionFile?: string | undefined } = {},
+): ReattachCandidate[] {
 	const out: ReattachCandidate[] = [];
-	for (const run of runs) {
+	for (const store of dedupeStores(stores)) out.push(...discoverReattachCandidates(store, opts));
+	return out;
+}
+
+/** `[store, ...stores]` deduped by resolved rootDir, first spelling wins (order kept). */
+function dedupeStores(stores: readonly ReattachStore[]): ReattachStore[] {
+	const seen = new Set<string>();
+	const out: ReattachStore[] = [];
+	for (const store of stores) {
+		const key = path.resolve(store.rootDir);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(store);
+	}
+	return out;
+}
+
+/** The launch cwd of one run: `run.json`'s own `cwd`, else the store's directory. */
+function launchCwdOf(storeRoot: string, run: { cwd?: string | undefined }): string {
+	return typeof run.cwd === "string" && run.cwd.length > 0 ? run.cwd : storeCwdOf(storeRoot);
+}
+
+/** The one place candidates are built, so discovery and the pass read facts alike. */
+function candidatesFromRuns(
+	store: ReattachStore,
+	runs: readonly ReattachRun[],
+	opts: { sessionFile?: string | undefined },
+): ReattachCandidate[] {
+	const own = opts.sessionFile !== undefined ? path.resolve(opts.sessionFile) : undefined;
+	const storeRoot = path.resolve(store.rootDir);
+	const ordered = [...runs].sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
+	const out: ReattachCandidate[] = [];
+	for (const run of ordered) {
 		// Our own run is not a leftover: this session launched it and holds the jobs.
 		if (own !== undefined && typeof run.sessionFile === "string" && path.resolve(run.sessionFile) === own) continue;
 		const owner = readOwnerFile(path.join(store.runDir(run.runId), RUN_OWNER_FILE));
+		const storeCwd = launchCwdOf(storeRoot, run);
 		for (const child of run.children) {
 			if (!REATTACH_CANDIDATE_STATES.includes(child.state)) continue;
 			// A local child dies with its process; there is nothing to re-attach to.
@@ -307,6 +441,8 @@ export function discoverReattachCandidates(
 			if (host === undefined) continue;
 			out.push({
 				runId: run.runId,
+				storeRoot,
+				storeCwd,
 				name: child.name,
 				host,
 				...(child.nodeId ? { nodeId: child.nodeId } : {}),
@@ -404,7 +540,22 @@ export type LivenessVerdict =
 	| { live: true; evidence: string; terminal?: RemoteTerminalProbe }
 	| { live: false; reason: string; terminal?: RemoteTerminalProbe };
 
-function unansweredProbe(candidate: ReattachCandidate, reason: string): RemoteTerminalProbe {
+/**
+ * What a liveness probe needs: the address to ask about, and nothing about which
+ * store the record came from. Kept as its own shape so a caller (and a test) can
+ * probe a single address without inventing a store identity for it.
+ */
+export interface LivenessSubject {
+	runId: string;
+	name: string;
+	host: string;
+	/** Carried so a full candidate can be passed as-is; the probe itself does not read it. */
+	recordState?: string;
+	remoteDir?: string;
+	remoteTerminal?: string;
+}
+
+function unansweredProbe(candidate: LivenessSubject, reason: string): RemoteTerminalProbe {
 	return {
 		address: candidate.remoteTerminal ?? `${candidate.host}/${candidate.name}`,
 		state: "unknown",
@@ -429,7 +580,7 @@ function unansweredProbe(candidate: ReattachCandidate, reason: string): RemoteTe
  *    sample (`file.read limit: 0` returns the file's TOTAL line count).
  */
 export async function probeLiveness(
-	candidate: ReattachCandidate,
+	candidate: LivenessSubject,
 	opts: {
 		probeTerminal: (request: RemoteTerminalProbeRequest) => Promise<RemoteTerminalProbe>;
 		remoteLines: RemoteLineCount;
@@ -594,6 +745,10 @@ export async function adoptCandidate(
 		name: candidate.name,
 		host: candidate.host,
 		runId: candidate.runId,
+		// #450: the adopting store, so the watcher's key cannot collide with another
+		// store's same-named child and the summary can label a foreign adoption.
+		storeRoot: candidate.storeRoot,
+		storeCwd: candidate.storeCwd,
 		...(candidate.nodeId ? { nodeId: candidate.nodeId } : {}),
 		...(candidate.remoteTerminal ? { terminal: candidate.remoteTerminal } : {}),
 		evidence,
@@ -605,6 +760,11 @@ export async function adoptCandidate(
 
 /**
  * One session-start pass: discover, gate, probe, adopt — bounded, never throwing.
+ *
+ * #450: the same pass, over `[store, ...stores]` — the session cwd store first, then
+ * every store discovery found. ONE budget covers them all (a foreign store is not a
+ * second pass with its own 5s), and adoption goes back through the store the
+ * candidate was READ from, so two stores holding the same name never cross-talk.
  *
  * Every failure becomes a `skipped` entry with a sentence, so a broken machine, a
  * bad settings file or a locked ledger costs the session its leftovers and nothing
@@ -618,6 +778,7 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 	const deadline = startedAt + budgetMs;
 	const pid = input.pid ?? process.pid;
 	const log = input.log ?? reattachLogSink(input.store.rootDir);
+	const labelOf = (rootDir: string): string => formatStoreLabel(rootDir, { home: input.home });
 	const report: ReattachReport = {
 		disabled: input.settings?.reattachLiveChildren === false,
 		considered: 0,
@@ -627,6 +788,8 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 		deferred: 0,
 		elapsedMs: 0,
 		budgetMs,
+		sessionStoreRoot: path.resolve(input.store.rootDir),
+		stores: { scanned: 0, withRuns: 0, candidates: 0, truncated: input.storeScan?.truncated === true, skipped: [] },
 	};
 	if (report.disabled) {
 		log(`${new Date(startedAt).toISOString()} reattach disabled (subagents.${REATTACH_SETTING_KEY}: false)`);
@@ -639,7 +802,38 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 	const listOrphans = input.listMirrorOrphans ?? createMirrorOrphanLister(crossMachine);
 	const alive = input.alive ?? isPidAlive;
 	try {
-		const discovered = discoverReattachCandidates(input.store, { sessionFile: input.sessionFile });
+		// #450: the surface is every store discovery handed over, the session store
+		// first, deduped by resolved rootDir. Each candidate keeps the store it came
+		// from, so adoption/gating writes back into THAT store's run dir.
+		const stores = dedupeStores([input.store, ...(input.stores ?? [])]);
+		const storeByRoot = new Map<string, ReattachStore>();
+		const discovered: ReattachCandidate[] = [];
+		report.stores.scanned = stores.length;
+		// What discovery refused to look at is reported verbatim: a bounded surface must
+		// say so, or "no leftovers" would be a lie about a store we never read.
+		for (const skipped of input.storeScan?.skipped ?? []) {
+			report.stores.skipped.push({ store: labelOf(path.join(skipped.dir, STORE_DIR)), reason: skipped.reason });
+		}
+		for (const store of stores) {
+			const rootDir = path.resolve(store.rootDir);
+			storeByRoot.set(rootDir, store);
+			let runs: ReattachRun[];
+			try {
+				runs = store.listRuns();
+			} catch (error) {
+				// One unreadable store must not cost the session the others: a sentence, not a
+				// thrown pass.
+				report.stores.skipped.push({ store: labelOf(rootDir), reason: `its runs could not be listed (${messageOf(error)})` });
+				continue;
+			}
+			if (runs.length > 0) report.stores.withRuns += 1;
+			discovered.push(...candidatesFromRuns(store, runs, { sessionFile: input.sessionFile }));
+		}
+		report.stores.candidates = discovered.length;
+		log(`${new Date(now()).toISOString()} reattach stores=${report.stores.scanned} withRuns=${report.stores.withRuns} candidates=${report.stores.candidates} scannedDirs=${input.storeScan?.scannedDirs ?? 0} truncated=${String(report.stores.truncated)}`);
+		for (const skipped of report.stores.skipped) {
+			log(`${new Date(now()).toISOString()} skipped store ${skipped.store}: ${skipped.reason}`);
+		}
 		const considered = discovered.slice(0, input.maxCandidates ?? REATTACH_MAX_CANDIDATES);
 		report.deferred = Math.max(0, discovered.length - considered.length);
 		const reachedHosts = new Set<string>();
@@ -648,16 +842,19 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 				report.deferred += 1;
 				continue;
 			}
+			// The store whose record this candidate was read from — never "the" store.
+			const store = storeByRoot.get(candidate.storeRoot) ?? input.store;
+			const storeLabel = labelOf(candidate.storeRoot);
 			const owned = ownerGate(candidate, { pid, alive });
 			if (owned !== undefined) {
 				report.skipped.push(owned);
-				log(skipLine(now(), candidate, owned.reason));
+				log(skipLine(now(), candidate, owned.reason, storeLabel));
 				continue;
 			}
-			const ledger = ledgerGate(candidate, { runDir: input.store.runDir(candidate.runId) });
+			const ledger = ledgerGate(candidate, { runDir: store.runDir(candidate.runId) });
 			if ("skip" in ledger) {
 				report.skipped.push(ledger.skip);
-				log(skipLine(now(), candidate, ledger.skip.reason));
+				log(skipLine(now(), candidate, ledger.skip.reason, storeLabel));
 				continue;
 			}
 			report.considered += 1;
@@ -670,18 +867,18 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 			});
 			if (!verdict.live) {
 				report.skipped.push({ name: candidate.name, host: candidate.host, reason: verdict.reason });
-				log(skipLine(now(), candidate, verdict.reason));
+				log(skipLine(now(), candidate, verdict.reason, storeLabel));
 				if (verdict.terminal?.unreachable === undefined) reachedHosts.add(candidate.host);
 				continue;
 			}
 			reachedHosts.add(candidate.host);
 			try {
-				const adopted = await adoptCandidate(candidate, verdict.evidence, { store: input.store, sessionFile: input.sessionFile, now, pid });
+				const adopted = await adoptCandidate(candidate, verdict.evidence, { store, sessionFile: input.sessionFile, now, pid });
 				report.adopted.push(adopted);
-				log(`${new Date(now()).toISOString()} adopted ${candidate.name} run=${candidate.runId} host=${candidate.host} node=${candidate.nodeId ?? "(none)"} evidence=${JSON.stringify(verdict.evidence)}`);
+				log(`${new Date(now()).toISOString()} adopted ${candidate.name} run=${candidate.runId} host=${candidate.host} node=${candidate.nodeId ?? "(none)"} store=${storeLabel} evidence=${JSON.stringify(verdict.evidence)}`);
 			} catch (error) {
 				report.skipped.push({ name: candidate.name, host: candidate.host, reason: `adoption failed (${messageOf(error)})` });
-				log(skipLine(now(), candidate, `adoption failed (${messageOf(error)})`));
+				log(skipLine(now(), candidate, `adoption failed (${messageOf(error)})`, storeLabel));
 			}
 		}
 		// Mirror-only orphans: no record and no row, so they cannot be adopted — but a
@@ -732,18 +929,39 @@ async function transcriptGrowing(
 	return first !== undefined && second !== undefined && second > first;
 }
 
-function skipLine(at: number, candidate: ReattachCandidate, reason: string): string {
-	return `${new Date(at).toISOString()} skipped ${candidate.name} run=${candidate.runId} host=${candidate.host} record=${candidate.recordState}: ${reason}`;
+function skipLine(at: number, candidate: ReattachCandidate, reason: string, storeLabel: string): string {
+	return `${new Date(at).toISOString()} skipped ${candidate.name} run=${candidate.runId} host=${candidate.host} store=${storeLabel} record=${candidate.recordState}: ${reason}`;
 }
 
-/** `legion: reattached 2 live children (a, b)` — the ONLY line the session sees (#445 §6). */
-export function formatReattachSummary(report: ReattachReport): string | undefined {
+/**
+ * `legion: reattached 2 live children (a, b)` — the ONLY line the session sees (#445 §6).
+ *
+ * #450: still ONE line. An adoption that came entirely from the session cwd store
+ * keeps the #445 text byte-for-byte (a user who works in one repo sees no new
+ * noise); an adoption that reached into another store names it, in adoption order
+ * and deduped, so "where did this child come from" is answerable from the line —
+ * before the `; ` mirrorOnly/deferred suffixes.
+ */
+export function formatReattachSummary(report: ReattachReport, opts: { home?: string | undefined } = {}): string | undefined {
 	if (report.adopted.length === 0 && report.mirrorOnly.length === 0 && report.deferred === 0) return undefined;
 	const names = report.adopted.map((child) => child.name);
 	const parts: string[] = [];
 	if (names.length > 0) {
 		const noun = names.length === 1 ? "child" : "children";
-		parts.push(`legion: reattached ${names.length} live ${noun} (${names.join(", ")})`);
+		const foreignStores: string[] = [];
+		for (const child of report.adopted) {
+			// Resolved spelling: the same store reached through two paths is ONE store, so
+			// a same-store adoption can never grow a `— store` suffix by accident.
+			if (path.resolve(child.storeRoot) === path.resolve(report.sessionStoreRoot)) continue;
+			const label = formatStoreLabel(child.storeRoot, { home: opts.home });
+			if (!foreignStores.includes(label)) foreignStores.push(label);
+		}
+		const where = foreignStores.length === 0
+			? ""
+			: foreignStores.length === 1
+				? ` — store ${foreignStores[0]}`
+				: ` — stores ${foreignStores.join(", ")}`;
+		parts.push(`legion: reattached ${names.length} live ${noun} (${names.join(", ")})${where}`);
 	}
 	if (report.mirrorOnly.length > 0) {
 		const hosts = [...new Set(report.mirrorOnly.map((entry) => entry.host))];
@@ -793,6 +1011,10 @@ function trimLog(file: string): void {
 
 /** One child the watcher is responsible for (the adoption's persisted identity). */
 export interface ReattachWatchTarget {
+	/** #450: the store the child was adopted in — part of its identity (see {@link ReattachWatcher.add}). */
+	storeRoot?: string;
+	/** #450: that store's launch cwd (display/diagnostic only). */
+	storeCwd?: string;
 	runId: string;
 	name: string;
 	host: string;
@@ -853,8 +1075,20 @@ export class ReattachWatcher {
 	}
 
 	add(target: ReattachWatchTarget): void {
-		this.targets.set(`${target.runId}\u0000${target.name}`, { target, strikes: 0, settling: false });
+		this.targets.set(this.keyOf(target), { target, strikes: 0, settling: false });
 		this.deps.log(`${new Date(this.now()).toISOString()} watching ${target.name} run=${target.runId} host=${target.host} terminal=${target.remoteTerminal ?? "(none)"}`);
+	}
+
+	/**
+	 * #450: a child's identity is `(storeRoot, runId, name)`.
+	 *
+	 * The run store is per-cwd, so `~/agents` and `~/code/anotify` can each hold a
+	 * `worker-0` (and a run id is only unique inside its own store). Keying on
+	 * run/name alone would make the second `add` overwrite the first: one child
+	 * silently watched twice, the other never settled and never announced.
+	 */
+	private keyOf(target: ReattachWatchTarget): string {
+		return `${target.storeRoot ?? ""}\u0000${target.runId}\u0000${target.name}`;
 	}
 
 	/** The children still being watched, in adoption order. */
@@ -918,7 +1152,7 @@ export class ReattachWatcher {
 				// `unknown ≠ live`: after repeated silence the record keeps its facts (the
 				// next session may find the machine back) and this session stops guessing.
 				this.deps.log(`${new Date(now).toISOString()} stopped watching ${target.name}: ${entry.strikes} unanswered probes`);
-				this.targets.delete(`${target.runId}\u0000${target.name}`);
+				this.targets.delete(this.keyOf(target));
 			}
 			return;
 		}
@@ -935,12 +1169,12 @@ export class ReattachWatcher {
 				this.deps.log(`${new Date(now).toISOString()} ${target.name}: not settled (${outcome.kind}${outcome.reason ? `: ${outcome.reason}` : ""}); strike ${entry.strikes}/${maxStrikes}`);
 				if (entry.strikes >= maxStrikes) {
 					this.deps.log(`${new Date(now).toISOString()} stopped watching ${target.name}: ${outcome.kind} on ${entry.strikes} consecutive probes`);
-					this.targets.delete(`${target.runId}\u0000${target.name}`);
+					this.targets.delete(this.keyOf(target));
 				}
 				return;
 			}
 			const recovery = outcome.recovery;
-			const key = `${target.runId}\u0000${target.name}`;
+			const key = this.keyOf(target);
 			if (recovery === undefined) {
 				this.targets.delete(key);
 				return;
@@ -1089,6 +1323,14 @@ export interface PendingReattachNotice {
 	runId: string;
 	name: string;
 	child: ChildRecord;
+	/**
+	 * #450: the store this record lives in. The latch (`reattached.notifiedAt`) is
+	 * written THERE — a pending notice from `~/code/anotify` must never be stamped
+	 * into the session's own store, which would leave it owed forever over there.
+	 */
+	storeRoot: string;
+	/** #450: that store's launch cwd (see {@link ReattachCandidate.storeCwd}). */
+	storeCwd: string;
 }
 
 /**
@@ -1098,20 +1340,32 @@ export interface PendingReattachNotice {
  * A child still working owes nothing (its watcher announces it when the program
  * ends). A record with `notifiedAt` owes nothing. Everything else — adopted, has a
  * terminal execution, no latch — is a notice a previous session failed to deliver.
+ *
+ * #450: `stores` takes ONE store or a list; the list is deduped by resolved rootDir
+ * and kept in order, so a caller can pass the discovered surface as-is and a store
+ * reached twice owes its notice once.
  */
 export function pendingReattachNotices(
-	store: ReattachStore,
+	stores: ReattachStore | readonly ReattachStore[],
 	opts: { limit?: number } = {},
 ): PendingReattachNotice[] {
+	const surface: readonly ReattachStore[] = Array.isArray(stores)
+		? (stores as readonly ReattachStore[])
+		: [stores as ReattachStore];
+	const limit = opts.limit ?? 5;
 	const out: PendingReattachNotice[] = [];
-	for (const run of store.listRuns()) {
-		for (const child of run.children) {
-			if (child.reattached === undefined) continue;
-			if (alreadyNotified(child)) continue;
-			const status = child.execution?.status;
-			if (status === undefined || status === "running" || status === "unknown") continue;
-			out.push({ runId: run.runId, name: child.name, child });
-			if (out.length >= (opts.limit ?? 5)) return out;
+	for (const store of dedupeStores(surface)) {
+		const storeRoot = path.resolve(store.rootDir);
+		for (const run of store.listRuns()) {
+			const storeCwd = launchCwdOf(storeRoot, run);
+			for (const child of run.children) {
+				if (child.reattached === undefined) continue;
+				if (alreadyNotified(child)) continue;
+				const status = child.execution?.status;
+				if (status === undefined || status === "running" || status === "unknown") continue;
+				out.push({ runId: run.runId, name: child.name, child, storeRoot, storeCwd });
+				if (out.length >= limit) return out;
+			}
 		}
 	}
 	return out;

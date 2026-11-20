@@ -625,6 +625,15 @@ export interface LiveChildStatusInput {
 	 * `accumulateUsage` source of truth the widget reads.
 	 */
 	contextTokens?: number;
+	/**
+	 * #450: which run store this record lives in (`store=<label>`), when it is NOT the
+	 * session's own store. A child record is keyed by `(store, name)`, so a name alone
+	 * cannot tell a reader where to look; the line names the directory instead.
+	 *
+	 * Absent for every child of the session's own store (and for every caller that does
+	 * not do a cross-store scan), which keeps every pre-#450 block byte-identical.
+	 */
+	store?: string;
 	now?: number;
 }
 
@@ -883,6 +892,10 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const memory = memoryLine(input);
 	if (memory) lines.push(memory);
 	lines.push(...meta);
+	// #450: which store the record came from — right after the `session=` meta line it
+	// qualifies (both are path facts about the same record). One line, and only when the
+	// caller scanned more than one store: a same-store child grows no line at all.
+	if (input.store !== undefined) lines.push(`store=${input.store}`);
 	if (stale) {
 		const persistedExecution = input.execution
 			? `execution=${input.execution.status}${input.execution.reason ? ` (${input.execution.reason})` : ""}`
