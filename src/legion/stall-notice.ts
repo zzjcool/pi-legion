@@ -6,8 +6,21 @@
  * ```
  * L1 (silence) : in-flight stack empty  AND  now - lastEventAt >= silenceNoticeMs
  * L1, stack non-empty : never reported (D1)
- * L2 (long)    : now - loopBaseAt       >= loopRadiusMs
+ * L2 (long)    : now - loopBaseAt >= loopRadiusMs
+ *                AND nothing is in flight                     (#441-C)
+ *                AND, when this host cannot see tools, the transcript did NOT grow
+ *                    inside the window; no growth evidence ⇒ unknown ≠ stalled (#441-B)
  * ```
+ *
+ * **#441 rewrote what L2 is allowed to mean.** Before it, L2's only input was the
+ * clock, so "the child has been running for longer than the radius" was reported
+ * as "it may be looping" no matter what the child was doing — and on a big task
+ * that is true by construction. Measured on 2026-08 (10+ false notices in a day):
+ * a `hub`-hosted child compiling at CPU 27% / 80 °C, a local child blocked in
+ * `gh pr checks --watch` for 16 minutes, another rebasing at CPU 49% / 95 °C, and
+ * a remote child whose `session.jsonl` was being written 23 s AFTER its notice.
+ * The composition above is the rule that keeps L2 an *anomaly* detector: the
+ * clock only opens the question, the two facts answer it.
  *
  * Nothing here reads a clock, touches SQLite, or calls a supervisor: the caller
  * passes `now` and the facts it folded, and gets a decision back. That is what
@@ -61,13 +74,40 @@ export type StallNoticeKind = "silence" | "long-running";
  * `lastEventAt` is the host-clock reading of that child's last coarse event (D2)
  * and is optional on purpose: a supervisor that cannot answer it has no fact, and
  * "no fact" must not become an L1 notice. `inFlightTool` is the innermost frame of
- * the in-flight stack; `undefined` means the stack is empty.
+ * the in-flight stack; `undefined` means the stack is empty — but ONLY when the
+ * backend can observe tools at all, which is what `toolObservationUnavailable`
+ * separates (#441-B): `undefined` from a backend that never sees tool events is
+ * "no fact", not "nothing is running".
  */
 export interface StallChildFacts {
 	readonly name: string;
 	readonly lastEventAt?: number;
 	readonly inFlightTool?: string;
 	readonly inFlightToolStartedAt?: number;
+	/**
+	 * #441-B: this backend observes no tool events (a cross-machine child, or any
+	 * child on the `hc` terminal backend — `routing-supervisor` D12), so an absent
+	 * `inFlightTool` carries no information. L2 may then only be judged by
+	 * {@link programState} + {@link lastSessionGrowthAt}; with neither, unknown.
+	 */
+	readonly toolObservationUnavailable?: boolean;
+	/**
+	 * #441-B/C: the child's own container status word (the 7501 program status the
+	 * `hc` terminal reports: `working`, `idle`, `blocked`, `done`, …), read on demand.
+	 *
+	 * This is the fact a human reads off the child's terminal — "is it working or is
+	 * it sitting at a prompt" — and it is the ONLY tool-activity evidence a
+	 * tool-blind backend can offer. `working` means a tool (or a generation) is in
+	 * flight, so the child is working, never stalled.
+	 */
+	readonly programState?: string;
+	/**
+	 * #441-B: ms epoch of the last observed growth of this child's transcript, or
+	 * `undefined` when this host has no such evidence (mirror off, no session file,
+	 * pump never wrote a row). Only consulted for a tool-blind backend, and absence
+	 * means `unknown` — which is NOT `stalled`, so it never becomes a notice.
+	 */
+	readonly lastSessionGrowthAt?: number;
 }
 
 /** Both thresholds are "off" when they are absent, non-finite, or `<= 0` (D6). */
@@ -133,9 +173,15 @@ export interface StallAnnouncement {
 	readonly sequence: number;
 	readonly elapsedMs: number;
 	readonly thresholdMs: number;
-	/** L2 only, and only when the child is inside a tool: the evidence (D1). */
-	readonly inFlightTool?: string;
-	readonly inFlightMs?: number;
+	/**
+	 * L2 only: the container's own status word when this host could read it
+	 * (#441-B/C), e.g. `idle` — the fact the line quotes instead of the old
+	 * "inside `bash` for 38m" evidence. `undefined` = the observing backend did not
+	 * answer (a local child: the empty stack was the determination).
+	 */
+	readonly programState?: string;
+	/** L2 only, tool-blind child only: how long its transcript has been stalled (#441-B). */
+	readonly sessionGrowthIdleMs?: number;
 }
 
 /**
@@ -204,13 +250,35 @@ function longRunningAnnouncement(input: {
 	if (!Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
+	// #441-C: a child the container can SEE inside a command is WORKING, and "it has
+	// been running for 45 minutes" is then a description of the work, not an anomaly.
+	// The measured case: a worker blocked in `gh pr checks --watch` for 16 minutes,
+	// producing no session bytes — reported as a stall on every boundary.
+	if (child.inFlightTool !== undefined) return undefined;
+	// #441-B: the composition. A tool-blind backend cannot answer "is something in
+	// flight", so the empty stack above is not evidence of anything; the container's
+	// own status word is. `working` there is the same "it is working" fact as a stack
+	// frame (a terminal-hosted centurion compiles for 20 minutes with no session
+	// writes). With no status word either, this host has no view of the child at all:
+	// not decidable ⇒ no notice.
+	const programState = typeof child.programState === "string" ? child.programState.trim().toLowerCase() : "";
+	const toolBlind = child.toolObservationUnavailable === true;
+	const containerIdle = programState.length > 0 ? programState !== "working" : !toolBlind;
+	if (!containerIdle) return undefined;
+	// #441-B: the growth half of the composition, and ONLY for a tool-blind child.
+	// A growing transcript is proof of life no clock can argue with; a missing
+	// growth fact is `unknown`, and `unknown ≠ stalled`.
+	if (toolBlind) {
+		const growthAt = child.lastSessionGrowthAt;
+		if (growthAt === undefined || !Number.isFinite(growthAt)) return undefined;
+		if (!(now - growthAt >= thresholdMs)) return undefined;
+	}
 	// #413: one line per crossed boundary — see `crossedTier`. The cap below is the
 	// other half of D6 and stays: three boundaries, then silence until `extend`.
 	const tier = crossedTier(elapsedMs, thresholdMs);
 	if (tier <= window.longRunning.tier) return undefined;
 	const sequence = window.longRunning.count + 1;
 	if (sequence > LONG_RUNNING_NOTICE_LIMIT) return undefined;
-	const inFlightMs = child.inFlightTool === undefined ? undefined : now - (child.inFlightToolStartedAt ?? Number.NaN);
 	return {
 		kind: "long-running",
 		childName: child.name,
@@ -219,8 +287,10 @@ function longRunningAnnouncement(input: {
 		sequence,
 		elapsedMs,
 		thresholdMs,
-		...(child.inFlightTool === undefined ? {} : { inFlightTool: child.inFlightTool }),
-		...(inFlightMs !== undefined && Number.isFinite(inFlightMs) && inFlightMs >= 0 ? { inFlightMs } : {}),
+		...(programState.length > 0 ? { programState } : {}),
+		...(toolBlind && child.lastSessionGrowthAt !== undefined
+			? { sessionGrowthIdleMs: now - child.lastSessionGrowthAt }
+			: {}),
 	};
 }
 
@@ -373,9 +443,21 @@ function silenceLine(announcement: StallAnnouncement): string {
 	return `- ${announcement.childName}: no event for ${formatStallDuration(announcement.elapsedMs)} with nothing in flight (threshold ${formatStallDuration(announcement.thresholdMs)}). The child is not inside a turn, so steer cannot land here; abort can.`;
 }
 
+/**
+ * L2's line: the age, then the two facts that made it an anomaly (#441).
+ *
+ * The old sentence said `with no tool in flight` even for a backend that cannot
+ * see tools at all — a claim this host had no way to make, printed for every
+ * cross-machine child. The wording now says exactly what was measured: either an
+ * empty in-flight stack (`nothing in flight`), the container's own idle word, or
+ * (tool-blind) the stalled transcript. A growing child never reaches this line.
+ */
 function longRunningLine(announcement: StallAnnouncement): string {
-	const evidence = announcement.inFlightTool === undefined
-		? "with no tool in flight"
-		: `inside \`${announcement.inFlightTool}\`${announcement.inFlightMs === undefined ? "" : ` for ${formatStallDuration(announcement.inFlightMs)}`}`;
-	return `- ${announcement.childName}: running for ${formatStallDuration(announcement.elapsedMs)} (threshold ${formatStallDuration(announcement.thresholdMs)}), ${evidence}. It may be looping — check its actual execution context; steer reaches a child at a turn boundary.`;
+	const container = announcement.programState === undefined
+		? "nothing in flight"
+		: `nothing in flight, container status \`${announcement.programState}\``;
+	const growth = announcement.sessionGrowthIdleMs === undefined
+		? ""
+		: ` and its transcript has not grown for ${formatStallDuration(announcement.sessionGrowthIdleMs)}`;
+	return `- ${announcement.childName}: running for ${formatStallDuration(announcement.elapsedMs)} (threshold ${formatStallDuration(announcement.thresholdMs)}), ${container}${growth}. It may be looping — check its actual execution context; steer reaches a child at a turn boundary.`;
 }

@@ -31,6 +31,22 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 **测试**：单测 2866（trunk 2855，+11，全部为新增能力），集成 193/193，typecheck 绿。
 报告：`docs/reports/notice-delivery.md`。
 
+## [Unreleased] — 待发（patch）
+
+**`#441`：stall 告警不再给已退休的 child 发「跑了 1h45m」，也不再跨机恒真。** 今天 10+ 封误报的两个根因：
+(a) 候选集只看 ledger 行，而 `run.json` 早已 `state=retired`（行要等父 collect 才动），于是退役 1h23m 后还在
+报、还会被 `extend` 续命；(b) 跨机/终端后端的 child 本地看不到任何工具事件，`inFlightTool === undefined`
+**恒真**，"异常"于是退化成"跑得久"，而跑得久在大任务上必然成立。现在：
+
+- **候选集**加一条硬闸：ledger 终态 **或** `run.json` 终态（`state`/`execution.status`）⇒ 永不出 stall
+  通知、`extend` 直接拒绝（`child-ended`）。来源二选一即可，缺证据不算终态。
+- **L2 改成组合判据**：`越过阈值 ∧ 没有工具在飞 ∧（跨机/终端后端时）transcript 在窗口内无增长`。
+  拿不到增长证据 ⇒ `unknown ≠ stalled`，不告警；`working` 的容器（正在编译/正在 `gh pr checks --watch`）
+  一律算 working。本地 inprocess/rpc child 的 in-flight 栈是 sharper fact，不额外要求增长证据。
+- 新增 supervisor 只读成员 `observesToolEvents` / `programState`（`terminal.get` 的 7501 状态词，按需一次，
+  仅在阈值已越过时问），`TerminalSupervisor` 实现前者为 `false`、后者读真终端。
+- 报告：`docs/reports/stall-candidates.md`；合同：`docs/contracts/stall-candidate-filters-v1.md`。
+
 ## [Unreleased] — 6.2.5（patch）
 
 **`#411`：跨机 child 的 transcript 不再实时镜像。** 跨机 child 的 `sessionFile` 是本机预先创建的

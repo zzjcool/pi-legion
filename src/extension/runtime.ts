@@ -62,7 +62,11 @@ import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
-import { liveMirrorStatePathFor, type LiveMirrorFacts } from "../runs/live-mirror.ts";
+import { readMirrorFacts, type LiveMirrorFacts } from "../runs/live-mirror.ts";
+/** #441-B: re-exported so the pre-existing importers (`readMirrorFacts(...)` in the
+ * status path and its tests) keep one spelling of the parser; the implementation
+ * moved to `runs/live-mirror.ts` because the stall detector reads it too. */
+export { readMirrorFacts };
 import { listArtifacts, markNotified, undelivered } from "../legion/ledger.ts";
 import { publishLegionRunActivity } from "../legion/run-active.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
@@ -755,58 +759,6 @@ export function formatMirrorLine(facts: LiveMirrorFacts | undefined): string | u
 	if (facts.mode === "off") return "mirror=off";
 	if (facts.staleBytes > 0 || facts.error !== undefined) return `mirror=stale(${facts.staleBytes} bytes)`;
 	return `mirror=ok(${facts.bytes} bytes)`;
-}
-
-/**
- * The persisted facts of a child's live mirror, or `undefined` when there is
- * nothing trustworthy to show.
- *
- * The row lives at `liveMirrorStatePathFor(sessionFile)`, i.e. under
- * `<runDir>/remote/` — a path that only the pump ever writes. Its ABSENCE is the
- * normal case for a local child, so "no file" is silence, not a warning.
- *
- * Every failure mode degrades to `undefined` for the same reason: a status block
- * is a diagnostic, and a half-written or hand-edited JSON must not turn it into
- * an exception. The shape is checked field by field because a `bytes` that is a
- * string would render as `mirror=ok(abc bytes)` — a fabricated fact.
- */
-export function readMirrorFacts(sessionFile: string): LiveMirrorFacts | undefined {
-	if (!sessionFile) return undefined;
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(fs.readFileSync(liveMirrorStatePathFor(sessionFile), "utf8"));
-	} catch {
-		return undefined;
-	}
-	if (!parsed || typeof parsed !== "object") return undefined;
-	const row = parsed as Record<string, unknown>;
-	const mode = row.mode;
-	if (mode !== "on" && mode !== "off") return undefined;
-	const bytes = row.bytes;
-	const staleBytes = row.staleBytes;
-	// Byte counts: finite and non-negative (`LiveMirror` floors `staleBytes` at 0,
-	// so a negative here means this is not a pump row at all).
-	if (!isByteCount(bytes) || !isByteCount(staleBytes)) return undefined;
-	const offset = isByteCount(row.offset) ? row.offset : 0;
-	const lastGrowthAt = isByteCount(row.lastGrowthAt) ? row.lastGrowthAt : 0;
-	const lastSyncAt = isByteCount(row.lastSyncAt) ? row.lastSyncAt : 0;
-	const error = typeof row.error === "string" && row.error.length > 0 ? row.error : undefined;
-	return {
-		localPath: typeof row.localPath === "string" ? row.localPath : sessionFile,
-		mode,
-		bytes,
-		offset,
-		...(isByteCount(row.remoteBytes) ? { remoteBytes: row.remoteBytes } : {}),
-		staleBytes,
-		lastGrowthAt,
-		lastSyncAt,
-		...(error !== undefined ? { error } : {}),
-	};
-}
-
-/** A plausible byte count: a finite, non-negative number. */
-function isByteCount(value: unknown): value is number {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 /**
