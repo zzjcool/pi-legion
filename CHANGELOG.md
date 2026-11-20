@@ -31,6 +31,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 **测试**：单测 2866（trunk 2855，+11，全部为新增能力），集成 193/193，typecheck 绿。
 报告：`docs/reports/notice-delivery.md`。
 
+## [6.2.9] — 2026-11-20
+
+**一句话：重启 pi 之后，上一个会话派出去的跨机 child 会被自动接回来（状态、通知、结算全部恢复），不再需要人工 `recover`；顺带修掉一个会让 legion 进程崩掉的 EPIPE。**
+
+- **`#445` PR #447 session 启动时自动接回活着的跨机 child。** 此前重启/会话替换后，远端仍在跑的 child 对新会话完全不可见 ——
+  `status` 看不到、完成通知不会来，只能人工 `subagent({action:"recover"})` 一个个捡，用户体感是"任务全没了"。
+  现在 session start 后会跑一趟**有界**（每 child 3s、最多 20 个、整趟 ≤5s、`void async` 不阻塞 session_start）的接管：
+  候选 = run store 里 `launching/working/orphaned/unfetched` 且 owner 不是当前会话的行；活性 = 远端 terminal 程序在跑 ∨
+  无 terminal 地址时 transcript 两次采样在增长（`unreachable`/`unknown` 一律不接管，`unknown ≠ live`）；
+  **硬闸**：另一个仍活着的会话持有的行不接管（`owned by <session>`），账本行已 settled/retired 的不接管不通知。
+  `notifiedAt` 闩锁在**送达后**才写，未送达的下次启动补发。session start 只打一行摘要（细节进 `reattach-live-children.log`）。
+  `subagents.reattachLiveChildren: false` 可关。端到端（真 hc）：A 死 → B 启动 → `status` 显示 `state=working host=…` →
+  对端结束后**自动一条完成通知**、账本 settled、再启动不采纳不重报，**全程未调用 `recover`**。
+- **`#447` `hc` 子进程中途退出不再打死 legion（EPIPE）。** `HcCliClient` 只 catch 了同步 `write()`，没给 `child.stdin` 挂
+  `error` 监听：假 `hc` 先退出时 EPIPE 从 stdin 的 `error` 事件冒出来 → `uncaughtException` **打死整个进程**。
+  现在 `stdin.on("error")` 记录 `exitReason`、拒绝全部 pending、reap 子进程 —— EPIPE 从"崩溃"变成"连接已死"的业务事实。
+  变异：去掉监听 → 端到端用例稳定红 `uncaughtException: write EPIPE`，两条新单测也红。
+
+**测试**：单测 2891（trunk 2866，+25），集成 201（trunk 193，+8），typecheck 绿。
+报告：`docs/reports/reattach-live-children.md`、`docs/reports/stall-candidates.md`。
+
 ## [6.2.8] — 2026-11-20
 
 **`#441`：stall 告警不再给已退休的 child 发「跑了 1h45m」，也不再跨机恒真。** 今天 10+ 封误报的两个根因：
