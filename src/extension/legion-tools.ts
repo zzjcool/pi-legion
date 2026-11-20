@@ -17,7 +17,9 @@ import type { LegionSupervisor } from "../supervisor/types.ts";
 import { inFlightToolStackOf } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
 import { assertLocalWorktree, normalizeHost } from "../runs/remote.ts";
-import { isUnstartedShell, transcriptBytesOf } from "../runs/launch-evidence.ts";
+import { crossMachineHost, isUnstartedShell, transcriptBytesOf } from "../runs/launch-evidence.ts";
+import { readMirrorFacts } from "../runs/live-mirror.ts";
+import { stallCandidateVerdict, type StallRunFacts } from "../legion/stall-candidates.ts";
 import {
 	isMailHeld,
 	MAIL_DELIVERY_CLAIM_LEASE_MS,
@@ -97,6 +99,12 @@ const RENEW_CLAIM_EVERY_MS = Math.floor(MAIL_DELIVERY_CLAIM_LEASE_MS / 3);
 /** Upper bound on ACCEPTED mail one tick may confirm (#322 §3), so a big inbox cannot stall the loop. */
 const ACCEPTED_MAIL_CONFIRM_LIMIT = 20;
 const ORPHAN_SCAN_INTERVAL_MS = 60_000;
+/**
+ * #441-B: how long one `terminal.get` (the container's status word) may hold up the
+ * postman tick. The read is asked at most once per child per crossed radius, so this
+ * bounds a wedged core's cost to one skipped notice — never a stuck mail pass.
+ */
+const PROGRAM_STATE_TIMEOUT_MS = 5_000;
 const DEFAULT_ORPHAN_STALE_MS = 90_000;
 const ORPHAN_REPORT_WINDOW_MS = 10 * 60_000;
 /** How long a stale-pass probe is trusted before the next `git status` (#P0 S4). */
@@ -161,6 +169,25 @@ export interface LegionPostmanOptions {
 	 * a boolean copied in here (display-liveness-v1 R1).
 	 */
 	isRunActive?: () => boolean;
+	/**
+	 * #441-A: the RUN lifecycle of this node's children, from `run.json` — the one
+	 * source that knows a child retired before the ledger row caught up.
+	 *
+	 * A child that finished its turn is `state=retired execution=success` in this
+	 * process's own run record the moment it is retired; `nodes.status` only moves
+	 * when the parent COLLECTS. The measured ghost (`#441`) fired 1h 23m after the
+	 * retire, while the ledger row still looked live, so the ledger alone is not
+	 * enough to answer "is this run over?".
+	 *
+	 * Same seam shape and same rule as {@link noticeMsForRole}: the postman has no
+	 * handle on the run store, so the caller resolves it. Called at most ONCE per
+	 * tick with every child row (one `run.json` read, not one per child), and may
+	 * throw — the postman degrades to "no run facts this tick", i.e. today's
+	 * ledger-only answer.
+	 *
+	 * Absent = no fact (a test double, a caller predating #441). Never "ended".
+	 */
+	childRunStates?: (children: readonly LegionNode[]) => ReadonlyMap<string, StallRunFacts>;
 	/**
 	 * Test seam for the DELIVERED evidence scan: read the recipient's turns from a
 	 * session file. Defaults to `parseSessionFile(file).turns`, and the postman calls
@@ -230,6 +257,7 @@ export class LegionPostman {
 	private readonly machine?: PhaseMachine;
 	private readonly noticeMsForRole?: LegionPostmanOptions["noticeMsForRole"];
 	private readonly isRunActive?: LegionPostmanOptions["isRunActive"];
+	private readonly childRunStates?: LegionPostmanOptions["childRunStates"];
 	/** D3: the fail-open degrade is worth ONE line in the log, not one per 2s tick. */
 	private runActivityWarned = false;
 	private readonly parseTurns: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
@@ -292,6 +320,7 @@ export class LegionPostman {
 		this.machine = options.machine;
 		this.noticeMsForRole = options.noticeMsForRole;
 		this.isRunActive = options.isRunActive;
+		this.childRunStates = options.childRunStates;
 		this.parseTurns = options.parseTurns ?? ((sessionFile) => parseSessionFile(sessionFile).turns);
 		this.now = options.now ?? Date.now;
 		this.intervalMs = options.intervalMs ?? POSTMAN_INTERVAL_MS;
@@ -320,7 +349,7 @@ export class LegionPostman {
 			// stall-notice: the detectors run off the SAME per-tick facts the heartbeat
 			// just refreshed, and before any delivery pass — so a notice written here is
 			// picked up by this tick's own delivery instead of waiting another 2s.
-			this.checkStallNotices(timestamp, children);
+			await this.checkStallNotices(timestamp, children);
 			// Confirm before delivering, so a message sent in this very tick stays
 			// ACCEPTED for at least one tick instead of flipping to DELIVERED in the
 			// same pass that queued it.
@@ -1100,9 +1129,15 @@ export class LegionPostman {
 	 * - **L1 silence** — empty in-flight stack, no event for `silenceNoticeMs`. The
 	 *   child is alive but produced nothing; the parent gets two announcements (1× and
 	 *   2×) and then quiet, because a dead child must not mail every 2 minutes.
-	 * - **L2 long-running** — `now - loopBaseAt >= loopRadiusMs`. It may be looping and
-	 *   it may just be a huge task; either way the parent should look at the actual
-	 *   execution context. Repeated once per radius, at most three times per window.
+	 * - **L2 long-running** — `now - loopBaseAt >= loopRadiusMs`, AND nothing is in
+	 *   flight, AND (on a backend that cannot see tools) the transcript stopped
+	 *   growing (#441: the clock alone called a 16-minute `gh pr checks --watch` and a
+	 *   20-minute compile "stalled"). Repeated once per radius, at most three times
+	 *   per window.
+	 *
+	 * Only a child whose run is still RUNNING is judged at all (D5 + #441-A): the
+	 * ledger row ends the candidacy, and so does the run record, whichever speaks
+	 * first.
 	 *
 	 * Nothing here decides liveness, kills, steers or retires anything (D3): a false
 	 * positive must cost a human a glance, never a child its process.
@@ -1110,9 +1145,9 @@ export class LegionPostman {
 	 * @param timestamp this tick's clock reading (`this.now()`), never a fresh one, so
 	 * two facts written in the same tick cannot disagree about "now".
 	 */
-	private checkStallNotices(timestamp: number, children: readonly LegionNode[]): void {
+	private async checkStallNotices(timestamp: number, children: readonly LegionNode[]): Promise<void> {
 		try {
-			this.runStallNoticeCheck(timestamp, children);
+			await this.runStallNoticeCheck(timestamp, children);
 		} catch (error) {
 			// Degrade, don't throw: this step runs in the MIDDLE of the tick, so an
 			// escaped throw would cost the rest of the pass its mail delivery (unlike
@@ -1124,19 +1159,42 @@ export class LegionPostman {
 		}
 	}
 
-	private runStallNoticeCheck(timestamp: number, children: readonly LegionNode[]): void {
+	private async runStallNoticeCheck(timestamp: number, children: readonly LegionNode[]): Promise<void> {
 		const self = getNode(this.db, this.nodeId);
 		// A team that already ended has nothing left to act on a notice with.
 		if (!self || hasEnded(self)) return;
 		const live = new Set<string>();
 		const announcements: StallAnnouncement[] = [];
+		// #441-A: the run lifecycle of this tick's children, read ONCE (one `run.json`
+		// parse for the whole pass) and lazily — a postman with no seam, or a caller
+		// whose store is unreadable, keeps the ledger-only answer of today.
+		let runStates: ReadonlyMap<string, StallRunFacts> | undefined;
+		const runStatesFor = (): ReadonlyMap<string, StallRunFacts> => {
+			if (runStates !== undefined) return runStates;
+			try {
+				runStates = this.childRunStates?.(children) ?? new Map<string, StallRunFacts>();
+			} catch (error) {
+				console.warn(
+					`[pi-legion] child run-state read for '${this.nodeId}' failed (${messageOf(error)}); stall candidates are judged from the ledger alone this tick.`,
+				);
+				runStates = new Map<string, StallRunFacts>();
+			}
+			return runStates;
+		};
 		for (const child of children) {
-			if (hasEnded(child)) {
-				// D5: an ENDED child leaves a tombstone, not a hole. `continue`/resume can
-				// bring it back with the same `nodes.created_at`, so deleting the entry
-				// would make the next tick take that old creation time as a fresh baseline
-				// and announce "running for 70m" one tick after the revival. The tombstone
-				// (`absent`) is what turns the revival into a restart.
+			// #441-A: a run that is OVER is never a stall candidate, whichever source
+			// says so first (the ledger row, or the run record that retires the child
+			// before the parent collects). Tombstoned exactly like an ended child, so a
+			// later re-dispatch gets a fresh baseline instead of inheriting "70m old".
+			const runFacts = runStatesFor().get(child.id) ?? runStatesFor().get(child.name);
+			if (!stallCandidateVerdict({ ledger: child, run: runFacts }).candidate) {
+				// D5 + #441-A: an ENDED child leaves a tombstone, not a hole. `continue`/
+				// resume can bring it back with the same `nodes.created_at`, so deleting
+				// the entry would make the next tick take that old creation time as a
+				// fresh baseline and announce "running for 70m" one tick after the
+				// revival. The tombstone (`absent`) is what turns the revival into a
+				// restart. Both sources of "over" land here on purpose: the ledger row
+				// and the run record agree on what the parent should be told (nothing).
 				this.tombstoneStallClock(child.name);
 				continue;
 			}
@@ -1166,12 +1224,12 @@ export class LegionPostman {
 			}
 			live.add(child.name);
 			const clock = this.stallClockFor(child, timestamp);
-			const facts = this.stallFactsFor(child);
 			// The same two thresholds the decision uses, held in locals because the
 			// announced state is only comparable WITHIN one threshold (#413): a `tier`
 			// number means nothing without the radius it was measured against.
 			const silenceNoticeMs = this.settings.silenceNoticeMs ?? DEFAULT_LEGION_SETTINGS.silenceNoticeMs;
 			const loopRadiusMs = this.stallLoopRadiusMs(child, clock);
+			const facts = await this.stallFactsFor(child, timestamp, clock, loopRadiusMs);
 			const announcement = decideStallNotice({
 				now: timestamp,
 				child: facts,
@@ -1274,23 +1332,140 @@ export class LegionPostman {
 	}
 
 	/**
-	 * The two facts the pure decision reads, and nothing else.
+	 * The facts the pure decision reads, and nothing else (#441-B/C).
 	 *
 	 * `inFlightToolStackOf` answers `undefined` both for "empty stack" and for "this
 	 * supervisor cannot answer" — the same conflation the status line has always made
 	 * ("no fact, no line"). For L1 that is the honest reading: absence of a frame is
 	 * the absence of a running tool, and D2 makes `lastEventAt` the optional member
 	 * that decides whether a notice can be produced at all.
+	 *
+	 * For L2 the conflation is exactly what #441 measured: a child on the `hc`
+	 * terminal backend (every cross-machine child, and every worktree-holding
+	 * centurion inside a terminal — `routing-supervisor` D12) emits no tool events, so
+	 * the empty stack was a PERMANENT `true` and "it has no tool in flight" degenerated
+	 * into "it has been running for a while". So this method names the blind spot
+	 * (`toolObservationUnavailable`) and supplies the two facts such a child CAN be
+	 * judged by:
+	 *
+	 *   - `programState` — the terminal's own 7501 status word, read on demand. This
+	 *     is #441-C: a child the container sees `working` (a 20-minute compile, a
+	 *     `gh pr checks --watch`) is working, and no clock may call it stalled.
+	 *   - `lastSessionGrowthAt` — the mirror pump's `lastGrowthAt` for a cross-machine
+	 *     child (no mirror / pump off / never grew ⇒ `undefined` = unknown), or the
+	 *     local transcript's mtime for a terminal-hosted LOCAL child. This is
+	 *     #441-B's second conjunct, and its absence is `unknown`, never `stalled`.
+	 *
+	 * Both reads are BOUNDED: the growth read is one `statSync` (or one small JSON),
+	 * and the `terminal.get` behind `programState` is asked ONLY once this child is
+	 * already past its L2 radius with that boundary unannounced — i.e. at most a
+	 * handful of round trips per window, never one per 2 s tick.
 	 */
-	private stallFactsFor(child: LegionNode): StallChildFacts {
+	private async stallFactsFor(
+		child: LegionNode,
+		timestamp: number,
+		clock: StallClock,
+		loopRadiusMs: number | undefined,
+	): Promise<StallChildFacts> {
 		const stack = inFlightToolStackOf(this.supervisor, child.name);
 		const top = stack?.[stack.length - 1];
 		const lastEventAt = this.supervisor.lastEventAt?.(child.name);
+		// Tool-blindness is the SUPERVISOR's answer first (#441-B): only it knows which
+		// backend hosts the child, and only the `hc` terminal backend folds no tool
+		// events. The row is the fallback for a caller whose supervisor cannot answer
+		// (a test double, an older backend): a recorded `remoteTerminal` is only ever
+		// written by that backend, and a cross-machine row cannot be `inprocess`/`rpc`
+		// (those cannot leave this machine).
+		const observesTools = this.supervisor.observesToolEvents?.(child.name);
+		const terminalBacked = typeof child.remoteTerminal === "string" && child.remoteTerminal.trim().length > 0;
+		const toolObservationUnavailable = observesTools === undefined
+			? terminalBacked || crossMachineHost(child.host) !== undefined
+			: observesTools === false;
+		const programState = toolObservationUnavailable ? await this.programStateFor(child, timestamp, clock, loopRadiusMs) : undefined;
+		const lastSessionGrowthAt = toolObservationUnavailable ? this.lastSessionGrowthAt(child) : undefined;
 		return {
 			name: child.name,
 			...(lastEventAt === undefined ? {} : { lastEventAt }),
 			...(top === undefined ? {} : { inFlightTool: top.tool, inFlightToolStartedAt: top.startedAt }),
+			...(toolObservationUnavailable ? { toolObservationUnavailable: true } : {}),
+			...(programState === undefined ? {} : { programState }),
+			...(lastSessionGrowthAt === undefined ? {} : { lastSessionGrowthAt }),
 		};
+	}
+
+	/**
+	 * The container's status word for one child, or `undefined` — asked only when it
+	 * can change an answer.
+	 *
+	 * `terminal.get` is one RPC round trip, so the pre-check below is deliberately
+	 * LOOSER than the decision (it only asks "is this child past its radius at all"):
+	 * a tick that asks needlessly costs one round trip, while a pre-check that were
+	 * STRICTER than the decision would silently suppress notices — the one failure
+	 * mode this whole change must not introduce. Nothing is cached: a stale `working`
+	 * is the one answer that could hide a real stall.
+	 */
+	private async programStateFor(
+		child: LegionNode,
+		timestamp: number,
+		clock: StallClock,
+		loopRadiusMs: number | undefined,
+	): Promise<string | undefined> {
+		if (!isActiveStallThreshold(loopRadiusMs)) return undefined;
+		if (!(timestamp - clock.loopBaseAt >= loopRadiusMs)) return undefined;
+		const read = this.supervisor.programState;
+		if (read === undefined) return undefined;
+		try {
+			// Bounded: this runs INSIDE the 2 s postman tick, and an `hc` core that has
+			// stopped answering must cost this tick one skipped notice, never the whole
+			// pass (mail delivery runs after it). A timeout is NO FACT, exactly like an
+			// unreachable terminal.
+			const state = await Promise.race([
+				read.call(this.supervisor, child.name),
+				new Promise<undefined>((resolve) => {
+					const timer = setTimeout(() => resolve(undefined), PROGRAM_STATE_TIMEOUT_MS);
+					timer.unref?.();
+				}),
+			]);
+			return typeof state === "string" && state.trim().length > 0 ? state : undefined;
+		} catch (error) {
+			// A backend that cannot answer is NO FACT, not an idle child: the detector
+			// stays silent for it (unknown ≠ stalled) instead of guessing.
+			console.warn(
+				`[pi-legion] program-state read for '${child.name}' threw (${messageOf(error)}); its stall candidacy is judged without a container view.`,
+			);
+			return undefined;
+		}
+	}
+
+	/**
+	 * #441-B: when this host last OBSERVED the child's transcript grow, or `undefined`.
+	 *
+	 * Two shapes, one question:
+	 *
+	 *   - **cross-machine** — the transcript is a live mirror (`#411`): the pump's own
+	 *     state row carries `lastGrowthAt`, and a mirror configured `off` (or one that
+	 *     never grew) is NO EVIDENCE. Deliberately NOT the local file's mtime: the
+	 *     placeholder exists from launch, so its age measures the launch, not the
+	 *     child.
+	 *   - **local terminal-backend child** — the child writes its own transcript on
+	 *     this host, so its mtime IS the growth fact.
+	 *
+	 * Never throws; a missing file is `undefined` (unknown).
+	 */
+	private lastSessionGrowthAt(child: LegionNode): number | undefined {
+		const sessionFile = child.sessionFile;
+		if (typeof sessionFile !== "string" || sessionFile.length === 0) return undefined;
+		if (crossMachineHost(child.host) !== undefined) {
+			const facts = readMirrorFacts(sessionFile);
+			if (facts?.mode !== "on") return undefined;
+			return facts.lastGrowthAt > 0 ? facts.lastGrowthAt : undefined;
+		}
+		try {
+			const stat = fs.statSync(sessionFile);
+			return stat.isFile() ? stat.mtimeMs : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -1352,7 +1527,20 @@ export class LegionPostman {
 	extendStallWindow(name: string, ms?: number): StallExtendReceipt | StallExtendRefusal {
 		const child = getChildren(this.db, this.nodeId).find((candidate) => candidate.name === name);
 		if (!child) return { reason: "unknown-child" };
-		if (hasEnded(child)) return { reason: "child-ended" };
+		// #441-A: "no reminder item that can be extended" — the SAME predicate the
+		// candidate filter runs, so a child whose run is over (retired in `run.json`,
+		// or ended in the ledger) cannot be handed a receipt that promises a reminder
+		// which will never arrive. `child-ended` covers both sources on purpose: the
+		// receipt's promise is identical (nothing will fire), and the operator does not
+		// need to know which writer recorded the end.
+		let runFacts: StallRunFacts | undefined;
+		try {
+			const states = this.childRunStates?.([child]);
+			runFacts = states?.get(child.id) ?? states?.get(child.name);
+		} catch {
+			runFacts = undefined;
+		}
+		if (!stallCandidateVerdict({ ledger: child, run: runFacts }).candidate) return { reason: "child-ended" };
 		const now = this.now();
 		const known = this.stallClocks.get(name);
 		const radius = ms ?? known?.loopRadiusMs;

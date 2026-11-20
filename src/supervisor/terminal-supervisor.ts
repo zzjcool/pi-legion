@@ -1303,6 +1303,48 @@ export class TerminalSupervisor implements LegionSupervisor {
 	}
 
 	/**
+	 * #441-B: this backend observes NO tool events (D12) — the absence is the point,
+	 * so it is answered explicitly instead of leaving callers to infer it from a
+	 * missing method.
+	 */
+	observesToolEvents(_name: string): boolean {
+		return false;
+	}
+
+	/**
+	 * #441-B/C: the child's own program-status word, read on demand with ONE
+	 * `terminal.get`.
+	 *
+	 * The stall detector's question is "is anything in flight", and this backend
+	 * observes no tool events (D12) — but the terminal the child runs in does report
+	 * a program status (`working` while a tool/generation runs, `idle` at the
+	 * prompt, `blocked` on an approval). That word is what lets a 20-minute compile
+	 * stay a compile instead of becoming a stall notice.
+	 *
+	 * Deliberately a PURE READ: it does not fold the answer into the record
+	 * (`applyFacts` would also move `turn`/`state`, and a stall probe must not
+	 * advance this backend's settle bookkeeping). Every failure — no such child, a
+	 * dead terminal, an unreachable core, a reply without the field — is
+	 * `undefined`, because "no fact" is exactly what the caller must be told: it
+	 * stays silent rather than inventing an idle child.
+	 *
+	 * Asked only by the postman, only once a child's L2 radius has already elapsed
+	 * (bounded by the notice cap), never per tick.
+	 */
+	async programState(name: string): Promise<string | undefined> {
+		const child = this.children.get(name);
+		if (!child || child.state !== "live") return undefined;
+		try {
+			const client = await this.ensureClient();
+			const facts = await client.request<HcTerminalFacts>("terminal.get", { terminal: terminalAddress(child) });
+			const state = facts?.status?.state;
+			return typeof state === "string" ? state : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
 	 * No usage facts travel over this channel (D12): `null` is the honest answer,
 	 * and both callers already treat it as "unknown".
 	 */

@@ -59,6 +59,7 @@ import { LegionPostman, registerLegionTools, verificationSummary, type LegionMai
 import { registerLegionOutputTool } from "./src/extension/legion-output.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
 import { resolveLoopRadiusMs } from "./src/legion/stall-notice.ts";
+import { createChildRunStateReader } from "./src/runs/child-run-facts.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, LEGION_PHASES_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
@@ -1112,12 +1113,22 @@ function createLegionRuntime(input: {
 	const self = getNode(input.db, input.nodeId);
 	const eventBus = input.eventBus;
 	const dbEventSource = attachLegionRuntime(input);
+	// #441-A: the run-record half of "is this child's run over?". The run in
+	// `<storeRoot>/runs/<runDir basename>` is the one THIS node dispatches into
+	// (`createLegionRuntime` receives the run dir whose `nodeId` is this node), so
+	// its `children` are exactly this node's children — the same records `subagent
+	// status` reads. Read once per postman pass, never per child.
+	const childRunStates = createChildRunStateReader({
+		storeRootDir: input.storeRootDir,
+		runId: path.basename(input.runDir),
+	});
 	const postman = new LegionPostman({
 		db: input.db,
 		nodeId: input.nodeId,
 		supervisor: input.supervisor,
 		settings: input.settings,
 		eventBus,
+		childRunStates,
 		sendRootMessage: (text: string) => notice(input.pi, text),
 		sendSelfMessage: (text: string) => notice(input.pi, text),
 		// root-mail-run-boundary D2: the read side. Asked on every root-inbox pass; the

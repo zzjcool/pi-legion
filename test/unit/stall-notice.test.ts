@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import { liveMirrorStatePathFor } from "../../src/runs/live-mirror.ts";
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { RunStore } from "../../src/runs/store.ts";
@@ -60,6 +61,18 @@ import { applyOverride } from "../../src/agents/overrides.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 const MINUTE = 60_000;
+
+/**
+ * #441-B: write the pump's persisted facts row for a cross-machine test child.
+ *
+ * A cross-machine child may only be judged by GROWTH, so a fixture that expects a
+ * notice for one must give it a mirror row — exactly what the pump writes every 5 s.
+ */
+function writeMirrorState(sessionFile: string, lastGrowthAt: number, mode: "on" | "off" = "on"): void {
+	const statePath = liveMirrorStatePathFor(sessionFile);
+	mkdirSync(path.dirname(statePath), { recursive: true });
+	writeFileSync(statePath, `${JSON.stringify({ mode, bytes: 10, offset: 10, staleBytes: 0, lastGrowthAt, lastSyncAt: lastGrowthAt })}\n`);
+}
 
 // ───────────────────────────── 1. pure decision ─────────────────────────────
 
@@ -212,7 +225,11 @@ test("L2: the radius boundary, and it works without lastEventAt (D2)", () => {
 	assert.ok(fired);
 	assert.equal(fired.kind, "long-running");
 	assert.equal(fired.sinceBucket, base, "the bucket is the L2 baseline");
-	assert.equal(fired.inFlightTool, undefined);
+	// #441: the local (tool-observable) decision carries no container word and no
+	// growth fact — the empty stack was the determination, so the line says only
+	// `nothing in flight`.
+	assert.equal(fired.programState, undefined);
+	assert.equal(fired.sessionGrowthIdleMs, undefined);
 });
 
 test("L2: it repeats once per radius and stops after three unhandled lines (D6)", () => {
@@ -277,25 +294,88 @@ test("#413: the NEXT boundary re-arms — one threshold after the last line was 
 	assert.equal(at(225 * MINUTE, sent(4, 1))?.tier, 5, "crossing the next boundary re-arms the reminder");
 });
 
-test("L2: a non-empty stack becomes EVIDENCE inside the line, never a verdict of its own (D1)", () => {
-	const announcement = decideStallNotice({
-		now: 46 * MINUTE,
-		child: child({ inFlightTool: "bash", inFlightToolStartedAt: 8 * MINUTE }),
-		thresholds: long(45 * MINUTE),
+test("#441-C: a child the container can SEE inside a command is WORKING — no L2 line", () => {
+	// The measured false positive: a worker blocked in `gh pr checks --watch` for 16
+	// minutes, session not written at all, reported on every boundary. Before #441
+	// the stack was EVIDENCE ("inside `bash` for 38m"); now it is a verdict that the
+	// child is working, so the clock alone cannot raise a notice.
+	for (const startedAt of [8 * MINUTE, Number.NaN]) {
+		assert.equal(
+			decideStallNotice({
+				now: 46 * MINUTE,
+				child: child({ inFlightTool: "bash", inFlightToolStartedAt: startedAt }),
+				thresholds: long(45 * MINUTE),
+				window: window(0),
+			}),
+			undefined,
+			`an in-flight tool (startedAt=${startedAt}) is working, not stalled`,
+		);
+	}
+	// The container's own status word is the same fact on a tool-blind backend: a
+	// terminal-hosted centurion compiling for 20 minutes reports `working`.
+	assert.equal(
+		decideStallNotice({
+			now: 46 * MINUTE,
+			child: child({ toolObservationUnavailable: true, programState: "working", lastSessionGrowthAt: 0 }),
+			thresholds: long(45 * MINUTE),
+			window: window(0),
+		}),
+		undefined,
+		"a `working` container is not a stalled child, whatever the clock says",
+	);
+});
+
+test("#441-B: a tool-blind child is judged by GROWTH — an idle container with a stalled transcript fires, and the line quotes both facts", () => {
+	const radius = 45 * MINUTE;
+	const now = 46 * MINUTE;
+	// The child sits at its prompt (`idle`) and its transcript has not grown for 38m.
+	const announced = decideStallNotice({
+		now,
+		child: child({
+			toolObservationUnavailable: true,
+			programState: "idle",
+			lastSessionGrowthAt: now - 50 * MINUTE,
+		}),
+		thresholds: long(radius),
 		window: window(0),
 	});
-	assert.ok(announcement);
-	assert.equal(announcement.inFlightTool, "bash");
-	assert.equal(announcement.inFlightMs, 46 * MINUTE - 8 * MINUTE);
-	// An unusable tool start is no evidence — the line must not print `NaN`.
-	const noClock = decideStallNotice({
-		now: 46 * MINUTE,
-		child: child({ inFlightTool: "bash", inFlightToolStartedAt: Number.NaN }),
-		thresholds: long(45 * MINUTE),
-		window: window(0),
-	});
-	assert.equal(noClock?.inFlightTool, "bash");
-	assert.equal(noClock?.inFlightMs, undefined);
+	assert.ok(announced, "idle container + stalled transcript IS an anomaly");
+	assert.equal(announced.programState, "idle");
+	assert.equal(announced.sessionGrowthIdleMs, 50 * MINUTE, "the line quotes how long the transcript has been still");
+	// A transcript that grew INSIDE the window is proof of life the clock cannot beat.
+	assert.equal(
+		decideStallNotice({
+			now,
+			child: child({ toolObservationUnavailable: true, programState: "idle", lastSessionGrowthAt: now - 44 * MINUTE }),
+			thresholds: long(radius),
+			window: window(0),
+		}),
+		undefined,
+		"growth 44m ago is inside the 45m window",
+	);
+	// No growth evidence at all (mirror off / no session) is `unknown`, never `stalled`.
+	assert.equal(
+		decideStallNotice({
+			now,
+			child: child({ toolObservationUnavailable: true, programState: "idle" }),
+			thresholds: long(radius),
+			window: window(0),
+		}),
+		undefined,
+		"unknown ≠ stalled",
+	);
+	// And a tool-blind child with NO container word either is undecidable — the
+	// empty stack on such a backend means nothing at all ("本机永远看不到").
+	assert.equal(
+		decideStallNotice({
+			now,
+			child: child({ toolObservationUnavailable: true, lastSessionGrowthAt: 0 }),
+			thresholds: long(radius),
+			window: window(0),
+		}),
+		undefined,
+		"no container view ⇒ not decidable ⇒ no notice",
+	);
 });
 
 test("L1 wins over L2 for the same child in the same tick (one line per child)", () => {
@@ -394,12 +474,13 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 			sequence: 1,
 			elapsedMs: 46 * MINUTE,
 			thresholdMs: 45 * MINUTE,
-			inFlightTool: "bash",
-			inFlightMs: 38 * MINUTE,
+			programState: "idle",
+			sessionGrowthIdleMs: 38 * MINUTE,
 		},
 	], DETECTED_AT);
 	assert.doesNotMatch(body, /steer cannot land/);
-	assert.match(body, /inside `bash` for 38m 0s/, "the stack is evidence, spelled out as one");
+	assert.match(body, /nothing in flight, container status `idle`/, "the two facts that made it an anomaly");
+	assert.match(body, /transcript has not grown for 38m 0s/, "and the growth evidence, spelled out as one");
 	assert.match(body, /running for 46m 0s/);
 	assert.match(body, /threshold 45m 0s/);
 	assert.match(body, /steer reaches a child at a turn boundary/);
@@ -596,6 +677,17 @@ class StallSupervisor extends FakeSupervisor {
 	inFlightToolStack(name: string): InFlightToolStack | undefined {
 		return this.stacks.get(name);
 	}
+
+	/**
+	 * #441-B/C: the container's status word. A tool-blind child (a terminal-backed /
+	 * cross-machine row) is judged by this plus the mirror's growth, so the postman
+	 * test can prove the composition without an `hc` core.
+	 */
+	readonly programStates = new Map<string, string>();
+
+	async programState(name: string): Promise<string | undefined> {
+		return this.programStates.get(name);
+	}
 }
 
 const TICK_AT = 3_600_000;
@@ -763,16 +855,23 @@ test("#423 req 5: a SHELL is not a stall candidate — no terminal and no sessio
 	try {
 		const emptyTrace = path.join(root, "shell.jsonl");
 		writeFileSync(emptyTrace, "");
+		const realTrace = path.join(root, "real.jsonl");
+		writeFileSync(realTrace, '{"type":"message","message":{"role":"user","content":"hi"}}\n');
 		const fx = fixture({
 			children: [
 				// The shell: a cross-machine row with neither of the two facts that
 				// prove a launch happened.
 				{ name: "shell", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", sessionFile: emptyTrace },
 				// The control: the SAME age, the same role, but a terminal the core holds.
-				{ name: "real", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", remoteTerminal: "host-workspace/lgl-rx-real" },
+				// #441-B: it also needs the two facts a cross-machine child is judged by —
+				// the container's own `idle` word, and a transcript that has not grown.
+				{ name: "real", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", remoteTerminal: "host-workspace/lgl-rx-real", sessionFile: realTrace },
 			],
 			loopRadiusMs: 15 * MINUTE,
 		});
+		// The mirror row the pump would have written: last growth long before the radius.
+		writeMirrorState(realTrace, TICK_AT - 30 * MINUTE);
+		fx.supervisor.programStates.set("real", "idle");
 		try {
 			await fx.postman.tick();
 			fx.stop();
@@ -796,9 +895,13 @@ test("#423 req 5: the SAME shell becomes a candidate once a transcript with byte
 		const written = path.join(root, "written.jsonl");
 		writeFileSync(written, '{"type":"message","message":{"role":"user","content":"hi"}}\n');
 		const fx = fixture({
-			children: [{ name: "slow", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", sessionFile: written }],
+			children: [{ name: "slow", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", remoteTerminal: "host-workspace/lgl-rx-slow", sessionFile: written }],
 			loopRadiusMs: 15 * MINUTE,
 		});
+		// #441-B: candidate ≠ noticed. A cross-machine child is announced only when its
+		// container says it is not working AND its transcript has stopped growing.
+		writeMirrorState(written, TICK_AT - 30 * MINUTE);
+		fx.supervisor.programStates.set("slow", "idle");
 		try {
 			await fx.postman.tick();
 			fx.stop();
@@ -825,7 +928,9 @@ test("postman L2: the role-derived radius fires, and the merged mail names every
 		noticeMsForRole: () => 45 * MINUTE,
 	});
 	try {
-		// `worker-a` is inside a tool: that becomes evidence, not a verdict (D1).
+		// #441-C: `worker-a` is inside a tool, so it is WORKING — the observation that
+		// used to be quoted as evidence is now a verdict, and the notice covers only
+		// the idle sibling.
 		fx.supervisor.stacks.set("worker-a", [{ tool: "bash", startedAt: TICK_AT - 38 * MINUTE }]);
 
 		await fx.postman.tick();
@@ -834,11 +939,11 @@ test("postman L2: the role-derived radius fires, and the merged mail names every
 		const rows = inbox(fx.db, "root");
 		assert.equal(rows.length, 1, "D7: one mail for the whole tick");
 		const body = rows[0]!.body;
-		assert.match(rows[0]!.subject, /2 children/);
-		assert.match(body, /\bworker-a\b/);
+		assert.doesNotMatch(rows[0]!.subject, /2 children/, "only the idle child is a candidate");
+		assert.doesNotMatch(body, /\bworker-a\b/, "#441-C: a child inside `bash` is working, never stalled");
 		assert.match(body, /\bworker-b\b/);
 		assert.doesNotMatch(body, /\bworker-c\b/, "a child under its radius is not mentioned");
-		assert.match(body, /inside `bash` for 38m 0s/, "D1: the stack is the evidence the L2 line carries");
+		assert.match(body, /nothing in flight/, "the line says what this host actually measured");
 		assert.doesNotMatch(body, /steer cannot land/, "D3: an L2 line must not deny steer");
 	} finally {
 		fx.db.close();
