@@ -693,6 +693,16 @@ delivers through the one shared `origin` — is a three-step setup (one shared
 remote → `subagents.crossMachine` → one `subagent` call):
 [docs/runbooks/cross-machine-centurion-demo.md](docs/runbooks/cross-machine-centurion-demo.md).
 
+A cross-machine child outlives the session that launched it, so a new session in
+the same directory **re-attaches** it at start: the child is listed by `status`
+again and its completion notice arrives by itself — `recover` is not something a
+user needs to know about. Adoption is evidence-based (the program must still be
+running there, or its transcript must be growing), never steals a child another
+live session holds, is bounded (3s per child, 20 children, 5s for the whole
+start pass), and prints **one** line; per-child detail goes to
+`.pi-subagents/reattach-live-children.log`. Turn it off with
+`subagents.reattachLiveChildren: false`.
+
 ## Supported kinds
 
 Pi Legion runs `kind: pi` roles only. `kind` is still a legal frontmatter key,

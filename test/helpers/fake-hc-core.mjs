@@ -34,9 +34,17 @@
  *   FAKE_HC_TERMINALS     optional JSON (or a path to a JSON file holding it):
  *                         one entry per terminal NAME (`"*"` = fallback) that
  *                         says how that terminal ENDS (`state`, `exit_code`,
- *                         `screen`) and what it WRITES before it does. Applied
- *                         once, at `terminal.run`; see §7 of
+ *                         `screen`, `finish_after_ms`) and what it WRITES before
+ *                         it does. Applied once, at `terminal.run`; see §7 of
  *                         `docs/contracts/remote-child-fate-v1.md`.
+ *
+ *                         `finish_after_ms` (#445) makes the terminal END on its
+ *                         own N ms after `terminal.run`, read on every
+ *                         `terminal.get`/`terminal.wait`. The other keys describe
+ *                         a state that never changes, which cannot express the one
+ *                         transition a re-attach test needs: a child that is LIVE
+ *                         while the new session adopts it and FINISHED when that
+ *                         session's watcher looks again.
  *
  * Protocol: newline-delimited JSON-RPC on stdin/stdout, same as `hc connect`.
  * Result shapes mirror `hc schema` (verified against herdr-core 0.1.21):
@@ -62,6 +70,18 @@ const REMOTE_PATH = (process.env.FAKE_HC_REMOTE_PATH ?? "").trim();
 const REMOTE_HOME = (process.env.FAKE_HC_REMOTE_HOME ?? "").trim();
 /** Path-or-inline JSON: read at every `terminal.run`, so a test may replace it. */
 const TERMINALS_SPEC = (process.env.FAKE_HC_TERMINALS ?? "").trim();
+/**
+ * #445: a file this core PERSISTS its terminals to, loaded at boot.
+ *
+ * Every `hcCliClient` spawns a NEW core process, so the default in-memory map
+ * means "a terminal created by one client does not exist for the next one" — which
+ * is fine for a launch+collect test (both calls share a client) and wrong for a
+ * re-attach test, whose whole premise is that a child created by a PREVIOUS
+ * session is visible to a LATER one. Set this and a `terminal.run` in process A is
+ * readable by `terminal.get` in process B, `created_ms` (and therefore
+ * `finish_after_ms`), `pid`, `exit_code` and `turn` included.
+ */
+const TERMINAL_STATE_FILE = (process.env.FAKE_HC_TERMINAL_STATE ?? "").trim();
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXEC_TIMEOUT_S = 600;
@@ -70,6 +90,35 @@ const CAPTURE_BYTES = 1024 * 1024;
 /** name -> terminal. `host` is undefined for a local terminal. */
 const terminals = new Map();
 let terminalSeq = 0;
+
+// ── #445: durable terminals (see TERMINAL_STATE_FILE) ──────────────────────
+
+function loadTerminalState() {
+	if (TERMINAL_STATE_FILE.length === 0) return;
+	try {
+		if (!fs.existsSync(TERMINAL_STATE_FILE)) return;
+		const parsed = JSON.parse(fs.readFileSync(TERMINAL_STATE_FILE, "utf8"));
+		for (const terminal of Array.isArray(parsed?.terminals) ? parsed.terminals : []) {
+			if (terminal && typeof terminal.address === "string") terminals.set(terminal.address, terminal);
+		}
+		if (typeof parsed?.seq === "number" && Number.isFinite(parsed.seq)) terminalSeq = parsed.seq;
+	} catch {
+		// A corrupt state file is "no state", never a boot failure: a test harness
+		// artifact must not make the core unusable.
+	}
+}
+
+function persistTerminalState() {
+	if (TERMINAL_STATE_FILE.length === 0) return;
+	try {
+		fs.mkdirSync(path.dirname(TERMINAL_STATE_FILE), { recursive: true });
+		fs.writeFileSync(TERMINAL_STATE_FILE, `${JSON.stringify({ seq: terminalSeq, terminals: [...terminals.values()] })}\n`);
+	} catch {
+		// best effort: the state file is a convenience for cross-process tests
+	}
+}
+
+loadTerminalState();
 
 // ── wire helpers ────────────────────────────────────────────────────────────
 
@@ -255,6 +304,8 @@ function terminalRun(id, params) {
 		name: name ?? address,
 		host: on,
 		state: typeof fate?.state === "string" && fate.state.length > 0 ? fate.state : "running",
+		// #445: the transition a re-attach test needs (see the header). Absent = static.
+		finish_after_ms: typeof fate?.finish_after_ms === "number" && Number.isFinite(fate.finish_after_ms) ? fate.finish_after_ms : undefined,
 		// Only ever reported by `terminal.get` once the terminal is `finished`.
 		exit_code: typeof fate?.exit_code === "number" ? fate.exit_code : 0,
 		screen: typeof fate?.screen === "string" ? fate.screen : "",
@@ -271,6 +322,8 @@ function terminalRun(id, params) {
 		created_ms: Date.now(),
 	};
 	terminals.set(address, terminal);
+	// #445: a later `hc` process (session B) must see this terminal, `created_ms` and all.
+	persistTerminalState();
 	// The child's own effects on that machine (its transcript, most of the time).
 	for (const write of writes) {
 		const file = path.resolve(write.path);
@@ -323,16 +376,31 @@ function resolveTerminal(reference) {
 	return undefined;
 }
 
+/**
+ * The state a terminal reports NOW (#445's `finish_after_ms`).
+ *
+ * `terminal.run` happens once, long before the transition a re-attach test needs
+ * to observe (live at adoption, finished at the next watcher tick), so the
+ * manifest's static `state` cannot express it. Absent key = the static state.
+ */
+function effectiveState(terminal) {
+	const after = terminal.finish_after_ms;
+	if (typeof after !== "number" || !Number.isFinite(after)) return terminal.state;
+	if (terminal.state === "finished") return "finished";
+	return Date.now() - terminal.created_ms >= after ? "finished" : terminal.state;
+}
+
 function terminalGet(id, params) {
 	const terminal = resolveTerminal(params.terminal);
 	if (!terminal) {
 		fail(id, "not_found", `no such terminal: ${String(params.terminal)}`);
 		return;
 	}
+	const state = effectiveState(terminal);
 	reply(id, {
 		address: terminal.address,
 		name: terminal.name,
-		state: terminal.state,
+		state,
 		turn: terminal.turn,
 		cwd: terminal.cwd,
 		argv: terminal.argv,
@@ -345,8 +413,8 @@ function terminalGet(id, params) {
 		die_with_parent: false,
 		// The manifest's own exit code: "the child died" is only half the answer, and
 		// `1` vs `137` is what tells an operator which failure they are looking at.
-		...(terminal.state === "finished" ? { exit_code: terminal.exit_code ?? 0, finished_ms: Date.now() } : {}),
-		status: { state: terminal.state === "running" ? "idle" : "finished" },
+		...(state === "finished" ? { exit_code: terminal.exit_code ?? 0, finished_ms: Date.now() } : {}),
+		status: { state: state === "running" ? "idle" : "finished" },
 		// #423: measured on hc 0.1.21 — `terminal.get` answers the MODE WORD here, not
 		// the screen. The text is `terminal.read`'s reply (below). A fake that put the
 		// text in this field is how the receipts came to quote `| exact` and nothing
@@ -577,12 +645,13 @@ function handle(request) {
 					return;
 				}
 				terminal.turn += 1;
+				persistTerminalState();
 				reply(id, { turn: terminal.turn, started: true });
 			});
 			return;
 		case "terminal.wait":
 			withTerminal(id, p, (terminal) => {
-				reply(id, { address: terminal.address, state: terminal.state, turn: terminal.turn, timed_out: false });
+				reply(id, { address: terminal.address, state: effectiveState(terminal), turn: terminal.turn, timed_out: false });
 			});
 			return;
 		case "terminal.interrupt":
@@ -593,12 +662,14 @@ function handle(request) {
 		case "terminal.kill":
 			withTerminal(id, p, (terminal) => {
 				terminal.state = "finished";
+				persistTerminalState();
 				reply(id, { address: terminal.address, state: "finished" });
 			});
 			return;
 		case "terminal.rm":
 			withTerminal(id, p, (terminal) => {
 				terminals.delete(terminal.address);
+				persistTerminalState();
 				reply(id, { removed: terminal.address });
 			});
 			return;
