@@ -11,15 +11,22 @@ test("playbook text describes the backend-neutral launch and frozen child guidan
 	assert.match(PARENT_PLAYBOOK, /subagent\(\{ agent:/);
 	assert.match(PARENT_PLAYBOOK, /matching role/);
 	assert.match(PARENT_PLAYBOOK, /Forbidden/);
-	assert.match(PARENT_PLAYBOOK, /Isolation belongs to centurion/);
+	assert.match(PARENT_PLAYBOOK, /Isolation: one centurion = one delivery unit/);
 	assert.match(PARENT_PLAYBOOK, /worktree: true/);
 	// #303: the playbook used to say "For N parallel isolated writers, dispatch N
 	// centurions". That was an instruction to nest a centurion inside a centurion,
 	// which the runtime REFUSES (only the root may dispatch one) — so it told models
 	// to do something that could only fail. It now describes the ownership rule
 	// without prescribing a nested dispatch.
-	assert.match(PARENT_PLAYBOOK, /owns one worktree/);
+	assert.match(PARENT_PLAYBOOK, /one delivery unit/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /dispatch N centurions/);
+	// #451 (docs half of the issue): the supported parallel-write recipe and the
+	// explicit override are part of the frozen launch guidance, not tribal knowledge.
+	assert.match(PARENT_PLAYBOOK, /worktree:false/);
+	assert.match(PARENT_PLAYBOOK, /worktreeSource=request/);
+	assert.match(PARENT_PLAYBOOK, /pre-built worktrees/);
+	assert.match(PARENT_PLAYBOOK, /cwd: <absolute tree>/);
+	assert.match(PARENT_PLAYBOOK, /#450/);
 	// D1: children are in-process by default; a separate `pi` process is the
 	// worktree/`spawnMode: rpc` case only.
 	assert.match(PARENT_PLAYBOOK, /Children are in-process by default/);

@@ -438,6 +438,22 @@ export interface OrphanRecord {
 	sessionFile?: string;
 }
 
+/**
+ * #451: WHO decided this launch's worktree isolation.
+ *
+ * - `role`    — the launch carried no `worktree` argument, so the role card
+ *               decided (a centurion in a Legion tree is still always `true`).
+ * - `request` — the launch call carried the boolean (`true` or `false`), and
+ *               that value won over the card. `false` is the expression for
+ *               "work in the checkout I was given, create no tree".
+ *
+ * Recorded on `ChildRecord` (run.json) so `status` can say who asked. It is
+ * deliberately NOT a `nodes` column (the ledger schema stays v5) and records
+ * written before it existed simply lack it — absence is never rendered as a
+ * guess.
+ */
+export type WorktreeSource = "role" | "request";
+
 export interface ChildRecord {
 	/** Supervisor-local child name; unique among live children in this run. */
 	name: string;
@@ -510,6 +526,12 @@ export interface ChildRecord {
 	worktreePath?: string;
 	/** Branch created in that worktree; the child ships via MR, not the parent checkout. */
 	worktreeBranch?: string;
+	/**
+	 * #451: who decided the worktree above (or its absence) — see
+	 * {@link WorktreeSource}. A `request` with no `worktreePath` is the in-place
+	 * shape (`worktree: false`), not a missing fact.
+	 */
+	worktreeSource?: WorktreeSource;
 	/**
 	 * Machine that ran this child; absent = this host.
 	 *
