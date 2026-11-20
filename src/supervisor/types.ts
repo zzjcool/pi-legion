@@ -674,6 +674,40 @@ export interface LegionSupervisor {
 	 */
 	lastEventAt?(name: string): number | undefined;
 	/**
+	 * #441-B/C: the child's own program-status word as its CONTAINER reports it
+	 * (the 7501 status: `working`, `idle`, `blocked`, `done`, …), or `undefined`.
+	 *
+	 * This is the only "is anything in flight" fact a tool-blind backend can offer:
+	 * a child hosted in an `hc` terminal (`terminal-supervisor` D12) emits no tool
+	 * events, so the stall detector cannot tell a 20-minute compile from a hang by
+	 * the stack — but the terminal itself answers `working` for the former.
+	 *
+	 * Optional, and async because one answer is one `terminal.get` on demand, asked
+	 * only when a stall candidate's radius has already elapsed (never per tick).
+	 * Absence, a throw, or `undefined` all mean NO FACT — and "no fact" must never
+	 * become "nothing is running": the detector treats it as undecidable and stays
+	 * silent (#441: unknown ≠ stalled).
+	 *
+	 * `rpc` / `inprocess` backends answer `undefined` on purpose: their in-flight
+	 * stack is the sharper fact, and asking a terminal about an in-process child
+	 * would be a category error.
+	 */
+	programState?(name: string): Promise<string | undefined>;
+	/**
+	 * #441-B: does this backend observe TOOL EVENTS for `name` at all?
+	 *
+	 * `false` is not "nothing is running" — it is "an absent in-flight stack here
+	 * carries no information", which is the difference the whole #441-B defect turned
+	 * on. The `hc` terminal backend runs a real TUI in another process and folds no
+	 * tool events (D12), so for a child it hosts `inFlightTool === undefined` was
+	 * PERMANENTLY true and the detector read it as "no tool in flight".
+	 *
+	 * The supervisor that routes by owner (`routing-supervisor`) is the authoritative
+	 * answer; a backend or test double that predates this read leaves it absent, and
+	 * callers then fall back to the row's own evidence (`remoteTerminal` / `host`).
+	 */
+	observesToolEvents?(name: string): boolean;
+	/**
 	 * Measured decode ms for `name` — the cumulative first-delta→last-delta wall
 	 * clock this backend observed over that child's WHOLE LIFE, or `undefined` when
 	 * it has never observed the name at all.

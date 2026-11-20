@@ -644,6 +644,11 @@ export class RpcSupervisor implements LegionSupervisor {
 		return stack?.[stack.length - 1];
 	}
 
+	/** #441-B: this backend folds the child's own tool events, so an empty stack MEANS empty. */
+	observesToolEvents(_name: string): boolean {
+		return true;
+	}
+
 	/**
 	 * The whole stack (#331), innermost last. Same `isAlive` gate as
 	 * {@link inFlightTool}: a dead child holds no live handle and cannot be inside

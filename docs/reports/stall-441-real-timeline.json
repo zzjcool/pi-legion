@@ -1,0 +1,272 @@
+{
+  "runId": "stall441-mwolwu7y",
+  "startedAt": "2026-11-20T06:37:21.243Z",
+  "finishedAt": "2026-11-20T06:58:25.779Z",
+  "wallMinutes": 21,
+  "radiusMinutes": 5,
+  "machine": "t98",
+  "phase0": {
+    "child": "pi",
+    "address": "stall441-mwolwu7y-pi",
+    "reportedProgramState": "working"
+  },
+  "phase1": {
+    "child": "big-task",
+    "address": "t9z",
+    "finalProgramState": "working",
+    "notices": 0,
+    "oldRuleFired": [
+      {
+        "at": "2026-11-20T06:42:21.639Z",
+        "child": "big-task",
+        "tier": 1,
+        "notice": "\"big-task: running for 5m 0s (threshold 5m 0s), with no tool in flight\""
+      },
+      {
+        "at": "2026-11-20T06:47:21.994Z",
+        "child": "big-task",
+        "tier": 2,
+        "notice": "\"big-task: running for 10m 0s (threshold 5m 0s), with no tool in flight\""
+      },
+      {
+        "at": "2026-11-20T06:52:22.362Z",
+        "child": "big-task",
+        "tier": 3,
+        "notice": "\"big-task: running for 15m 0s (threshold 5m 0s), with no tool in flight\""
+      }
+    ],
+    "oldRuleNoticeCount": 3
+  },
+  "phase2": {
+    "child": "idle-child",
+    "address": "t101",
+    "reportedProgramState": "idle",
+    "notices": 1,
+    "body": "Legion stall notice — nothing was stopped, steered or retired; these are facts for you to check.\nDetected at 2026-11-20T07:48:25.772Z.\n\nL2 long-running (past the role's notice budget):\n- idle-child: running for 1h 36m (threshold 5m 0s), nothing in flight, container status `idle` and its transcript has not grown for 50m 3s. It may be looping — check its actual execution context; steer reaches a child at a turn boundary.\n\n`subagent({action:\"extend\", name, ms?})` defers only this L2 reminder: it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`."
+  },
+  "controls": {
+    "workingWordSuppresses": true
+  },
+  "timeline": [
+    {
+      "at": "2026-11-20T06:37:21.250Z",
+      "elapsedMin": 0,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 1,
+      "oldRuleTier": 0,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:38:21.328Z",
+      "elapsedMin": 1,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 61,
+      "oldRuleTier": 0,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:39:21.401Z",
+      "elapsedMin": 2,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 121,
+      "oldRuleTier": 0,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:40:21.469Z",
+      "elapsedMin": 3,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 181,
+      "oldRuleTier": 0,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:41:21.554Z",
+      "elapsedMin": 4,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 241,
+      "oldRuleTier": 0,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:42:21.639Z",
+      "elapsedMin": 5,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 301,
+      "oldRuleTier": 1,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:43:21.704Z",
+      "elapsedMin": 6,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 361,
+      "oldRuleTier": 1,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:44:21.782Z",
+      "elapsedMin": 7,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 422,
+      "oldRuleTier": 1,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:45:21.851Z",
+      "elapsedMin": 8,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 482,
+      "oldRuleTier": 1,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:46:21.922Z",
+      "elapsedMin": 9,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 542,
+      "oldRuleTier": 1,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:47:21.994Z",
+      "elapsedMin": 10,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 602,
+      "oldRuleTier": 2,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:48:22.060Z",
+      "elapsedMin": 11,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 662,
+      "oldRuleTier": 2,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:49:22.124Z",
+      "elapsedMin": 12,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 722,
+      "oldRuleTier": 2,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:50:22.183Z",
+      "elapsedMin": 13,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 782,
+      "oldRuleTier": 2,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:51:22.260Z",
+      "elapsedMin": 14,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 842,
+      "oldRuleTier": 2,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:52:22.362Z",
+      "elapsedMin": 15,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 902,
+      "oldRuleTier": 3,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:53:22.434Z",
+      "elapsedMin": 16,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 962,
+      "oldRuleTier": 3,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:54:22.504Z",
+      "elapsedMin": 17,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 1022,
+      "oldRuleTier": 3,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:55:22.567Z",
+      "elapsedMin": 18,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 1082,
+      "oldRuleTier": 3,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:56:22.636Z",
+      "elapsedMin": 19,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 1142,
+      "oldRuleTier": 3,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:57:22.696Z",
+      "elapsedMin": 20,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 1202,
+      "oldRuleTier": 3,
+      "notices": 0
+    },
+    {
+      "at": "2026-11-20T06:58:22.756Z",
+      "elapsedMin": 21,
+      "terminalState": "live",
+      "programState": "working",
+      "sessionBytes": 74,
+      "sessionAgeSec": 1263,
+      "oldRuleTier": 3,
+      "notices": 0
+    }
+  ]
+}

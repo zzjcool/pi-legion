@@ -1514,6 +1514,11 @@ export class InProcessSupervisor implements LegionSupervisor {
 		return stack?.[stack.length - 1];
 	}
 
+	/** #441-B: this backend folds the child's own tool events, so an empty stack MEANS empty. */
+	observesToolEvents(_name: string): boolean {
+		return true;
+	}
+
 	/** The whole stack (#331), innermost last; same `isAlive` gate as above. */
 	inFlightToolStack(name: string): InFlightToolStack | undefined {
 		if (!this.isAlive(name)) return undefined;

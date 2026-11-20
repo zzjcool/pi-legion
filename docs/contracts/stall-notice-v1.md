@@ -10,6 +10,13 @@
 > `OBSOLETE`（`reason: obsolete_after_child_end`）。三条路径的**文本时序与投递节奏**仍按本
 > D4（postman 仍 2s tick、`isMailHeld` 与 `formatMail` 不动），D9 写入侧仍零事件。
 >
+> **修订（2026-11-20，#441）**：`docs/contracts/stall-candidate-filters-v1.md`（FROZEN）**改写了 L2**
+> 的判据与候选集，D1 表里「L2 (long) : now - loopBaseAt >= loopRadiusMs」这一行与 D2 的「L2 不依赖
+> `lastEventAt`」仍成立，但**不再充分**：L2 现在要求「容器内可判定没有工具在飞」∧（跨机/终端后端）
+> 「transcript 在窗口内无增长」；`inFlightTool` 从「文案证据」升级为「working ⇒ 不告警」；候选集增加
+> **run.json 终态**这一条硬闸。L1、去重（#413 的 `tier`）、上限、`extend` 语义、三条投递路径**全部不变**。
+> 冲突时以 `stall-candidate-filters-v1.md` 为准。
+>
 > **追加（2026-11-09）**：同一天又落了一道 `docs/contracts/root-mail-run-boundary-v1.md`——本节点 run 活跃期间
 > `deliverRootInbox` 整轮不投递（行留 `PENDING`）。**它与 D4「三条投递路径零改动」的冲突，裁定为**：
 > **路径 2（root 自己的 `deliverRootInbox`）的投递时机由该契约 D1 接管**，路径 2 的其余语义（`formatMail`

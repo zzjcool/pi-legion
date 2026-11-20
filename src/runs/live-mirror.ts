@@ -195,6 +195,64 @@ export interface LiveMirrorFacts {
 }
 
 /**
+ * The persisted facts of a child's live mirror, or `undefined` when there is
+ * nothing trustworthy to read.
+ *
+ * The row lives at `liveMirrorStatePathFor(sessionFile)`, i.e. under
+ * `<runDir>/remote/` — a path that only the pump ever writes. Its ABSENCE is the
+ * normal case for a local child, so "no file" is silence, not a warning.
+ *
+ * Every failure mode degrades to `undefined` for the same reason: two callers read
+ * this (the status block, #411 §4; and the stall detector's growth gate, #441-B),
+ * and a half-written or hand-edited JSON must not turn a diagnostic into an
+ * exception — nor into a fabricated "no growth" verdict. The shape is checked field
+ * by field because a `bytes` that is a string would render as `mirror=ok(abc
+ * bytes)` and a `lastGrowthAt` that is a string would compare as `NaN`.
+ *
+ * Lives here, not in the extension layer, because `legion-tools` (#441-B) and the
+ * status renderer must read the SAME row with the SAME rules: two readers, one
+ * parser (the growth gate must not disagree with the `mirror=` marker).
+ */
+export function readMirrorFacts(sessionFile: string): LiveMirrorFacts | undefined {
+	if (typeof sessionFile !== "string" || sessionFile.length === 0) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(fs.readFileSync(liveMirrorStatePathFor(sessionFile), "utf8"));
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object") return undefined;
+	const row = parsed as Record<string, unknown>;
+	const mode = row.mode;
+	if (mode !== "on" && mode !== "off") return undefined;
+	const bytes = row.bytes;
+	const staleBytes = row.staleBytes;
+	// Byte counts: finite and non-negative (`LiveMirror` floors `staleBytes` at 0,
+	// so a negative here means this is not a pump row at all).
+	if (!isByteCount(bytes) || !isByteCount(staleBytes)) return undefined;
+	const offset = isByteCount(row.offset) ? row.offset : 0;
+	const lastGrowthAt = isByteCount(row.lastGrowthAt) ? row.lastGrowthAt : 0;
+	const lastSyncAt = isByteCount(row.lastSyncAt) ? row.lastSyncAt : 0;
+	const error = typeof row.error === "string" && row.error.length > 0 ? row.error : undefined;
+	return {
+		localPath: typeof row.localPath === "string" ? row.localPath : sessionFile,
+		mode,
+		bytes,
+		offset,
+		...(isByteCount(row.remoteBytes) ? { remoteBytes: row.remoteBytes } : {}),
+		staleBytes,
+		lastGrowthAt,
+		lastSyncAt,
+		...(error !== undefined ? { error } : {}),
+	};
+}
+
+/** A plausible byte count: a finite, non-negative number. */
+function isByteCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
  * Production remote: `machine.exec wc -c` + `tail -c +N`, one long-lived `hc connect`.
  *
  * `undefined` when `remoteDir` is unknown: guessing the path would produce a
