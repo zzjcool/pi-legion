@@ -31,6 +31,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 **测试**：单测 2866（trunk 2855，+11，全部为新增能力），集成 193/193，typecheck 绿。
 报告：`docs/reports/notice-delivery.md`。
 
+## [6.2.10] — 2026-11-20
+
+**一句话：自动接回不再只看当前目录（跨仓库派出的 child 也能找回来），并且 `worktree` 可以在派遣时显式关掉 —— `worktreePath` 记 `NULL` 而不是静默退化成 cwd。**
+
+- **`#450` PR #452 接回的扫描面扩到本机多个 store。** 6.2.9 的自动接回只看当前 cwd 的 run store，于是
+  "在 `~/code/anotify` 派出去、在 `~/agents` 重启"这种跨仓库场景**完全看不见**（`recover` 回 `searched ../code/pi-legion/.pi-subagents/runs`）。
+  现在：每条候选带**逐条 launch-cwd**（复用 `run.json.cwd`，缺省回落 `dirname(storeRoot)`，无新增持久字段）；
+  扫描面 = cwd + callerCwd + （cwd 在 `$HOME` 内时）其祖先与向下两层，realpath 去重、跳过 hidden/node_modules，
+  上界 32 store / 240 目录 / 深度 2，超界报 `truncated` + reason；`status` / `list all:true` / `recover` 跨 store 可见并标 `store=<label>`，
+  跨 store 同名**拒绝歧义**（列出 store+run 候选），`recover` 写回账本所属 store；摘要仍一行，同 store 时与 6.2.9 逐字一致。
+  验收含**真 `pi --print` 进程换 cwd 接回**、三 store 一次采纳 429ms、同名不串味、四个变异实跑均红。
+- **`#451` PR #454 `worktree` 可显式覆盖。** 此前编排层硬编码 `worktree: true`（`src/runs/orchestrator.ts:1940`），
+  派遣参数无法关掉，只能降级成"多个 worker + 预建 worktree"。现在 launch 级 `worktree:false` 覆盖角色卡：
+  在该 `cwd` 就地工作、**不建树**、`worktree_path` 严格记 **SQL NULL**（此前缺失会让 `node.worktreePath ?? options.cwd`
+  静默退回 cwd，resume/collect 可能跑在错的树上），并新增 `worktreeSource: role|request` 让 `status` 看得出这个 worktree 是谁要的。
+  `#214` 反向不变（非 centurion 仍拿不到 worktree）。契约新增 `docs/contracts/worktree-override-v1.md`：
+  **预建 N 棵树、一树一 launch call + call-level 绝对 `cwd`、一个 centurion = 一个交付单元**，并用真 centurion 按文档跑通两棵树并行写。
+
+**测试**：单测 2907（trunk 2907），集成 206（trunk 201，+5），typecheck 绿。
+报告：`docs/reports/reattach-cross-store.md`、`docs/reports/worktree-override.md`。
+
 ## [6.2.9] — 2026-11-20
 
 **一句话：重启 pi 之后，上一个会话派出去的跨机 child 会被自动接回来（状态、通知、结算全部恢复），不再需要人工 `recover`；顺带修掉一个会让 legion 进程崩掉的 EPIPE。**
