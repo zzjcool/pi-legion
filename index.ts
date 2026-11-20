@@ -70,7 +70,7 @@ import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { orphanFateOf } from "./src/legion/orphan.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
-import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
+import { type ExecutionStatus, type LegionSettings, type WorktreeSource } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
 import {
@@ -315,7 +315,7 @@ const TaskItem = Type.Object({
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
-				"Parent decides isolation for this child. true = own git branch, child delivers that branch (an MR when the repository has a remote). false = write the current checkout. Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
+				"Isolation for THIS step. An explicit value overrides the role card: true = own git branch, child delivers that branch (an MR when the repository has a remote); false = work in the checkout this launch already selected (create no tree, status shows worktreeSource=request). Omitted = the card decides (today's behaviour; a centurion in a Legion tree still always gets one). Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
 		}),
 	),
 	host: Type.Optional(
@@ -387,7 +387,7 @@ const SubagentParams = Type.Object({
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
-				"Parent decides isolation. true = isolated git branch, child delivers that branch (an MR when the repository has a remote). false = edit the current checkout. Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit.",
+				"Isolation for this launch. An explicit value overrides the role card (a per-item `tasks[].worktree` overrides this call-level one): true = isolated git branch, child delivers that branch (an MR when the repository has a remote); false = work in the checkout this launch already selected — no tree is created, `node.worktreePath` is NULL and status says `worktreeSource=request`. Omitted everywhere = the card decides (a centurion in a Legion tree still always gets one). Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit, or pre-build N worktrees and pin each launch with `cwd` for parallel writes.",
 		}),
 	),
 	host: Type.Optional(
@@ -2718,6 +2718,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					// run.json records the arbitrated backend; a legacy record has none,
 					// and `renderLiveChildStatus` renders that as `unknown` — never `rpc`.
 					...(child.spawnMode ? { spawnMode: child.spawnMode } : {}),
+					// #451: who asked for the worktree, on the slash surface too.
+					...childWorktreeFacts(child),
 					alive,
 					...(owner ? { owner } : {}),
 					...(inFlightTools ? { inFlightTools } : {}),
@@ -3963,6 +3965,8 @@ async function controlAction(input: {
 			// renderer, so the machine and terminal come from the record on both.
 			// 6.2.5 / D5: the ledger row answers when the record cannot.
 			...childRemoteFacts(found.child, ledgerNodeFor(found.child)),
+			// #451: the worktree provenance, same fields on both surfaces.
+			...childWorktreeFacts(found.child),
 			alive,
 			...(owner ? { owner } : {}),
 		});
@@ -5485,11 +5489,20 @@ async function launchStep(
 			// The origin distinguishes a deliberate per-run model from the parent's
 			// model falling through; the launch line reports which one won.
 			modelOrigin: model.modelOrigin,
+			// #451: the value is pre-resolved exactly as before (per-step field wins
+			// over the call-level one, then the role card); `worktreeSource` is what
+			// says whether the CALLER actually decided, so the orchestrator can both
+			// honour an explicit override and keep "nobody asked" byte-identical
+			// (a pre-resolved `true` from the card must never masquerade as a request).
 			worktree: resolveLaunchWorktree({
 				roleDefault: effective.worktree,
 				launch: session.params.worktree,
 				step: step.worktree,
 			}),
+			worktreeSource:
+				step.worktree !== undefined || session.params.worktree !== undefined
+					? "request"
+					: "role",
 			...(host ? { host } : {}),
 			...(hostTarget ? { hostTarget } : {}),
 			// D5: a RELATIVE `cwd` next to `host` names the checkout on THIS machine
@@ -6769,6 +6782,27 @@ const TERMINAL_STATUS_CHILD_STATES = new Set<string>([
 type StatusChildRecord = NonNullable<ReturnType<RunStore["findChild"]>>;
 
 /**
+ * #451: what every status surface needs to say WHO asked for the worktree.
+ *
+ * Only facts the record actually holds are handed over — a legacy record grows
+ * no line at all (`renderLiveChildStatus` skips an absent `worktreeSource`), so
+ * the pre-#451 output stays byte-identical. An empty `worktreePath` is NOT
+ * mapped to `undefined` here: the renderer's `worktree=none` comes from the
+ * source+absence pair, never from a guessed empty string.
+ */
+function childWorktreeFacts(child: {
+	worktreeSource?: WorktreeSource;
+	worktreePath?: string | null;
+	worktreeBranch?: string;
+}): { worktreeSource?: WorktreeSource; worktreePath?: string; worktreeBranch?: string } {
+	return {
+		...(child.worktreeSource ? { worktreeSource: child.worktreeSource } : {}),
+		...(child.worktreePath ? { worktreePath: child.worktreePath } : {}),
+		...(child.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
+	};
+}
+
+/**
  * Liveness facts for one child, supplied by the caller.
  *
  * `alive` is this process's in-memory supervisor answer (it never holds a child
@@ -6951,6 +6985,8 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				// #409: and whose terminal it hangs from — or why nobody can say.
 				...(child.parentTerminal ? { parentTerminal: child.parentTerminal } : {}),
 				...(child.parentAbsent ? { parentAbsent: child.parentAbsent } : {}),
+				// #451: the overview block answers the same question as the named one.
+				...childWorktreeFacts(child),
 				alive,
 				...(owner ? { owner } : {}),
 				...(pid ? { pid } : {}),

@@ -654,12 +654,17 @@ export function formatSubagentDetail(input: SummaryDetailInput): string {
 	}
 	if (detailBits.length > 0) lines.push(`  ${detailBits.join(" · ")}`);
 
-	if (child.worktreeBranch || child.worktreePath) {
+	if (child.worktreeSource !== undefined || child.worktreeBranch || child.worktreePath) {
 		// D13: the display carries the OWNER, not just the path (`vps:/srv/.pi-worktrees/x`).
 		// A path without its machine is exactly the ambiguity the ownership pair
 		// exists to remove, and this line is where an operator first meets it.
 		// Absent host renders byte-identically to the local form.
-		lines.push(`  worktree: ${worktreeDisplay(child)}`);
+		// #451: `source=` names WHO asked — `role` (the card) or `request` (the
+		// caller's launch argument). `request` with no tree is the in-place shape,
+		// so it says `none` instead of hiding the whole line.
+		const tree = child.worktreeBranch || child.worktreePath ? worktreeDisplay(child) : "none";
+		const source = child.worktreeSource !== undefined ? ` (source=${child.worktreeSource})` : "";
+		lines.push(`  worktree: ${tree}${source}`);
 	}
 	if (child.sessionFile) {
 		const base = input.cwd ?? run.cwd;

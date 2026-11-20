@@ -50,6 +50,7 @@ import {
 	type AgentKind,
 	type RetireOptions,
 	type SpawnMode,
+	type WorktreeSource,
 } from "../shared/types.ts";
 import type {
 	EventSubscriptionOptions,
@@ -575,6 +576,17 @@ export interface LiveChildStatusInput {
 	 * never a guessed `rpc`.
 	 */
 	spawnMode?: string;
+	/**
+	 * #451: who decided this launch's worktree isolation — `role` (the role card)
+	 * or `request` (the caller's explicit launch argument). Absent on records
+	 * written before the field existed, and then no line is invented: the block
+	 * stays byte-identical.
+	 */
+	worktreeSource?: WorktreeSource;
+	/** Isolated tree this child holds (#451 display); absent = no tree. */
+	worktreePath?: string | null;
+	/** Branch created in that tree; shown instead of the path when both exist. */
+	worktreeBranch?: string;
 	/** RPC process is still running. */
 	alive: boolean;
 	/**
@@ -855,6 +867,14 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		if (parent !== undefined && (input.host !== undefined || input.parentAbsent !== undefined)) {
 			lines.push(parent);
 		}
+	}
+	// #451: WHO asked for the worktree. A `request` with no tree is the in-place
+	// shape (`worktree:false`), not a missing fact, so it prints `worktree=none`
+	// instead of vanishing; a legacy record has no source and grows no line.
+	if (input.worktreeSource !== undefined) {
+		lines.push(
+			`worktreeSource=${input.worktreeSource} worktree=${input.worktreeBranch ?? input.worktreePath ?? "none"}`,
+		);
 	}
 	// #411 §4: only a child whose transcript is a live mirror has a state file, so
 	// this line is absent for every local child (byte-identical output, by design).

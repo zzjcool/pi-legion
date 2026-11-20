@@ -71,6 +71,7 @@ import {
 	SubagentError,
 	withSecondaryFailures,
 	type Usage,
+	type WorktreeSource,
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import { terminalHostAvailable } from "../supervisor/terminal-supervisor.ts";
@@ -315,7 +316,26 @@ export interface LaunchInput {
 	/** Provider id pinning `--provider` for an ambiguous bare model id (#123). */
 	modelProvider?: string;
 	thinking?: string | false;
+	/**
+	 * Worktree isolation for THIS launch (#451): when present, the value wins over
+	 * the role card (`agent.worktree`) — `false` means "work in the checkout this
+	 * launch already selected (`worktreePath`/this.cwd), create no tree".
+	 *
+	 * Absent = the card decides, which is the pre-#451 behaviour byte for byte
+	 * (a centurion in a Legion tree still resolves to `true`). Still subject to
+	 * #214: a non-centurion asking for `true` is demoted with a one-time warning.
+	 */
 	worktree?: boolean;
+	/**
+	 * #451: WHO decided {@link worktree}.
+	 *
+	 * When supplied (the tool layer), `worktree` is already the arbitrated value
+	 * and only `request` marks an explicit caller argument; the Legion branch
+	 * then ignores a `role`-sourced value exactly as it did before #451. Absent
+	 * (programmatic callers, resumes): a present `worktree` is the caller's
+	 * request. Recorded as `ChildRecord.worktreeSource`.
+	 */
+	worktreeSource?: WorktreeSource;
 	/**
 	 * Target machine for this launch; absent = this host (contract
 	 * `cross-machine-spawn-v1` D4). Normalized once by `normalizeHost` below and
@@ -1312,7 +1332,7 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}), ...(node.worktreeHost ? { worktreeHost: node.worktreeHost } : {}), ...(node.host ? { host: node.host } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; worktreeHost?: string; host?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string | null; worktreeHost?: string | null; host?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -1374,7 +1394,7 @@ export class Orchestrator {
 				// ledger says why a stint restarted without a transition — the event set
 				// stays closed (no new type, no new mail subject).
 				const revivedAt = this.now();
-				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, worktreeHost: input.worktreeHost ?? previous.worktreeHost, host: input.host ?? previous.host, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
+				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath === null ? null : input.worktreePath ?? previous.worktreePath, worktreeHost: input.worktreeHost === null ? null : input.worktreeHost ?? previous.worktreeHost, host: input.host ?? previous.host, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
 				if (previous.phase !== null) {
 					this.emitStored(input.nodeId, "phase_change", { from: previous.phase, to: previous.phase, reworkCount: previous.reworkCount, reason: "revived" });
 				}
@@ -1423,7 +1443,7 @@ export class Orchestrator {
 		return gate.value;
 	}
 
-	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; worktreeBranch?: string; worktreeHost?: string; host?: string }): Promise<boolean> {
+	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; worktreeBranch?: string; worktreeHost?: string; host?: string; worktreeSource?: WorktreeSource; worktreeOptOut?: boolean }): Promise<boolean> {
 		const legion = this.legion;
 		const parentRunId = legion?.runId;
 		if (!legion?.runStore || !parentRunId) return false;
@@ -1443,6 +1463,14 @@ export class Orchestrator {
 				if (input.worktreePath) child.worktreePath = input.worktreePath;
 				if (input.worktreeBranch) child.worktreeBranch = input.worktreeBranch;
 				if (input.worktreeHost) child.worktreeHost = input.worktreeHost;
+				// #451: the audit fact lands with the reservation, and an explicit opt-out
+				// CLEARS the previous launch's tree instead of leaving it to look current.
+				if (input.worktreeSource) child.worktreeSource = input.worktreeSource;
+				if (input.worktreeOptOut) {
+					delete child.worktreePath;
+					delete child.worktreeBranch;
+					delete child.worktreeHost;
+				}
 				if (input.host) child.host = input.host;
 				// #414: the dispatching run, written from the reservation moment on, so
 				// even a record left behind by a launch killed later still answers
@@ -1464,6 +1492,7 @@ export class Orchestrator {
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
+			...(input.worktreeSource ? { worktreeSource: input.worktreeSource } : {}),
 			...(input.host ? { host: input.host } : {}),
 			// #414: the reverse-lookup key, present from the first write (see above).
 			parentRunId,
@@ -1886,9 +1915,18 @@ export class Orchestrator {
 		}
 		// #371 G2/G3/G4 live BELOW the cross-machine guards on purpose — see the
 		// "why the preflight runs before the phases validation" note there.
-		// #214 D4: only centurion may hold worktree. Legion path still forces
-		// centurion→true and centurion-parent→member false; non-centurion
-		// requests from any source are demoted below (D1: warn, never throw).
+		// #214 D4: only centurion may hold worktree. A Legion path still forces a
+		// centurion's role-pinned `true` when the caller said NOTHING, and still
+		// forces a centurion-parent's member to `false`; non-centurion requests from
+		// any source are demoted below (D1: warn, never throw).
+		//
+		// #451: an EXPLICIT launch value wins over the role card on BOTH paths. Before
+		// this, the Legion branch was hardcoded `true`, so
+		// `subagent({agent:"centurion", worktree:false})` could not be expressed at
+		// all: the only way to work inside an existing checkout was to give up the
+		// role. `worktreeSource` is the audit split — the launch argument
+		// (`request`) or the card (`role`) — and it is recorded on the child
+		// (`ChildRecord.worktreeSource`) so `status` can say who asked.
 		//
 		// #345: the nested-worktree probe is a REAL subprocess — one synchronous
 		// `git rev-parse` at 5–7ms, 60% of a worker launch — and it used to be an
@@ -1896,10 +1934,17 @@ export class Orchestrator {
 		// and its answer was then thrown away: the demotion below forces every
 		// non-centurion to `false` no matter what the probe said (18/18
 		// combinations of roleDefault × launch × parentInWorktree). It is asked only
-		// on the centurion branch, which is the only one it can change.
+		// on the LIB centurion branch, which is the only one it can change; the
+		// Legion branch never probed and still does not (`!this.legion &&
+		// isInsideChildWorktree(...)` short-circuits before the git call).
+		const worktreeSource: WorktreeSource = input.worktreeSource ?? (input.worktree !== undefined ? "request" : "role");
 		let worktree = isCenturion
 			? (this.legion
-				? true
+				? resolveLaunchWorktree({
+					// Frozen #214 rule: a centurion with no caller decision holds a tree.
+					roleDefault: true,
+					launch: worktreeSource === "request" ? input.worktree : undefined,
+				})
 				: resolveLaunchWorktree({
 					roleDefault: input.agent.worktree,
 					launch: input.worktree,
@@ -1919,6 +1964,13 @@ export class Orchestrator {
 			this.warnWorktreeDenied(input.agent.name);
 			worktree = false;
 		}
+		// #451: a caller who explicitly said `false` wants THIS checkout, so an
+		// earlier launch's tree must never be resurrected (a plain resume seeds
+		// `worktreePath` from the previous record, and `resume` re-derives its
+		// worktree flag from `saved.worktreePath` — keeping it would make the
+		// opt-out silently fail on the second launch). Raw `input.worktree`, not
+		// the arbitrated value: a demoted non-centurion is not an opt-out.
+		const explicitWorktreeOptOut = isCenturion && worktreeSource === "request" && input.worktree === false;
 		// ── Cross-machine (contract `cross-machine-spawn-v1` D1) ──
 		//
 		// A host is honored by the terminal backend only. Everything here fails
@@ -2165,8 +2217,8 @@ export class Orchestrator {
 				});
 			}
 		}
-		let worktreePath = previous?.worktreePath;
-		let worktreeBranch = previous?.worktreeBranch;
+		let worktreePath = explicitWorktreeOptOut ? undefined : previous?.worktreePath;
+		let worktreeBranch = explicitWorktreeOptOut ? undefined : previous?.worktreeBranch;
 		let createdWorktree = false;
 		let spawned = false;
 		let reservedNode: LegionNode | null = null;
@@ -2214,9 +2266,9 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}), model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath: explicitWorktreeOptOut ? null : worktreePath, worktreeHost: explicitWorktreeOptOut ? null : undefined, ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}), model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
 				reserved = true;
-				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(worktreeBranch ? { worktreeBranch } : {}), ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}) });
+				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, worktreeSource, worktreeOptOut: explicitWorktreeOptOut, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(worktreeBranch ? { worktreeBranch } : {}), ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}) });
 			}
 			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId, machine);
 			if (input.stripLegionIdentity) {
@@ -2371,6 +2423,19 @@ export class Orchestrator {
 				else if (!sameModel) delete previous.modelProvider;
 				// A resume re-arbitrates the backend; keep the record truthful (#209).
 				previous.spawnMode = mode;
+				// #451: an explicit opt-out is DURABLE. `resume` re-derives its worktree
+				// flag from `saved.worktreePath`, so a stale tree left on the record would
+				// make the next resume quietly re-create the isolation this caller
+				// refused. The handle below only ever re-adds what the backend reports.
+				if (explicitWorktreeOptOut) {
+					delete previous.worktreePath;
+					delete previous.worktreeBranch;
+					delete previous.worktreeHost;
+				}
+				// #451: a CALLER's decision is the auditable fact; a resume that said
+				// nothing keeps the source already on the record (never relabels a
+				// role-pinned tree as "request").
+				if (worktreeSource === "request") previous.worktreeSource = "request";
 				// A resumed REMOTE child learns its tree from the handle too (the local
 				// branch already had it). Only set what the handle actually reported, so a
 				// local resume keeps its stored pair untouched.
@@ -2399,6 +2464,9 @@ export class Orchestrator {
 				agent: input.agent,
 				sessionFile: result.sessionFile,
 				spawnMode: mode,
+				// #451: who decided the worktree — recorded on the child (run.json), not
+				// on a `nodes` column, so the ledger schema stays v5.
+				worktreeSource,
 				// #374 §4: snapshot the declaration this team actually RUNS under, so a
 				// resume in a later process can replay it. Gated exactly like
 				// `lineageEnv` — only `centurion` is ever sent `PI_LEGION_PHASES`, and a
@@ -3432,6 +3500,8 @@ export class Orchestrator {
 		worktreeBranch?: string;
 		/** Machine that OWNS `worktreePath`; absent = this host (contract D13). */
 		worktreeHost?: string;
+		/** #451: who decided the worktree — `role` (the card) or `request` (the launch). */
+		worktreeSource?: WorktreeSource;
 		/** Machine this child runs on; absent = this host (contract D5). */
 		host?: string;
 		/** Mirrored-argv dir on that machine (`remote-child-fate-v1` §3). */
@@ -3465,6 +3535,7 @@ export class Orchestrator {
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
+			...(input.worktreeSource ? { worktreeSource: input.worktreeSource } : {}),
 			...(input.host ? { host: input.host } : {}),
 			...(input.remoteDir ? { remoteDir: input.remoteDir } : {}),
 			...(input.remoteTerminal ? { remoteTerminal: input.remoteTerminal } : {}),
