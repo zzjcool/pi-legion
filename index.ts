@@ -54,6 +54,7 @@ import {
 import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
+import { deliverNotice, installNoticeChannel, liveNoticeChannel, NOTICE_LOG_FILE, noticeScopeKey, noticeScopeOf, rememberNoticeScope } from "./src/extension/notice-delivery.ts";
 import { LegionPostman, registerLegionTools, verificationSummary, type LegionMailCommand, type VerificationSummary } from "./src/extension/legion-tools.ts";
 import { registerLegionOutputTool } from "./src/extension/legion-output.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
@@ -639,20 +640,51 @@ const INTERRUPTED_HEAD = "interrupted (parent turn ended; children still running
  */
 const SHUTDOWN_RETIRE_BUDGET_MS = 5_000;
 
-function notice(pi: ExtensionAPI, text: string): void {
-	// #273: `sendMessage` is a host ACTION and pi throws
-	// "Extension runtime not initialized. Action methods cannot be called during
-	// extension loading." if it is reached before the runtime is up. An error
-	// handler that is more fatal than the error it reports turns "a resume
-	// failed" into "the whole agent process died", which is what happened on the
-	// centurion recovery path. Degrade to stderr instead; the caller still gets
-	// the fact, and nothing crashes.
-	try {
-		pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
-		console.error(`[pi-legion] notice not delivered (${reason}): ${text}`);
-	}
+/**
+ * The one message shape a notice uses: a visible `followUp` that wakes the parent.
+ *
+ * Kept separate from {@link notice} because the shape is the part a live channel
+ * and a load-captured `pi` share — #442's fix is about WHICH host object receives
+ * it, and it must not be able to drift into two slightly different payloads.
+ */
+function sendNoticeMessage(pi: ExtensionAPI, text: string): void {
+	pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+}
+
+/**
+ * Deliver one notice (`legion_mail`, a recovery fact, …) into this session.
+ *
+ * #273: `sendMessage` is a host ACTION and pi throws "Extension runtime not
+ * initialized. Action methods cannot be called during extension loading." if it is
+ * reached before the runtime is up. An error handler that is more fatal than the
+ * error it reports turns "a resume failed" into "the whole agent process died",
+ * which is what happened on the centurion recovery path. Nothing here throws; the
+ * caller still gets the fact and nothing crashes.
+ *
+ * #442 A: the `pi` this closure captured at LOAD time is not the delivery path any
+ * more — the host invalidates it on `ctx.newSession()` / `fork` / `switchSession` /
+ * `reload()`, and a legion runtime (a stall watcher, the postman, a queued resume)
+ * outlives that by design, so every notice after a session replacement was a
+ * silent loss with a red stderr line in its place. {@link deliverNotice} resolves
+ * the scope's CURRENT channel (installed by the newest load, see `piLegion`) and
+ * also keeps `pi` as the last-resort fallback. Its failure path is ONE summary line
+ * plus the body in the log file (#442 B), and a repeated stall detection is
+ * attempted once per window (#442 C).
+ *
+ * Exported for the #442 wiring tests (`test/unit/notice-delivery.test.ts` boots the
+ * extension TWICE, then calls this with the OLD `pi`); inside the extension it is
+ * reached through the five `notice(input.pi, …)` call sites, and every one of them
+ * is a place where a stale `pi` used to mean a silently lost notice.
+ */
+export function notice(pi: ExtensionAPI, text: string): void {
+	const scope = noticeScopeOf(pi);
+	deliverNotice({
+		scope,
+		owner: pi,
+		live: liveNoticeChannel(scope),
+		text,
+		fallback: (body) => sendNoticeMessage(pi, body),
+	});
 }
 
 /**
@@ -1634,6 +1666,56 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	 * parameter through the command layer for one reader.
 	 */
 	let lastSessionFile: string | undefined;
+	/**
+	 * Where an undeliverable notice body is written (#442 B).
+	 *
+	 * The run store is the only per-project directory this extension already owns,
+	 * so the log lands next to `session-errors.jsonl` instead of somewhere a user
+	 * would never think to look. A cwd that cannot be resolved (or a notice that
+	 * fires before `lastCwd` exists) answers `undefined`, and the summary line says
+	 * so out loud rather than promising a file.
+	 */
+	function noticeLogPath(): string | undefined {
+		try {
+			return path.join(runStoreFor(lastCwd).rootDir, NOTICE_LOG_FILE);
+		} catch {
+			return undefined;
+		}
+	}
+	// ── #442 A: this load is the LIVE delivery channel for its session ────────
+	//
+	// `notice()` may never deliver through the `pi` a closure captured: the host
+	// invalidates that object on `ctx.newSession()` / `fork` / `switchSession` /
+	// `reload()`, while the legion runtimes built here (postman, stall watchers, a
+	// resume queued from the load path) keep calling it long after. The replacement
+	// session loads this extension again with a FRESH `pi`, so every load registers
+	// itself under its own scope and an older instance's notice resolves the newest
+	// one. `ExtensionContext` has no `sendMessage` (only the `ReplacedSessionContext`
+	// of `withSession` does), so the `pi` of the newest load IS the live channel; the
+	// registry is what makes it reachable from a closure that only has the old one.
+	//
+	// The scope keeps siblings apart: one process holds the root session AND every
+	// in-process child, so a single process-wide slot would deliver a parent's
+	// notice into whichever child loaded last. A child's identity comes from the
+	// SAME channel `resolveLegionIdentity` reads — its AsyncLocalStorage context when
+	// it has one (never `PI_LEGION_*`, which is its parent's env in-process).
+	const noticeScope = noticeScopeKey({
+		isChild,
+		dbPath: hasInjectedChildContext ? childContext?.dbPath : process.env[LEGION_DB_ENV],
+		nodeId: hasInjectedChildContext ? childContext?.nodeId : process.env[LEGION_NODE_ID_ENV],
+	});
+	rememberNoticeScope(pi, noticeScope);
+	const uninstallNoticeChannel = installNoticeChannel(noticeScope, {
+		owner: pi,
+		send: (text) => sendNoticeMessage(pi, text),
+		logPath: noticeLogPath,
+	});
+	// A session that ends stops being a delivery target; the next load for the same
+	// scope (a replacement session) owns the entry from the moment it installs, and
+	// the uninstall only removes what is still ours.
+	pi.on("session_shutdown", () => {
+		uninstallNoticeChannel();
+	});
 	const supervisor = deps.supervisor ?? new RoutingSupervisor({
 		rpc: new RpcSupervisor({ onSpawnRefused }),
 		// The in-process supervisor is constructed here (not by RoutingSupervisor) so
