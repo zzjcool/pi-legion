@@ -12,6 +12,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type {
@@ -152,6 +153,11 @@ import {
 	unknownChildMessage,
 	type CandidateStore,
 } from "./src/runs/store-lookup.ts";
+// #450: the bounded store surface (`<cwd>/.pi-subagents` today, every store this machine
+// plausibly knows about when the cwd lives inside `$HOME`). Discovery is the ONE place
+// that decides which roots are worth reading — `status`, `list all:true`, `recover` and
+// the session-start re-attach all ask it rather than each inventing a walk.
+import { discoverLocalStores, formatStoreLabel, sameStore, storeCwdOf } from "./src/runs/store-scan.ts";
 import { RUN_OWNER_FILE, isPidAlive, ownerState, readOwnerFile } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
@@ -170,7 +176,7 @@ import {
 	type RemoteTerminalProbe,
 	type RemoteTerminalProbeRequest,
 } from "./src/runs/remote-artifact.ts";
-import { findRecoveryLedgerForName, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
+import { findRecoveryLedgerAcrossStores, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION, type RecoveryStore } from "./src/runs/remote-recover.ts";
 import {
 	createReattachSettle,
 	deliverReattachNotice,
@@ -447,7 +453,7 @@ const SubagentParams = Type.Object({
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children under cwd — with `all:true` the retired/finished children are listed below it too (omit `name` for the overview, no `all` needed).",
+			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children across this machine's stores — with `all:true` the retired/finished children are listed below it too (omit `name` for the overview, no `all` needed). list: with `all:true` the roster is followed by every store's live children (a record from another store carries `store=<label>`).",
 		}),
 	),
 	runId: Type.Optional(
@@ -2025,8 +2031,40 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
 				});
 				const log = reattachLogSink(store.rootDir);
-				const report = await runReattachPass({ store, sessionFile, settings, log });
-				const summary = formatReattachSummary(report);
+				// #450: the pass looks at every store this machine plausibly knows about, not
+				// just this cwd's. `discoverLocalStores` is the bounded, hermetic surface
+				// (`store-scan.ts`): a cwd outside `$HOME` yields its own store only, and a
+				// truncated scan is REPORTED through `storeScan` instead of silently narrowing
+				// the pass. Every write below is routed to the store the record came from —
+				// adoption, the run-record mirror and the notice latch all belong to THAT
+				// store, and stamping them into the session's store would leave the real
+				// record owed forever (and create a run dir nobody launched).
+				const home = os.homedir();
+				const discovered = discoverLocalStores({ cwd, home });
+				const surfaceStores: RunStore[] = [store];
+				const storesByRoot = new Map<string, RunStore>([[path.resolve(store.rootDir), store]]);
+				const extraStores: RunStore[] = [];
+				for (const located of discovered.stores) {
+					const rootDir = path.resolve(located.rootDir);
+					if (storesByRoot.has(rootDir)) continue;
+					const foreign = new RunStore({ rootDir: located.rootDir });
+					extraStores.push(foreign);
+					surfaceStores.push(foreign);
+					storesByRoot.set(rootDir, foreign);
+				}
+				/** The store a watcher target / pending notice came from; the session's store when unknown. */
+				const storeForRoot = (rootDir: string | undefined): RunStore =>
+					(rootDir !== undefined ? storesByRoot.get(path.resolve(rootDir)) : undefined) ?? store;
+				const report = await runReattachPass({
+					store,
+					sessionFile,
+					settings,
+					log,
+					stores: extraStores,
+					storeScan: discovered.stats,
+					home,
+				});
+				const summary = formatReattachSummary(report, { home });
 				if (summary) {
 					// ONE line, and NOT the transcript (#445 §6) — the same channel the storage
 					// sweep uses, for the same reason.
@@ -2040,7 +2078,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 						// #445: the record follows the ledger. `status` reads run.json, so a child
 						// that finished over there must stop claiming `working` HERE.
 						recordSettlement: async (target, recovery) => {
-							await store.updateChild(target.runId, target.name, (child) => {
+							await storeForRoot(target.storeRoot).updateChild(target.runId, target.name, (child) => {
 								child.state = "retired";
 								child.retiredAt ??= new Date(Date.now()).toISOString();
 								child.execution = recovery.execution;
@@ -2050,7 +2088,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 						},
 						markNotified: async (target, at) => {
 							// #445 §7: write-once, and only after a delivered send.
-							await store.updateChild(target.runId, target.name, (child) => {
+							await storeForRoot(target.storeRoot).updateChild(target.runId, target.name, (child) => {
 								if (child.reattached) child.reattached.notifiedAt ??= at;
 							});
 						},
@@ -2058,6 +2096,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					});
 					for (const child of report.adopted) {
 						reattachWatcher.add({
+							storeRoot: child.storeRoot,
+							storeCwd: child.storeCwd,
 							runId: child.runId,
 							name: child.name,
 							host: child.host,
@@ -2069,11 +2109,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					reattachWatcher.start();
 				}
 				// The latch's other half: a notice a previous session could not deliver is
-				// owed, not lost. Delivered here, then latched — once.
-				for (const entry of pendingReattachNotices(store)) {
+				// owed, not lost. Delivered here, then latched — once, in the store that
+				// actually holds the record (a notice from `~/code/anotify` is not this
+				// store's to stamp).
+				for (const entry of pendingReattachNotices(surfaceStores)) {
 					if (!reattachNotice(pendingReattachNotice(entry).content)) continue;
 					const at = Date.now();
-					await store.updateChild(entry.runId, entry.name, (child) => {
+					await storeForRoot(entry.storeRoot).updateChild(entry.runId, entry.name, (child) => {
 						if (child.reattached) child.reattached.notifiedAt ??= at;
 					});
 				}
@@ -2873,7 +2915,31 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
 			});
 
-			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
+			if (action === "list") {
+				const roster = renderAgentList(agents, team, teamWarnings);
+				// #450: `all:true` follows the roster with every store's LIVE children, rendered
+				// by the SAME surface `status` uses (`store=` markers included), so a row cannot
+				// read differently depending on which call asked for it. Without `all` the
+				// answer is the roster and nothing else — byte for byte what it was.
+				if (params.all !== true) return ok(roster);
+				// `ownLegionIdentity()` is the identity this session has ADOPTED so far; `list`
+				// runs before the per-call legion resolution below, and a read of this session's
+				// own `nodes` rows needs nothing more (absent = the renderer omits the line).
+				const legion = ownLegionIdentity();
+				const overview = renderScanOverview({
+					surface: scanSurfaceFor({
+						store,
+						cwd,
+						...(ctx.cwd && ctx.cwd !== cwd ? { callerCwd: ctx.cwd } : {}),
+					}),
+					supervisor,
+					runtime,
+					ledgerNodeFor: (child: StatusChildRecord) =>
+						legion && child.nodeId ? getNode(legion.db, child.nodeId) : undefined,
+					now: Date.now(),
+				}).text;
+				return ok(`${roster}\n\n${overview}`);
+			}
 			if (action === "diagnose") {
 				let sections;
 				try {
@@ -3846,61 +3912,33 @@ async function controlAction(input: {
 			);
 		}
 		if (!params.name) {
-			const runs = store.listRuns();
-			// Liveness facts are read once per name and reused by both the filter and
-			// the block, so `status` cannot classify a child one way and render it
-			// another (display-liveness D6 exit 1).
-			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack }>();
-			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
-				const cached = factsByName.get(child.name);
-				if (cached) return cached;
-				const alive = input.supervisor.isAlive(child.name);
-				const owner = ownerVerdictFor(store, () => runs, child.name, alive);
-				// A pid only exists for a child this process actually tracks; a
-				// record from another session has none, and none is invented.
-				const pid = input.runtime.get(child.name)?.pid;
-				// #315/#331: same rule for the in-flight stack — only this process's
-				// live backend can answer, and `undefined` renders no line.
-				const inFlightTools = inFlightToolStackOf(input.supervisor, child.name);
-				const facts = {
-					alive,
-					...(owner ? { owner } : {}),
-					...(pid ? { pid } : {}),
-					...(inFlightTools ? { inFlightTools } : {}),
-				};
-				factsByName.set(child.name, facts);
-				return facts;
-			};
-			const classified = classifyChildrenForStatus(runs, factsFor);
 			const now = Date.now();
-			// 6.2.5 / D5: the run-store record is the first source for where a child runs;
-			// this session's ledger row for the same node is the second (a run.json written
-			// by a rebuild or an older build can lack the pair, while the ledger has it).
-			const overview = renderStatusOverview(
-				classified.map(({ child, live }) => {
-					const { pid, inFlightTools, ...facts } = factsFor(child);
-					const remote = childRemoteFacts(child, ledgerNodeFor(child));
-					return {
-						child: { ...child, ...remote },
-						...facts,
-						...(pid ? { pid } : {}),
-						...(inFlightTools ? { inFlightTools } : {}),
-						live,
-					};
-				}),
+			// #450: children from EVERY store on the bounded scan surface, not just this
+			// cwd's. A record is keyed by `(store, name)`, so `status` must read each store
+			// under its own rules and mark a foreign row with `store=<label>` — the header
+			// text and the single-store output stay exactly what they were.
+			const surface = scanSurfaceFor({ store, cwd, callerCwd: input.callerCwd });
+			const { text: overview, liveNames } = renderScanOverview({
+				surface,
+				supervisor: input.supervisor,
+				runtime: input.runtime,
+				ledgerNodeFor,
 				now,
-			);
+			});
 			// D7 (polish round): `all` has to MEAN something. The overview above is
 			// live-only by construction (`TERMINAL_STATUS_CHILD_STATES` is skipped), so
 			// `all` used to be a switch that changed nothing — the second of the two
 			// shapes the contract allows. It now adds the retired/finished records below
 			// the live overview; omitting `all` gives exactly what it gave before.
 			if (params.all !== true) return ok(overview);
+			// #450: `retired/finished` stays the SESSION store's history. The widened surface
+			// is for what is still running (or owed); dumping every repository's past into
+			// `status all` would be a wall of rows the caller never asked about (measured on
+			// this machine: 195 terminal names in one neighbouring store) — the exact noise
+			// #442/#445 forbid. A foreign LIVE row is still listed above, with its marker.
+			const sessionSurface = surface[0]!;
 			const finished = renderFinishedStatusSection(
-				listFinishedChildrenForStatus(
-					runs,
-					classified.map(({ child }) => child.name),
-				),
+				listFinishedChildrenForStatus(sessionSurface.runs, liveNames.get(sessionSurface.rootDir) ?? []),
 			);
 			return ok(finished ? `${overview}\n\n${finished}` : overview);
 		}
@@ -3928,13 +3966,25 @@ async function controlAction(input: {
 		}
 		// #270: a miss in this store is not a miss overall — a worktree child's
 		// record lives under its own store, which this one cannot enumerate.
-		const found = scope.found ?? findChildAcrossStores({
-			name: params.name,
-			cwd,
-			callerCwd: input.callerCwd,
-			ownRoot: store.rootDir,
-		});
+		//
+		// #450: the search is the same bounded store surface `status`/`list` read. It
+		// returns EVERY store that holds the name, not just the first: a name is scoped
+		// to a store, so two repositories' `worker-0` are two different children.
+		const elsewhere = scope.found
+			? []
+			: findChildrenAcrossStores({ name: params.name, cwd, callerCwd: input.callerCwd, ownRoot: store.rootDir });
+		if (elsewhere.length > 1) {
+			return fail(crossStoreAmbiguityMessage("status", params.name, elsewhere), ErrorCodes.NOT_FOUND);
+		}
+		const crossStore = elsewhere[0];
+		const found = scope.found ?? crossStore;
 		if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
+		// #450: which store the record was ACTUALLY read from. A scoped hit is this
+		// store's; anything else came from another store, whose run dir the owner
+		// verdict has to read (`ownerVerdictFor` is per run dir, never global).
+		const foundRoot = crossStore !== undefined ? crossStore.storeRoot : store.rootDir;
+		const foreign = !sameStore(foundRoot, store.rootDir);
+		const foundStore = foreign ? new RunStore({ rootDir: foundRoot }) : store;
 		// #312: when the record is not this session's own child, say which run it
 		// came from. A direct hit adds nothing — the existing output is unchanged.
 		//
@@ -3949,7 +3999,16 @@ async function controlAction(input: {
 		const alive = input.supervisor.isAlive(params.name);
 		// #312: the owner verdict belongs to the run dir of the record just resolved
 		// (`found.runId`) — not to whatever `pickChildByName` prefers across runs.
-		const owner = ownerVerdictFor(store, scope.runs, params.name, alive, found.runId);
+		// #450: and the STORE it was resolved in: a foreign run dir must not be probed
+		// through the session store's path (`<sessionRoot>/runs/<foreign id>` is a
+		// directory that does not exist, which would read as `owner: dead`).
+		const owner = ownerVerdictFor(
+			foundStore,
+			foreign ? () => foundStore.listRuns() : scope.runs,
+			params.name,
+			alive,
+			found.runId,
+		);
 		// #315: what it is doing and for how long, prepended to the block when this
 		// process is actually running a tool for it.
 		const snapshot = renderLiveChildStatus({
@@ -3969,6 +4028,8 @@ async function controlAction(input: {
 			...childWorktreeFacts(found.child),
 			alive,
 			...(owner ? { owner } : {}),
+			// #450: a record from another store says which one, right after `session=`.
+			...(foreign ? { store: formatStoreLabel(foundRoot) } : {}),
 		});
 		const inFlightTools = inFlightToolStackOf(input.supervisor, found.child.name);
 		const rendered = withInFlightToolLine(snapshot, inFlightTools, Date.now());
@@ -4270,6 +4331,36 @@ function ambiguousChildMessage(
 		describeChildScopeCandidates(candidates) +
 		"\nPass `runId` to name the run that holds the one you mean."
 	);
+}
+
+/**
+ * #450: the same name, found in more than one STORE.
+ *
+ * `ambiguousChildMessage` above is the within-store case (two runs of one store) and is
+ * untouched. This is its cross-store sibling, and it exists because the scan surface is
+ * now wider than one repository: `worker-0` in `~/agents` and `worker-0` in
+ * `~/code/anotify` are two unrelated children, and answering about one of them while
+ * the caller meant the other is the cross-talk a widened surface must never introduce.
+ *
+ * The candidates are printed as `store=<label> run=<id>` because a run id is unique
+ * only inside its own store: two ids without their stores would read like a formatting
+ * bug, and one id alone would be the silent pick this refuses to make.
+ */
+function crossStoreAmbiguityMessage(
+	action: string,
+	name: string,
+	candidates: readonly CrossStoreChild[],
+): string {
+	const lines = [
+		`${name} is ambiguous: ${candidates.length} stores hold a child with that name, so \`${action}\` will not guess which one you mean (a name is scoped to a store, and answering from the wrong one would mix two projects).`,
+	];
+	for (const candidate of candidates) {
+		lines.push(`  store=${formatStoreLabel(candidate.storeRoot)} run=${candidate.runId}`);
+	}
+	lines.push(
+		"Fix: run the call from that store's directory, or pass `cwd:` with one of the store directories above so only one store is searched.",
+	);
+	return lines.join("\n");
 }
 
 /**
@@ -6923,6 +7014,9 @@ export function listFinishedChildrenForStatus(
  * One line each, so the section stays a list of what EXISTS rather than a second
  * rendering of the live blocks above; the outcome detail reuses the wording the
  * retired-record notes already use (`execution: success, retired at …`).
+ *
+ * #450: this section stays the SESSION store's history (`status all`), so it needs no
+ * `store=` marker: every line below it is a row of the store the caller is standing in.
  */
 export function renderFinishedStatusSection(children: StatusChildRecord[]): string | undefined {
 	if (children.length === 0) return undefined;
@@ -6944,6 +7038,11 @@ export interface StatusChildEntry {
 	alive: boolean;
 	/** Run-dir ownership verdict (#209-3); see {@link renderLiveChildStatus}. */
 	owner?: "live" | "dead" | "unknown";
+	/**
+	 * #450: `store=<label>` for a record that came from another store than the
+	 * session's own. Absent ⇒ the block is byte-identical to the single-store one.
+	 */
+	store?: string;
 	/**
 	 * Own process of an `rpc` child, when this session launched it. A pid is
 	 * not persisted, so a record from another session has none — and none is
@@ -6967,7 +7066,7 @@ export interface StatusChildEntry {
 export function renderStatusOverview(children: StatusChildEntry[], now: number = Date.now()): string {
 	const deadCount = children.filter((entry) => entry.live === false).length;
 	const liveCount = children.length - deadCount;
-	const blocks = children.map(({ child, alive, owner, pid, inFlightTools }) =>
+	const blocks = children.map(({ child, alive, owner, pid, inFlightTools, store }) =>
 		withInFlightToolLine(
 			renderLiveChildStatus({
 				name: child.name,
@@ -6989,6 +7088,9 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				...childWorktreeFacts(child),
 				alive,
 				...(owner ? { owner } : {}),
+				// #450: after the ownership verdict, one `store=` line for a foreign record
+				// (the renderer prints it right after the `session=` meta line).
+				...(store ? { store } : {}),
 				...(pid ? { pid } : {}),
 			}),
 			inFlightTools,
@@ -7008,6 +7110,147 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 	if (deadCount > 0) parts.push(`(${deadCount} dead)`);
 	if (blocks.length > 0) parts.push("", blocks.join("\n\n"));
 	return parts.join("\n");
+}
+
+/**
+ * #450: one store on the `status` / `list all:true` scan surface.
+ *
+ * `label` is the `store=<label>` marker, and it is set ONLY for a store that is not the
+ * session's own: a single-store session therefore renders exactly what it rendered
+ * before #450 (`renderLiveChildStatus` prints no line at all without it).
+ */
+interface ScanSurfaceStore {
+	/** Resolved `<cwd>/.pi-subagents`. */
+	rootDir: string;
+	store: RunStore;
+	/** `store=` marker; absent for the session's own store. */
+	label?: string;
+	runs: ReturnType<RunStore["listRuns"]>;
+}
+
+/**
+ * #450: the store surface a `status` / `list all:true` call reads.
+ *
+ * The session's own store first — that is the store this call already loaded, and its
+ * records keep their position in the output — then every root `discoverLocalStores`
+ * judges worth looking at. Discovery owns the bounded, hermetic rules (`store-scan.ts`):
+ * a cwd outside `$HOME` yields its own store only, so a throwaway directory never
+ * inherits the live children of whatever repository happens to sit at home.
+ *
+ * A store that cannot be read contributes nothing: one unreadable directory must not
+ * cost the session the others (the same rule `scanLocalStoreRuns` states).
+ */
+function scanSurfaceFor(input: {
+	store: RunStore;
+	cwd: string;
+	callerCwd?: string | undefined;
+}): ScanSurfaceStore[] {
+	const surface: ScanSurfaceStore[] = [];
+	const seen = new Set<string>();
+	const sessionRoot = path.resolve(input.store.rootDir);
+	const push = (rootDir: string, store: RunStore): void => {
+		const resolved = path.resolve(rootDir);
+		if (seen.has(resolved)) return;
+		seen.add(resolved);
+		let runs: ReturnType<RunStore["listRuns"]> = [];
+		try {
+			runs = store.listRuns();
+		} catch {
+			// Unreadable store: keep the surface, drop the rows.
+		}
+		surface.push({ rootDir: resolved, store, runs });
+	};
+	push(sessionRoot, input.store);
+	try {
+		for (const located of discoverLocalStores({
+			cwd: input.cwd,
+			...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
+		}).stores) {
+			if (seen.has(path.resolve(located.rootDir))) continue;
+			push(located.rootDir, new RunStore({ rootDir: located.rootDir }));
+		}
+	} catch {
+		// Discovery is a convenience: a session that cannot scan still sees its own store.
+	}
+	for (const entry of surface) {
+		if (entry.rootDir === sessionRoot) continue;
+		entry.label = formatStoreLabel(entry.rootDir);
+	}
+	return surface;
+}
+
+/** The overview text plus the per-store live names the `all` section excludes. */
+interface ScanOverview {
+	text: string;
+	/** `rootDir` → the names this store reports as live (its `all` section subtracts them). */
+	liveNames: Map<string, string[]>;
+}
+
+/**
+ * #450: the live-children overview across the WHOLE scan surface.
+ *
+ * Every classification rule is the single-store one, applied PER STORE: the run-dir
+ * ownership verdict is read from THAT store's runs (`ownerVerdictFor(thatStore, …)`),
+ * while `supervisor.isAlive` / `runtime.get(name)?.pid` / the in-flight stack stay
+ * global by name — this process's registry is global, and a foreign child has no job
+ * here, so `alive=false` is the correct answer for it.
+ *
+ * Names are deduped inside a store (the pre-existing name-reuse rule) and never across
+ * stores: identity is `(store, name)`, so `~/agents` and `~/code/anotify` each showing a
+ * `worker-0` is two rows, not one — a silent cross-store pick is exactly the
+ * cross-talk the widened surface must not introduce.
+ */
+function renderScanOverview(input: {
+	surface: ScanSurfaceStore[];
+	supervisor: LegionSupervisor;
+	runtime: SessionRuntime;
+	/** This session's ledger row for a node, when it owns one (6.2.5 / D5). */
+	ledgerNodeFor: (child: StatusChildRecord) => LegionNode | null | undefined;
+	now: number;
+}): ScanOverview {
+	const entries: StatusChildEntry[] = [];
+	const liveNames = new Map<string, string[]>();
+	for (const surfaceStore of input.surface) {
+		const runs = surfaceStore.runs;
+		// Liveness facts are read once per name and reused by both the filter and the
+		// block, so `status` cannot classify a child one way and render it another
+		// (display-liveness D6 exit 1). One cache per store: the same name in two stores
+		// is two records, and its owner verdict comes from two different run dirs.
+		const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack }>();
+		const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
+			const cached = factsByName.get(child.name);
+			if (cached) return cached;
+			const alive = input.supervisor.isAlive(child.name);
+			const owner = ownerVerdictFor(surfaceStore.store, () => runs, child.name, alive);
+			// A pid only exists for a child this process actually tracks; a record from
+			// another session (or another store) has none, and none is invented.
+			const pid = input.runtime.get(child.name)?.pid;
+			const inFlightTools = inFlightToolStackOf(input.supervisor, child.name);
+			const facts = {
+				alive,
+				...(owner ? { owner } : {}),
+				...(pid ? { pid } : {}),
+				...(inFlightTools ? { inFlightTools } : {}),
+			};
+			factsByName.set(child.name, facts);
+			return facts;
+		};
+		const classified = classifyChildrenForStatus(runs, factsFor);
+		liveNames.set(surfaceStore.rootDir, classified.flatMap(({ child, live }) => (live ? [child.name] : [])));
+		for (const { child, live } of classified) {
+			const { pid, inFlightTools, ...facts } = factsFor(child);
+			const remote = childRemoteFacts(child, input.ledgerNodeFor(child));
+			entries.push({
+				child: { ...child, ...remote },
+				...facts,
+				...(pid ? { pid } : {}),
+				...(inFlightTools ? { inFlightTools } : {}),
+				live,
+				...(surfaceStore.label ? { store: surfaceStore.label } : {}),
+			});
+		}
+	}
+	return { text: renderStatusOverview(entries, input.now), liveNames };
 }
 
 /**
@@ -7454,25 +7697,57 @@ export async function recoverAction(input: {
 			ErrorCodes.INVALID_PARAMS,
 		);
 	}
-	// D1: this session's own ledger wins; otherwise the store on disk decides, because
+	// D1: this session's own ledger wins; otherwise the stores on disk decide, because
 	// a fresh process has no runtime identity by construction (only a launch creates
 	// one). A handle discovered here is OURS to close.
-	const discovered = input.legion === undefined && input.store !== undefined
-		? findRecoveryLedgerForName(input.store as RunStore, name, { sessionFile: input.sessionFile })
+	//
+	// #450: "the stores on disk" is the bounded surface `discoverLocalStores` returns,
+	// session store first — a leftover launched from `~/code/anotify` is still this
+	// machine's work, and scoping the search to today's cwd is what made a fresh session
+	// answer "no such child" about a child it launched yesterday. The ledger it finds is
+	// still the ONLY one written (invariant I1: one call never mixes two projects' rows).
+	const recoveryStores: RecoveryStore[] = [];
+	if (input.legion === undefined && input.store !== undefined) {
+		recoveryStores.push(input.store);
+		try {
+			const sessionRoot = input.store.rootDir;
+			for (const located of discoverLocalStores({ cwd: storeCwdOf(sessionRoot) }).stores) {
+				if (sameStore(located.rootDir, sessionRoot)) continue;
+				if (recoveryStores.some((entry) => sameStore(entry.rootDir, located.rootDir))) continue;
+				recoveryStores.push(new RunStore({ rootDir: located.rootDir }));
+			}
+		} catch {
+			// Discovery is a convenience: this session's own store is still searched.
+		}
+	}
+	const discovered = recoveryStores.length > 0
+		? findRecoveryLedgerAcrossStores(recoveryStores, name, { sessionFile: input.sessionFile })
 		: undefined;
 	const ledger = input.legion ?? discovered;
+	// The store whose ledger this call reads: a run record we have to reconcile lands
+	// THERE, never in the session's own store (which does not even hold that run).
+	const ledgerStore: RecoveryStore | undefined = discovered !== undefined
+		? recoveryStores.find((entry) => sameStore(entry.rootDir, discovered.storeRoot)) ?? input.store
+		: input.store;
 	if (!ledger) {
 		// D1: say WHERE we looked. A miss has to be actionable, and "no ledger in this
-		// session" was not: it never mentioned the directory the search is scoped to.
-		const where = input.store ? ` (searched ${path.join(input.store.rootDir, "runs")})` : "";
-		const recoverable = input.store
-			? listRecoverableLeftovers(input.store as RunStore, { sessionFile: input.sessionFile }).map((entry) => entry.node.name)
-			: [];
+		// session" was not: it never mentioned the directories the search is scoped to.
+		// #450: with a widened surface that list is the answer to "why didn't it find my
+		// child?" — every store the call actually opened, by its `store=` label.
+		const labels = recoveryStores.map((entry) => formatStoreLabel(entry.rootDir));
+		const where = labels.length === 0
+			? ""
+			: labels.length === 1
+				? ` (searched ${labels[0]})`
+				: ` (searched ${labels.length} stores: ${labels.join(", ")})`;
+		const recoverable = [...new Set(recoveryStores.flatMap((entry) =>
+			listRecoverableLeftovers(entry, { sessionFile: input.sessionFile }).map((leftover) => leftover.node.name),
+		))];
 		const hint = recoverable.length > 0
-			? ` Waiting for recovery: ${[...new Set(recoverable)].join(", ")} — call ${recoveryCallFor(recoverable[0]!)}.`
-			: " Nothing is waiting for recovery: no cross-machine node in this store is unsettled.";
+			? ` Waiting for recovery: ${recoverable.join(", ")} — call ${recoveryCallFor(recoverable[0]!)}.`
+			: " Nothing is waiting for recovery: no cross-machine node in these stores is unsettled.";
 		return ok(
-			`No cross-machine child named ${JSON.stringify(name)} in this session's or cwd's ledgers${where}.${hint} \`recover\` reads the tree a PREVIOUS session of this conversation left behind, so a launch that happened in another directory is recovered from that directory.`,
+			`No cross-machine child named ${JSON.stringify(name)} in this session's or cwd's ledgers${where}.${hint} \`recover\` reads the tree a PREVIOUS session of this conversation left behind, so a launch that happened in another directory is recovered with its store listed above.`,
 		);
 	}
 	let outcome;
@@ -7496,7 +7771,10 @@ export async function recoverAction(input: {
 			const recovery = outcome.recovery;
 			const directoryRunId = path.basename(path.dirname(ledger.dbPath));
 			const ownershipRunId = recovery.node.runId ?? (/^r-[0-9a-f]{6,}$/i.test(directoryRunId) ? directoryRunId : undefined);
-			const ownershipRun = ownershipRunId ? input.store?.listRuns().find((run) => run.runId === ownershipRunId) : undefined;
+			// #450: the run record is read from the store that OWNS the ledger just found
+			// (`ledgerStore`), not from the session's store — a foreign run dir has no entry
+			// there, which is how the ownership block lost its cwd/session facts.
+			const ownershipRun = ownershipRunId ? ledgerStore?.listRuns().find((run) => run.runId === ownershipRunId) : undefined;
 			const ownershipOwner = readOwnerFile(path.join(path.dirname(ledger.dbPath), RUN_OWNER_FILE));
 			recovery.ownership = {
 				name: recovery.node.name,
@@ -7530,7 +7808,9 @@ export async function recoverAction(input: {
 	// class of bug this release is fixing. Best-effort on purpose — the verdict is
 	// already written, and a record we cannot refresh must not fail the recovery.
 	if (recovery.kind === "settled-now" || recovery.kind === "already-settled") {
-		const store = input.store as { updateChild?: RunStore["updateChild"] } | undefined;
+		// #450: the mirror is written to the store the ledger lives in — `input.store` may be
+		// a different project's store, where this run id does not exist at all.
+		const store = ledgerStore as { updateChild?: RunStore["updateChild"] } | undefined;
 		if (store?.updateChild) {
 			const runId = path.basename(path.dirname(ledger.dbPath));
 			const at = new Date((input.now ?? Date.now)()).toISOString();
@@ -8166,32 +8446,62 @@ function findControlAgent(
  * nothing. The returned shape matches {@link findChild} so callers do not care
  * which store answered — except that `runDir` now belongs to the owning store,
  * which is why the caller re-derives its orchestrator run directory from it.
+ *
+ * #450: it now reports `storeRoot` too, because the widened surface can find the same
+ * name in several stores and the caller has to be able to name (and refuse) them.
  */
 function findChildAcrossStores(input: {
 	name: string;
 	cwd: string;
 	callerCwd?: string | undefined;
 	ownRoot: string;
-}): {
+}): CrossStoreChild | null {
+	return findChildrenAcrossStores(input)[0] ?? null;
+}
+
+/** A child record resolved outside the session's own store (#450). */
+interface CrossStoreChild {
 	runId: string;
-	run: ReturnType<RunStore["listRuns"]>[number];
+	run: RunRecord;
 	child: NonNullable<ReturnType<RunStore["findChild"]>>;
-} | null {
-	const { found } = resolveChildAcrossStores({
-		name: input.name,
-		cwd: input.cwd,
-		callerCwd: input.callerCwd,
-		roots: candidateStoreRoots({ cwd: input.cwd, callerCwd: input.callerCwd }).filter(
-			(candidate) => path.resolve(candidate.rootDir) !== path.resolve(input.ownRoot),
-		),
-	});
-	if (!found) return null;
-	// Read the owning store again for the full record: `resolveChildAcrossStores`
-	// only reports where the name was seen.
-	const runs = new RunStore({ rootDir: found.storeRoot }).listRuns();
-	const picked = pickChildByName(runs, input.name);
-	if (!picked) return null;
-	return { runId: picked.run.runId, run: picked.run, child: picked.child };
+	/** The store holding the record (never the session's own; see the caller). */
+	storeRoot: string;
+}
+
+/**
+ * #450: EVERY candidate store holding `name`, in store order, session store excluded.
+ *
+ * `candidateStoreRoots` is the widened #270/#450 surface: this cwd, the caller's cwd,
+ * their immediate children, the worktree stores below this run, and the bounded
+ * `discoverLocalStores` walk (which is hermetic when the cwd is outside `$HOME`).
+ *
+ * Returning all hits — where {@link findChildAcrossStores} returns the first — is what
+ * lets a caller refuse a cross-store ambiguity instead of silently answering about one
+ * repository's child with another repository's facts. It reads each store's runs once;
+ * a store that cannot be read is skipped, never fatal.
+ */
+function findChildrenAcrossStores(input: {
+	name: string;
+	cwd: string;
+	callerCwd?: string | undefined;
+	ownRoot: string;
+}): CrossStoreChild[] {
+	const hits: CrossStoreChild[] = [];
+	const own = path.resolve(input.ownRoot);
+	for (const candidate of candidateStoreRoots({ cwd: input.cwd, callerCwd: input.callerCwd })) {
+		const rootDir = path.resolve(candidate.rootDir);
+		if (rootDir === own) continue;
+		let runs: ReturnType<RunStore["listRuns"]>;
+		try {
+			runs = new RunStore({ rootDir }).listRuns();
+		} catch {
+			continue;
+		}
+		const picked = pickChildByName(runs, input.name);
+		if (!picked) continue;
+		hits.push({ runId: picked.run.runId, run: picked.run, child: picked.child, storeRoot: rootDir });
+	}
+	return hits;
 }
 
 function findChild(
