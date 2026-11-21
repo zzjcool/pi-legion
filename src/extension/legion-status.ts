@@ -11,10 +11,7 @@ import { recoveryStateWord, renderRemoteOwnershipBlock } from "../runs/remote-re
 import type { InFlightToolStack } from "../supervisor/types.ts";
 import { formatInFlightToolLine } from "../supervisor/types.ts";
 import { formatTree } from "./legion-tools.ts";
-import {
-	renderLiveChildStatus,
-	type LiveChildStatusInput,
-} from "./runtime.ts";
+import { renderLiveChildStatus, type LiveChildStatusInput } from "./runtime.ts";
 import { formatDuration } from "./summary.ts";
 
 /** Child snapshot the status tool already prints. `now` is supplied by the caller. */
