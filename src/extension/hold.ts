@@ -137,8 +137,15 @@ export interface HoldRecord {
 	heldMs?: number;
 	/** `name#round` of every child the hold was waiting on. */
 	children?: string[];
-	/** The chain's continuation vote at the moment this boundary opened (#421). */
-	chainVote?: ChainVote;
+	/**
+	 * The chain's continuation vote at the moment this boundary opened (#421).
+	 *
+	 * #439: REQUIRED, not optional. The issue's whole complaint is a SILENT override, so a
+	 * record without the vote is the defect restated: every line of the trace must say what
+	 * the chain held — `hold:release` and `hold:commit` included, not just begin/end/abstain.
+	 * A record is the last thing a 1.5.2 user gets to see, and it has to be enough on its own.
+	 */
+	chainVote: ChainVote;
 	/** Entries the host already had queued for this boundary, and what we returned. */
 	entriesIn?: number;
 	entriesOut?: number;
@@ -324,13 +331,13 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 		}
 	};
 
-	const abstain = (outcome: HoldOutcome, at: number, reason?: string, chainVote?: ChainVote): undefined => {
+	const abstain = (outcome: HoldOutcome, at: number, reason: string | undefined, chainVote: ChainVote): undefined => {
 		record({
 			ev: "hold:abstain",
 			at,
 			outcome,
+			chainVote,
 			...(reason === undefined ? {} : { reason }),
-			...(chainVote === undefined ? {} : { chainVote }),
 		});
 		return undefined;
 	};
@@ -378,17 +385,24 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 			// above all no announcement (entries persist through an abort — §3 H11).
 			const outcome = boundary.outcome;
 			if (outcome !== undefined && outcome !== "completed") return abstain("cancelled", startedAt, undefined, vote);
-			const children = deps.liveChildren();
-			if (children === undefined) return abstain("degraded", startedAt, undefined, vote);
-			if (children.length === 0) return abstain("idle", startedAt, undefined, vote);
-			// #421: a handler BEFORE us said this turn must not continue. legion's own rule is
-			// "never be the one that stops a turn" — and this is not that rule: the turn was
+			// #421/#439: a handler BEFORE us said this turn must not continue. legion's own rule
+			// is "never be the one that stops a turn" — and this is not that rule: the turn was
 			// already stopped, and continuing it here would overwrite the only vote the chain
-			// holds. So the hold stands down, nothing is taken (the notice keeps waiting for
-			// the normal path) and the reason is recorded instead of swallowed.
+			// holds. So the hold stands down, nothing is taken (the notice keeps waiting for the
+			// normal path) and the reason is recorded instead of swallowed.
+			//
+			// #439: the vote is a fact about the BOUNDARY, so it is answered before any local
+			// question (`degraded`, `idle`). A veto on a boundary this hold would not have held
+			// anyway is still a veto, and the trace has to say so — otherwise the one verdict the
+			// issue asks for becomes invisible again whenever no child happens to be live.
+			// Every branch below is read-only: all of them return `undefined` with zero waits and
+			// no `takeNotice()`, so moving the gate changes NOTHING but the recorded outcome.
 			if (vote === "veto") {
 				return abstain("peer-continue-false", startedAt, "hold skipped: peer continue:false", vote);
 			}
+			const children = deps.liveChildren();
+			if (children === undefined) return abstain("degraded", startedAt, undefined, vote);
+			if (children.length === 0) return abstain("idle", startedAt, undefined, vote);
 			// §7: the user's own message must never wait behind this hold. Checked before the
 			// first sleep, so a boundary that opens with a queued message is not held at all.
 			if (userWaiting(context)) return abstain("user-waiting", startedAt, undefined, vote);
@@ -426,7 +440,7 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 			const exitWithoutDelivery = (exitOutcome: HoldOutcome, reason?: string): undefined => {
 				const at = now();
 				deps.releaseNotice();
-				record({ ev: "hold:release", at, outcome: exitOutcome });
+				record({ ev: "hold:release", at, outcome: exitOutcome, chainVote: vote });
 				record({
 					ev: "hold:end",
 					at,
@@ -474,7 +488,7 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 					// notice that was announced must never be announced again.
 					deps.commitNotice();
 					const at = now();
-					record({ ev: "hold:commit", at, outcome: "completed", noticeChars: taken.content.length });
+					record({ ev: "hold:commit", at, outcome: "completed", noticeChars: taken.content.length, chainVote: vote });
 					record({
 						ev: "hold:end",
 						at,

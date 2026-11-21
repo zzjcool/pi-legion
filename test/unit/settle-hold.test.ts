@@ -712,6 +712,11 @@ test("#421: on a host whose \"nobody spoke\" value IS `false` (pi 1.5.2) the sam
 	// The ONLY difference is what the trace says the chain had decided.
 	assert.equal(control.records[0]?.chainVote, "absent");
 	assert.equal(withFalse.records[0]?.chainVote, "sentinel");
+	// #439: “逐字不变” is pinned on the WHOLE record stream, not only on the answer: with the
+	// one field that is allowed to differ stripped, the two traces must be indistinguishable.
+	const stripVote = (records: HoldRecord[]): Omit<HoldRecord, "chainVote">[] =>
+		records.map(({ chainVote: _vote, ...rest }) => rest);
+	assert.deepEqual(stripVote(withFalse.records), stripVote(control.records));
 });
 
 test("#421: `continue: true` from an earlier handler is echoed, not invented", async () => {
@@ -726,6 +731,95 @@ test("#421: `continue: true` from an earlier handler is echoed, not invented", a
 	assert.equal(result?.continue, true);
 	assert.equal(h.records[0]?.chainVote, "continue");
 	assert.equal(h.calls.take, 1);
+});
+
+// ─────────────── #439: the vote is named on EVERY record, in all four states ───────────────
+
+test("#439: a vetoed boundary is peer-continue-false even when there is nothing to hold", async () => {
+	// The vote is a fact about the BOUNDARY, not about this hold's child list: a peer said
+	// "do not continue this turn". Recording `idle` here would hide the one verdict #439 asks
+	// for, so the gate sits before the local questions. Behavior is unchanged either way —
+	// this branch returns `undefined` with zero waits and never touches the outbox.
+	const h = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	// The first boundary teaches the instance that this host can say "nobody spoke yet".
+	const first = await h.hold.beforeSettle({ entries: [], outcome: "completed" }, h.ctx);
+	assert.equal(first?.continue, true, "the absent boundary was a normal delivery (nobody spoke)");
+	assert.equal(h.calls.take, 1, "the first boundary was a normal delivery");
+	const sleeps = h.sleeps.length;
+	const claims = h.calls.owns;
+	// The second boundary carries the peer's `false` — and there is no live child left.
+	const result = await h.hold.beforeSettle({ entries: [EXISTING], outcome: "completed", continue: false }, h.ctx);
+	assert.equal(result, undefined, "legion must not continue a turn a peer refused to continue");
+	const record = h.records.at(-1);
+	assert.equal(record?.ev, "hold:abstain");
+	assert.equal(record?.outcome, "peer-continue-false");
+	assert.equal(record?.reason, "hold skipped: peer continue:false");
+	assert.equal(record?.chainVote, "veto");
+	assert.equal(h.sleeps.length, sleeps, "zero waits");
+	assert.equal(h.calls.take, 1, "and no notice is taken: it stays on the normal path");
+	assert.equal(h.calls.owns, claims, "the boundary was never claimed, so no rescue timer was cancelled");
+});
+
+test("#439: the four chain votes are all diagnosable — continue / absent / sentinel / veto", async () => {
+	// The four values cannot all come from ONE host: on a host that can say "nobody spoke yet"
+	// (field absent) a later `false` is a veto, while on pi 1.5.2 the field is always present
+	// and `false` is the chain's starting value — the sentinel. Both hosts are exercised, and
+	// every value the type allows has to show up in the trace.
+	const settleFirstPoll = (state: Harness, index: number): void => {
+		if (index === 0) state.setChildren([]);
+	};
+	// pi 1.5.2: `false` on every fresh chain is the sentinel — the hold still holds (#417).
+	const legacy = harness({ onSleep: settleFirstPoll });
+	const legacyResult = await legacy.hold.beforeSettle(
+		{ entries: [], outcome: "completed", continue: false },
+		legacy.ctx,
+	);
+	assert.equal(legacyResult?.continue, true, "sentinel is not a veto: the hold delivers as before");
+	assert.equal(legacy.records.at(-1)?.chainVote, "sentinel");
+	// A peer that already asked to continue: echoed, and named as such.
+	await legacy.hold.beforeSettle({ entries: [], outcome: "completed", continue: true }, legacy.ctx);
+	assert.equal(legacy.records.at(-1)?.chainVote, "continue");
+	// A host that expresses "nobody spoke yet" by OMITTING the field.
+	const threeState = harness({ onSleep: settleFirstPoll });
+	const absentResult = await threeState.hold.beforeSettle({ entries: [], outcome: "completed" }, threeState.ctx);
+	assert.equal(absentResult?.continue, true, "absent means nobody spoke, so asking to continue is not an override");
+	assert.equal(threeState.records.at(-1)?.chainVote, "absent");
+	// …and from then on the same byte can only be a peer's own answer.
+	await threeState.hold.beforeSettle({ entries: [], outcome: "completed", continue: false }, threeState.ctx);
+	assert.equal(threeState.records.at(-1)?.chainVote, "veto");
+	assert.equal(threeState.records.at(-1)?.outcome, "peer-continue-false");
+
+	const votes = new Set([...legacy.records, ...threeState.records].map((record) => record.chainVote));
+	assert.deepEqual([...votes].sort(), ["absent", "continue", "sentinel", "veto"]);
+});
+
+test("#439: EVERY hold record carries the chain vote — release and commit included", async () => {
+	// The issue's wording is literal: 每条 hold 记录都带 chainVote. The field is REQUIRED in
+	// `HoldRecord`, because a trace line without the vote is the silent override again — and
+	// `hold:release` / `hold:commit` are exactly the lines a 1.5.2 user reads afterwards.
+	const delivered = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	await delivered.hold.beforeSettle({ entries: [], outcome: "completed", continue: true }, delivered.ctx);
+	const released = harness({ holdMaxMs: 300, pollMs: 100 });
+	await released.hold.beforeSettle({ entries: [], outcome: "completed" }, released.ctx);
+	for (const h of [delivered, released]) {
+		assert.ok(h.records.length > 0, "the harness recorded the whole boundary");
+		for (const record of h.records) {
+			assert.ok(
+				["continue", "absent", "sentinel", "veto"].includes(record.chainVote),
+				`${record.ev} (${record.outcome}) must name the chain's vote, got ${String(record.chainVote)}`,
+			);
+		}
+	}
+	const kinds = new Set([...delivered.records, ...released.records].map((record) => record.ev));
+	assert.deepEqual([...kinds].sort(), ["hold:begin", "hold:commit", "hold:end", "hold:release"]);
 });
 
 // ─────────────────────── 2. seam (real runtime + real ledger) ───────────────────────
