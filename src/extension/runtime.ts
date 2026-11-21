@@ -56,6 +56,7 @@ import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
+import type { OrphanStatusFacts, OrphanReclaimVerdict } from "../shared/types.ts";
 import type { LegionEvent, LegionEventBus } from "./event-bus.ts";
 import { LEGION_EVENT_TYPES, isDetailDeltaEvent } from "./event-bus.ts";
 import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
@@ -646,6 +647,12 @@ export interface LiveChildStatusInput {
 	 * not do a cross-store scan), which keeps every pre-#450 block byte-identical.
 	 */
 	store?: string;
+	/**
+	 * #456: set only for a row whose run.json/ledger says orphaned/unfetched; absent
+	 * leaves the pre-#456 output byte-identical. Display only — it never decides
+	 * liveness or writes anything.
+	 */
+	orphan?: OrphanStatusFacts;
 	now?: number;
 }
 
@@ -783,6 +790,26 @@ export function formatMirrorLine(facts: LiveMirrorFacts | undefined): string | u
 }
 
 /**
+ * #456: the state word an orphaned row is allowed to show.
+ *
+ * The four verdicts `src/runs/orphan-reclaim.ts` can reach are the four answers a
+ * reader needs; `state=orphaned` alone was true and useless — a row whose terminal
+ * was gone and whose work was done read exactly like one still running over there.
+ */
+export function orphanVerdictWord(verdict: OrphanReclaimVerdict): string {
+	switch (verdict) {
+		case "terminal-gone":
+			return "terminal gone, work done";
+		case "stale-orphan":
+			return "idle, transcript quiet";
+		case "working":
+			return "still working";
+		case "unknown":
+			return "liveness unknown";
+	}
+}
+
+/**
  * Status text for one child (`/legion status <name>` and `subagent status`).
  *
  * Living children lead with `alive · quiet Ns` so a long silent reasoning
@@ -819,9 +846,17 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const execution = stale
 		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
 		: input.execution;
+	// #456: the verdict is a presentation suffix on the frozen state word — the
+	// stale/ownerDead/shell rules above still decide what `state` says.
+	const orphanWord = input.orphan ? ` (${orphanVerdictWord(input.orphan.verdict)})` : "";
 	const lines = [
-		`${input.name} — state=${state} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
+		`${input.name} — state=${state}${orphanWord} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
 	];
+	// Directly under the header: the one sentence the verdict rests on, so a reader
+	// can check the word instead of trusting it. Display only, no line otherwise.
+	if (input.orphan?.evidence !== undefined && input.orphan.evidence.trim().length > 0) {
+		lines.push(`orphan: ${input.orphan.evidence}`);
+	}
 	if (shell !== undefined) {
 		// A shell is not "quiet": nothing was ever running to be quiet. This line is
 		// the answer to "is it working?", and `unknown` is the only claim the facts

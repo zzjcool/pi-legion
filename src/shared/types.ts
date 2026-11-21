@@ -438,6 +438,15 @@ export interface OrphanRecord {
 	sessionFile?: string;
 }
 
+/** #456: what one orphan-reclaim inspection concluded (see src/runs/orphan-reclaim.ts). */
+export type OrphanReclaimVerdict = "terminal-gone" | "stale-orphan" | "working" | "unknown";
+
+/** #456: the verdict + the one-sentence evidence a status surface renders for an orphaned row. */
+export interface OrphanStatusFacts {
+	verdict: OrphanReclaimVerdict;
+	evidence?: string;
+}
+
 /**
  * #451: WHO decided this launch's worktree isolation.
  *

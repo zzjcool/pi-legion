@@ -70,6 +70,18 @@ import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTermina
 import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { orphanFateOf } from "./src/legion/orphan.ts";
+import {
+	findOrphanedRecordsInStore,
+	inspectOrphan,
+	isOrphanedRecord,
+	ORPHAN_RECLAIM_LOG_FILE,
+	orphanOwnerGate,
+	orphanRowKey,
+	orphanSubjectFor,
+	reclaimOrphan,
+	type OrphanEvidence,
+	type OrphanRow,
+} from "./src/runs/orphan-reclaim.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings, type WorktreeSource } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
@@ -3848,6 +3860,21 @@ async function controlAction(input: {
 	if (action === "stop") {
 		const force = params.force === true;
 		const retireOpts = force ? { graceful: false as const } : undefined;
+		// #456: a name that resolves to an ORPHANED leftover is reclaimed before the
+		// tracked-child path runs. Without this, the empirical case answered `unknown
+		// child … (not tracked by this session)` forever: the record lives in a previous
+		// session's store, no supervisor holds it, and the remote terminal keeps the
+		// process alive.
+		const reclaimed = await reclaimOrphanOnStop({
+			params,
+			runtime: input.runtime,
+			store,
+			cwd,
+			...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
+			crossMachine: input.settings.crossMachine,
+			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
+		});
+		if (reclaimed !== undefined) return reclaimed;
 		return stopAction({
 			params,
 			runtime: input.runtime,
@@ -3918,12 +3945,18 @@ async function controlAction(input: {
 			// under its own rules and mark a foreign row with `store=<label>` — the header
 			// text and the single-store output stay exactly what they were.
 			const surface = scanSurfaceFor({ store, cwd, callerCwd: input.callerCwd });
+			// #456: an orphaned row is inspected (bounded, read-only) so `status` can
+			// say `orphaned (terminal gone, work done)` instead of leaving the reader to
+			// guess whether it is still working. A machine that cannot answer renders
+			// `orphaned (liveness unknown)`; the inspection never writes anything.
+			const orphanFacts = await inspectOrphansForSurface(surface, input.settings.crossMachine);
 			const { text: overview, liveNames } = renderScanOverview({
 				surface,
 				supervisor: input.supervisor,
 				runtime: input.runtime,
 				ledgerNodeFor,
 				now,
+				orphanFacts,
 			});
 			// D7 (polish round): `all` has to MEAN something. The overview above is
 			// live-only by construction (`TERMINAL_STATUS_CHILD_STATES` is skipped), so
@@ -4009,6 +4042,23 @@ async function controlAction(input: {
 			alive,
 			found.runId,
 		);
+		// #456: the same bounded inspection the overview does, for one orphaned record.
+		const orphanFacts = isOrphanedRecord(found.child)
+			? await raceWithTimeout(
+				inspectOrphan(
+					orphanSubjectFor({
+						storeRoot: foundRoot,
+						runId: found.runId,
+						runDir: foundStore.runDir(found.runId),
+						run: found.run,
+						child: found.child,
+					}),
+					{ crossMachine: input.settings.crossMachine },
+				),
+				ORPHAN_INSPECT_DEADLINE_MS,
+				() => undefined,
+			)
+			: undefined;
 		// #315: what it is doing and for how long, prepended to the block when this
 		// process is actually running a tool for it.
 		const snapshot = renderLiveChildStatus({
@@ -4026,6 +4076,7 @@ async function controlAction(input: {
 			...childRemoteFacts(found.child, ledgerNodeFor(found.child)),
 			// #451: the worktree provenance, same fields on both surfaces.
 			...childWorktreeFacts(found.child),
+			...(orphanFacts ? { orphan: { verdict: orphanFacts.verdict, ...(orphanFacts.evidence ? { evidence: orphanFacts.evidence } : {}) } } : {}),
 			alive,
 			...(owner ? { owner } : {}),
 			// #450: a record from another store says which one, right after `session=`.
@@ -6904,6 +6955,13 @@ export interface StatusLivenessFacts {
 	alive: boolean;
 	/** `undefined` while `alive` — in-memory liveness already decided (#209-3). */
 	owner?: "live" | "dead" | "unknown";
+	/**
+	 * #456: the record is an orphaned leftover, so it holds no slot and is never
+	 * counted live — whatever `owner.json` says. A live owner pid here is the
+	 * PREVIOUS session's marker (or a reused pid), and counting it live is how the
+	 * rail kept showing a finished child.
+	 */
+	orphaned?: boolean;
 }
 
 /** One run record after the status filter ran (display-liveness D6 exit 1). */
@@ -6947,7 +7005,11 @@ export function classifyChildrenForStatus(
 			// Dead = the run dir's owner pid is gone AND this process is not running
 			// it. `owner === "unknown"` (no marker, or no pid in it) is never dead:
 			// unknown must not be collapsed into dead (display-liveness D2).
-			const live = !(facts?.owner === "dead" && !facts.alive);
+			//
+			// #456: an orphaned leftover is not live either way. It is not a failure
+			// (`failed` would be a verdict), so the overview lists it as orphaned and
+			// stops counting it in the live header.
+			const live = facts?.orphaned !== true && !(facts?.owner === "dead" && !facts.alive);
 			candidates.push({ child, live });
 		}
 	}
@@ -7060,13 +7122,24 @@ export interface StatusChildEntry {
 	 * the supervisor; absent means no activity fact, which renders no line at all.
 	 */
 	inFlightTools?: InFlightToolStack;
+	/**
+	 * #456: the reclaim verdict for an orphaned record. Absent for every other
+	 * record (and for a caller that did not inspect), which keeps the block
+	 * byte-identical to the pre-#456 output.
+	 */
+	orphan?: OrphanEvidence;
 }
 
 /** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
 export function renderStatusOverview(children: StatusChildEntry[], now: number = Date.now()): string {
-	const deadCount = children.filter((entry) => entry.live === false).length;
-	const liveCount = children.length - deadCount;
-	const blocks = children.map(({ child, alive, owner, pid, inFlightTools, store }) =>
+	// #456: an orphaned record counts as orphaned in the header even when the
+	// (capped) inspection left it without a verdict word — calling it `dead` would
+	// be a verdict nobody reached.
+	const isOrphan = (entry: StatusChildEntry): boolean => entry.orphan !== undefined || isOrphanedRecord(entry.child);
+	const orphanCount = children.filter(isOrphan).length;
+	const deadCount = children.filter((entry) => entry.live === false && !isOrphan(entry)).length;
+	const liveCount = children.length - deadCount - orphanCount;
+	const blocks = children.map(({ child, alive, owner, pid, inFlightTools, store, orphan }) =>
 		withInFlightToolLine(
 			renderLiveChildStatus({
 				name: child.name,
@@ -7086,6 +7159,8 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				...(child.parentAbsent ? { parentAbsent: child.parentAbsent } : {}),
 				// #451: the overview block answers the same question as the named one.
 				...childWorktreeFacts(child),
+				// #456: the verdict word (`orphaned (terminal gone, work done)`).
+				...(orphan ? { orphan } : {}),
 				alive,
 				...(owner ? { owner } : {}),
 				// #450: after the ownership verdict, one `store=` line for a foreign record
@@ -7102,10 +7177,10 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 		// Nothing live. With no record at all this stays the exact literal the
 		// tests pin; with records that are all dead the count line below says so,
 		// instead of implying the run directory is empty.
-		parts.push("No live children.");
+		parts.push(orphanCount > 0 ? `Status · 0 live children (${orphanCount} orphaned)` : "No live children.");
 	} else {
 		const noun = liveCount === 1 ? "child" : "children";
-		parts.push(`Status · ${liveCount} live ${noun}`);
+		parts.push(`Status · ${liveCount} live ${noun}${orphanCount > 0 ? ` (${orphanCount} orphaned)` : ""}`);
 	}
 	if (deadCount > 0) parts.push(`(${deadCount} dead)`);
 	if (blocks.length > 0) parts.push("", blocks.join("\n\n"));
@@ -7207,6 +7282,11 @@ function renderScanOverview(input: {
 	/** This session's ledger row for a node, when it owns one (6.2.5 / D5). */
 	ledgerNodeFor: (child: StatusChildRecord) => LegionNode | null | undefined;
 	now: number;
+	/**
+	 * #456: inspected verdicts, keyed by {@link orphanRowKey}. A caller that did not
+	 * inspect passes nothing, and the row renders exactly as it did before.
+	 */
+	orphanFacts?: ReadonlyMap<string, OrphanEvidence>;
 }): ScanOverview {
 	const entries: StatusChildEntry[] = [];
 	const liveNames = new Map<string, string[]>();
@@ -7217,8 +7297,12 @@ function renderScanOverview(input: {
 		// (display-liveness D6 exit 1). One cache per store: the same name in two stores
 		// is two records, and its owner verdict comes from two different run dirs.
 		const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack }>();
+		// Key by the RECORD, not the name: two runs may reuse a name, and an orphaned
+		// newer record must not stamp `orphaned`/owner facts onto an older live one
+		// (review F10.5; the owner/alive dimensions had the same latent shape).
+		const factsKey = (child: StatusChildRecord): string => child.nodeId ?? `${child.name}\u0000${child.spawnedAt}`;
 		const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
-			const cached = factsByName.get(child.name);
+			const cached = factsByName.get(factsKey(child));
 			if (cached) return cached;
 			const alive = input.supervisor.isAlive(child.name);
 			const owner = ownerVerdictFor(surfaceStore.store, () => runs, child.name, alive);
@@ -7229,10 +7313,13 @@ function renderScanOverview(input: {
 			const facts = {
 				alive,
 				...(owner ? { owner } : {}),
+				// #456: "an orphaned record holds no slot", which is what keeps it out
+				// of the live count even when its owner pid still reads alive.
+				...(isOrphanedRecord(child) ? { orphaned: true } : {}),
 				...(pid ? { pid } : {}),
 				...(inFlightTools ? { inFlightTools } : {}),
 			};
-			factsByName.set(child.name, facts);
+			factsByName.set(factsKey(child), facts);
 			return facts;
 		};
 		const classified = classifyChildrenForStatus(runs, factsFor);
@@ -7240,17 +7327,232 @@ function renderScanOverview(input: {
 		for (const { child, live } of classified) {
 			const { pid, inFlightTools, ...facts } = factsFor(child);
 			const remote = childRemoteFacts(child, input.ledgerNodeFor(child));
+			const orphan = isOrphanedRecord(child)
+				? input.orphanFacts?.get(orphanRowKey(surfaceStore.rootDir, child.name))
+				: undefined;
 			entries.push({
 				child: { ...child, ...remote },
 				...facts,
 				...(pid ? { pid } : {}),
 				...(inFlightTools ? { inFlightTools } : {}),
+				...(orphan ? { orphan } : {}),
 				live,
 				...(surfaceStore.label ? { store: surfaceStore.label } : {}),
 			});
 		}
 	}
 	return { text: renderStatusOverview(entries, input.now), liveNames };
+}
+
+// ── #456: reclaiming an orphaned row ────────────────────────────────────────
+
+/** How many orphaned rows one `status` call inspects. Rarer than live children. */
+const MAX_ORPHAN_INSPECTIONS = 8;
+/** The whole inspection batch (parallel); a slow machine must not hold `status`. */
+const ORPHAN_INSPECT_DEADLINE_MS = 4_000;
+
+/** Every store on the bounded surface a stop/status call may read leftovers from. */
+function orphanSurfaceStores(ownRoot: string, cwd: string, callerCwd?: string | undefined): RunStore[] {
+	const stores: RunStore[] = [];
+	for (const candidate of candidateStoreRoots({ cwd, ...(callerCwd !== undefined ? { callerCwd } : {}) })) {
+		if (sameStore(candidate.rootDir, ownRoot)) continue;
+		stores.push(new RunStore({ rootDir: candidate.rootDir }));
+	}
+	return stores;
+}
+
+/**
+ * Inspect every orphaned row visible on the `status` surface, in parallel and
+ * under ONE deadline. Read-only: no ledger write, no kill, no log line.
+ *
+ * Capped by {@link MAX_ORPHAN_INSPECTIONS}; a row the cap leaves out simply gets
+ * no verdict word and renders as `state=orphaned` (still explicit, just less
+ * specific). A row whose probe cannot answer yields `unknown`, which the renderer
+ * prints as `orphaned (liveness unknown)` — never as live.
+ */
+async function inspectOrphansForSurface(
+	surface: readonly ScanSurfaceStore[],
+	crossMachine: CrossMachineSettings | undefined,
+): Promise<ReadonlyMap<string, OrphanEvidence>> {
+	const rows: OrphanRow[] = [];
+	const seen = new Set<string>();
+	for (const entry of surface) {
+		for (const row of findOrphanedRecordsInStore(entry.store)) {
+			const key = orphanRowKey(entry.rootDir, row.child.name);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			rows.push(row);
+		}
+	}
+	const facts = new Map<string, OrphanEvidence>();
+	const selected = rows.slice(0, MAX_ORPHAN_INSPECTIONS);
+	// A status call must not fan out one `hc` subprocess per row: at most two are in
+	// flight, and the batch deadline stops STARTING new ones (review F7). Each wait
+	// is bounded by what is left of the budget, so the tool result cannot be held
+	// past it; the two already in flight at the deadline finish on their own.
+	const started = Date.now();
+	let next = 0;
+	const lane = async (): Promise<void> => {
+		for (;;) {
+			const remaining = ORPHAN_INSPECT_DEADLINE_MS - (Date.now() - started);
+			if (remaining <= 0) return;
+			const index = next++;
+			const row = selected[index];
+			if (row === undefined) return;
+			const evidence = await raceWithTimeout(
+				inspectOrphan(row.subject, { crossMachine }),
+				remaining,
+				() => undefined,
+			);
+			if (evidence !== undefined) facts.set(orphanRowKey(row.subject.storeRoot, row.child.name), evidence);
+		}
+	};
+	await Promise.all([lane(), lane()]);
+	return facts;
+}
+
+/**
+ * The evidence line every reclaim answer carries: what was asked, what answered.
+ * Kept in one place so the `stop` text, the `/legion status` block and the report
+ * quote the same sentence.
+ */
+function orphanVerdictLine(result: { verdict: string; evidence: string; ledgerStatus?: string; execution?: { status: string }; killed?: boolean }): string {
+	const ledger = result.ledgerStatus !== undefined
+		? `ledger ${result.ledgerStatus}${result.execution ? ` (execution: ${result.execution.status})` : ""}`
+		: "";
+	return [
+		`verdict: ${result.verdict} (${result.evidence})`,
+		...(ledger ? [ledger] : []),
+		...(result.killed ? ["terminal killed"] : []),
+	].join(" · ");
+}
+
+/**
+ * `subagent({action:"stop", name})` on an ORPHANED leftover (#456).
+ *
+ * Returns `undefined` when the name is not an orphaned leftover, so the caller
+ * runs the ordinary stop path unchanged. When it IS one, the answer is one of
+ * three facts and nothing else:
+ *
+ *   - `Reclaimed …` — the terminal is gone (or was idle and quiet, and has been
+ *     killed), the ledger row ended, run.json retired;
+ *   - `Refusing …` — the child is still working, the machine could not answer, or
+ *     another LIVE session owns the row (the #445 owner gate). Nothing was written;
+ *   - the ambiguity refusal — one name in two stores is two children, and stop
+ *     never guesses (#312/#450).
+ *
+ * The row is settled through `reclaimOrphan`, so `stop` and any future sweep share
+ * exactly one write path.
+ */
+async function reclaimOrphanOnStop(input: {
+	params: { name?: string; all?: boolean; runId?: string };
+	runtime: SessionRuntime;
+	store: RunStore;
+	cwd: string;
+	callerCwd?: string | undefined;
+	crossMachine: CrossMachineSettings | undefined;
+	sessionFile?: string | undefined;
+}): Promise<AgentToolResult<unknown> | undefined> {
+	const name = input.params.name?.trim();
+	// `stop all` stays runtime-only ON PURPOSE: `all` means the jobs this session
+	// tracks. A leftover row is addressed by its `(store, name)` identity; sweeping
+	// every store's leftovers without naming one would be a cleanup the caller never
+	// asked for. The status overview names them, so `stop <name>` is one call away.
+	if (!name || input.params.all === true) return undefined;
+	// A live job with this name is the ordinary stop path's business (it holds a
+	// handle; reclaiming is for the row nobody holds).
+	const job = input.runtime.get(name);
+	if (job !== undefined && job.state !== "retired") return undefined;
+	const runId = input.params.runId;
+	// The session store's own pick decides FIRST. If it is a non-terminal, non-orphaned
+	// record (a live/working child of an older session), this call is the ordinary
+	// stop's, not a reclaim's — a same-named leftover in another store must not
+	// capture a name the caller's own store already answers for.
+	let picked: ReturnType<typeof pickChildByName> = null;
+	try {
+		picked = runId === undefined ? pickChildByName(input.store.listRuns(), name) : null;
+	} catch {
+		// A store this call cannot list has no answer for the name; let the ordinary
+		// stop path report that instead of failing the whole call here.
+		picked = null;
+	}
+	// If the session's own store answers for the name with anything that is NOT this
+	// orphan, the ordinary stop owns the call — even when that answer is `failed` or
+	// `settled` history. Reclaiming a same-named leftover from another project would
+	// otherwise capture a name this store already answered (review F2).
+	if (picked && !isOrphanedRecord(picked.child)) return undefined;
+	// One row per store: the newest run wins (the same preference `pickChildByName`
+	// and the status overview use). A `runId` narrows the search to that run only.
+	const newestPerStore = (rows: readonly OrphanRow[], storeRoot: string): OrphanRow | undefined =>
+		rows.find((row) => sameStore(row.subject.storeRoot, storeRoot));
+	const ownRow = newestPerStore(findOrphanedRecordsInStore(input.store, { name, ...(runId !== undefined ? { runId } : {}) }), input.store.rootDir);
+	const candidates: OrphanRow[] = [];
+	if (ownRow) {
+		candidates.push(ownRow);
+	} else if (runId === undefined) {
+		for (const store of orphanSurfaceStores(input.store.rootDir, input.cwd, input.callerCwd)) {
+			const row = newestPerStore(findOrphanedRecordsInStore(store, { name }), store.rootDir);
+			if (row) candidates.push(row);
+		}
+	}
+	if (candidates.length === 0) return undefined;
+	if (candidates.length > 1) {
+		const lines = [
+			`${name} is ambiguous: ${candidates.length} stores hold an orphaned child with that name, so \`stop\` will not guess which one you mean.`,
+		];
+		for (const row of candidates) {
+			lines.push(`  store=${formatStoreLabel(row.subject.storeRoot)} run=${row.subject.runId} state=${row.subject.recordState}`);
+		}
+		lines.push("Fix: run the call from that store's directory, or pass `cwd:` with one of the store directories above so only one store is searched.");
+		return fail(lines.join("\n"), ErrorCodes.NOT_FOUND);
+	}
+	const row = candidates[0]!;
+	// #445 §3 owner gate: a row another live session holds is not ours to touch.
+	const owned = orphanOwnerGate(row.subject);
+	if (owned !== undefined) {
+		return ok(`Not reclaiming ${name}: ${owned.reason}.`);
+	}
+	const evidence = await inspectOrphan(row.subject, { crossMachine: input.crossMachine });
+	const rowStore = sameStore(row.subject.storeRoot, input.store.rootDir)
+		? input.store
+		: new RunStore({ rootDir: row.subject.storeRoot });
+	const result = await reclaimOrphan(row.subject, evidence, {
+		store: rowStore,
+		crossMachine: input.crossMachine,
+		...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
+	});
+	if (!result.ok) {
+		// A refusal can follow a kill (the ledger write failed): say so — an operator
+		// must not read "refused" as "nothing was cleaned up" (review F5).
+		const killed = result.killed ? "the idle terminal WAS killed; " : "";
+		return ok(`Refusing to reclaim ${name}: ${killed}${result.reason}. ${orphanVerdictLine(result)}`);
+	}
+	const half = result.ledgerStatus === "missing"
+		? " (the ledger row was not found; run.json is the half that was written)"
+		: result.ledgerStatus === "already-ended"
+			? " (the ledger row had already ended)"
+			: "";
+	const recordLine = result.recordWritten
+		? `run record: retired; log: ${formatStoreLabel(row.subject.storeRoot)}/${ORPHAN_RECLAIM_LOG_FILE}`
+		: `run record: NOT retired (${result.recordNote ?? "the run.json write failed"}); retry the stop — log: ${formatStoreLabel(row.subject.storeRoot)}/${ORPHAN_RECLAIM_LOG_FILE}`;
+	return ok(
+		[
+			`Reclaimed ${name}. ${orphanVerdictLine(result)}${half}.`,
+			recordLine,
+			`result still fetchable: subagent({ action: "recover", name: ${JSON.stringify(name)} })`,
+		].join("\n"),
+		{
+			reclaim: {
+				name,
+				runId: row.subject.runId,
+				host: row.subject.host,
+				terminal: evidence.terminal?.address ?? row.subject.remoteTerminal,
+				verdict: result.verdict,
+				ledgerStatus: result.ledgerStatus,
+				...(result.execution ? { execution: result.execution.status } : {}),
+			},
+		},
+	);
 }
 
 /**
