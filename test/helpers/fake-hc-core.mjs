@@ -45,6 +45,12 @@
  *                         transition a re-attach test needs: a child that is LIVE
  *                         while the new session adopts it and FINISHED when that
  *                         session's watcher looks again.
+ *                         `program_state` (#456) is the PROGRAM's own word
+ *                         (`working` / `idle` / `done` / `error`), independent of
+ *                         the terminal's `state`: a kept terminal stays `running`
+ *                         after its program exits, which is exactly the idle-orphan
+ *                         shape. Defaults to `idle` while running and `finished`
+ *                         once finished.
  *
  * Protocol: newline-delimited JSON-RPC on stdin/stdout, same as `hc connect`.
  * Result shapes mirror `hc schema` (verified against herdr-core 0.1.21):
@@ -308,6 +314,8 @@ function terminalRun(id, params) {
 		finish_after_ms: typeof fate?.finish_after_ms === "number" && Number.isFinite(fate.finish_after_ms) ? fate.finish_after_ms : undefined,
 		// Only ever reported by `terminal.get` once the terminal is `finished`.
 		exit_code: typeof fate?.exit_code === "number" ? fate.exit_code : 0,
+		// #456: the program's own word, while the terminal may still be `running`.
+		program_state: typeof fate?.program_state === "string" && fate.program_state.length > 0 ? fate.program_state : undefined,
 		screen: typeof fate?.screen === "string" ? fate.screen : "",
 		turn: 0,
 		pid: 900000 + terminalSeq,
@@ -350,7 +358,7 @@ function terminalRun(id, params) {
 		keep: false,
 		rm: false,
 		die_with_parent: false,
-		status: { state: terminal.state === "running" ? "idle" : terminal.state },
+		status: { state: programState(terminal) },
 		screen: terminal.screen,
 		identity: "",
 	});
@@ -390,6 +398,18 @@ function effectiveState(terminal) {
 	return Date.now() - terminal.created_ms >= after ? "finished" : terminal.state;
 }
 
+/**
+ * #456: the PROGRAM's own word, separate from the terminal's `state`.
+ *
+ * A kept terminal stays `running` after its program exits (the idle-orphan shape),
+ * so a test must be able to say `program_state: "done"` / `"working"` while
+ * `state: "running"`. The default reproduces the pre-#456 reply byte for byte.
+ */
+function programState(terminal) {
+	if (typeof terminal.program_state === "string" && terminal.program_state.length > 0) return terminal.program_state;
+	return terminal.state === "running" ? "idle" : "finished";
+}
+
 function terminalGet(id, params) {
 	const terminal = resolveTerminal(params.terminal);
 	if (!terminal) {
@@ -414,7 +434,8 @@ function terminalGet(id, params) {
 		// The manifest's own exit code: "the child died" is only half the answer, and
 		// `1` vs `137` is what tells an operator which failure they are looking at.
 		...(state === "finished" ? { exit_code: terminal.exit_code ?? 0, finished_ms: Date.now() } : {}),
-		status: { state: state === "running" ? "idle" : "finished" },
+		// #456: the program's word travels independently of the terminal's state.
+		status: { state: state === "finished" ? "finished" : programState(terminal) },
 		// #423: measured on hc 0.1.21 — `terminal.get` answers the MODE WORD here, not
 		// the screen. The text is `terminal.read`'s reply (below). A fake that put the
 		// text in this field is how the receipts came to quote `| exact` and nothing

@@ -18,8 +18,14 @@
  * caller to remember it.
  *
  * Bounded on purpose:
- *  - only stores reachable from the two known roots (the current `cwd` and the
- *    caller's `cwd`), never a scan of `$HOME` or the filesystem;
+ *  - the two known roots (the current `cwd` and the caller's `cwd`), their immediate
+ *    children, and the worktree stores below this run;
+ *  - #450: plus the bounded store surface `discoverLocalStores` returns — the cwd's
+ *    sibling repos and the `$HOME` tree to depth 2, but ONLY when the cwd itself
+ *    lives inside `$HOME` (`store-scan.ts` documents why: a temp cwd is not evidence
+ *    that the user works in the home tree). A cwd outside `$HOME` therefore keeps
+ *    this function exactly as hermetic as it was before #450 — no second home walk is
+ *    added here, the rule lives in one place;
  *  - at most `MAX_SEARCHED_STORES` candidates, each probed with a single
  *    `readdir` of `runs/`;
  *  - `readdir` only — never `createRun`/`ensureRootUsable`, because a lookup
@@ -29,6 +35,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { RunStore, pickChildByName } from "./store.ts";
+import { discoverLocalStores } from "./store-scan.ts";
 import type { RunRecord } from "../shared/types.ts";
 
 /** Directory name every run store uses. */
@@ -38,14 +45,21 @@ export const STORE_DIR_NAME = ".pi-subagents";
  * Hard cap on candidate stores. A worktree-heavy run can nest a store per
  * centurion; the cap keeps a pathological tree from turning one status call
  * into a filesystem walk.
+ *
+ * #450 raised it from 24 to 40 because the candidate surface now includes the
+ * bounded `$HOME` scan (`discoverLocalStores`): a machine with a dozen checkouts
+ * plus their worktrees is ordinary, and a cap that truncates the ordinary case
+ * would hide the very child the scan exists to find. The bound still binds — the
+ * scan itself is capped at `MAX_LOCAL_STORES` and `MAX_SCAN_DIRS` — it is just no
+ * longer tighter than the scan it feeds.
  */
-export const MAX_SEARCHED_STORES = 24;
+export const MAX_SEARCHED_STORES = 40;
 
 /** A store that actually contains run records (so a miss there is meaningful). */
 export interface CandidateStore {
 	rootDir: string;
 	/** Why this directory is a candidate, for the error message. */
-	reason: "cwd" | "caller-cwd" | "sibling" | "worktree";
+	reason: "cwd" | "caller-cwd" | "sibling" | "worktree" | "scan";
 	/** Run records found in it (empty when the directory is unreadable). */
 	runs: readonly RunRecord[];
 }
@@ -94,6 +108,9 @@ function storeRootOf(cwd: string): string {
  * by the caller and it is listed here only for completeness). `parentOf` climbs
  * the run's own `worktrees/` directory, which is where a worktree child's store
  * lives: `<runDir>/worktrees/<child>/.pi-subagents`.
+ *
+ * #450 appends the bounded discovery surface last, so every pre-existing reason keeps
+ * its place in the order (the session's own records still win over a scanned sibling).
  */
 export function candidateStoreRoots(input: {
 	cwd: string;
@@ -149,6 +166,18 @@ export function candidateStoreRoots(input: {
 			if (!entry.isDirectory()) continue;
 			push(path.join(worktreesDir, entry.name, STORE_DIR_NAME), "worktree");
 		}
+	}
+
+	// #450: the bounded store surface (`store-scan.ts` owns the rules: the cwd store,
+	// the caller's store, sibling repos, and the `$HOME` tree to depth 2 — and it
+	// returns ONLY the two known roots when the cwd is outside `$HOME`). Appended last
+	// so the session's own records keep winning, and deduped by resolved path by `push`
+	// (discovery returns the cwd/callerCwd roots unconditionally, which are already here).
+	for (const located of discoverLocalStores({
+		cwd: input.cwd,
+		...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
+	}).stores) {
+		push(located.rootDir, "scan");
 	}
 	return out;
 }
@@ -220,7 +249,9 @@ function describeRoot(rootDir: string, cwd: string, reason: CandidateStore["reas
 				? " (the caller's cwd)"
 				: reason === "sibling"
 					? " (a neighbouring directory)"
-					: "";
+					: reason === "scan"
+						? " (found by the cross-store scan)"
+						: "";
 	if (relative === "" || relative === STORE_DIR_NAME) return `${rootDir}${label}`;
 	return `${rootDir}${label}`;
 }

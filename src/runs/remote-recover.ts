@@ -163,6 +163,13 @@ export interface RecoveryLedger {
 }
 
 /**
+ * The store surface this module reads: `listRuns` + the two path helpers, spelled
+ * structurally so a caller that only holds a `Pick<RunStore, …>` (the `recover` tool
+ * call, a test double) fits without widening its own type.
+ */
+export type RecoveryStore = Pick<RunStore, "listRuns" | "runDir" | "rootDir">;
+
+/**
  * Which ledger a `recover` call reads, in priority order (defect D1).
  *
  * The defect: `recover` used to read only the identity THIS process had created,
@@ -184,14 +191,44 @@ export interface RecoveryLedger {
  * Priority 2 is deliberately scoped to the store root, i.e. to this cwd: "a
  * leftover is the tree a PREVIOUS session of this conversation left behind", and a
  * different project's ledger is never consulted, adopted or written (invariant I1).
+ *
+ * #450: I1 is about ONE call never mixing two projects' rows, not about a session
+ * seeing only one tree. A session that launched in `~/code/anotify` yesterday and
+ * runs in `~/agents` today still owns that leftover — {@link findRecoveryLedgerAcrossStores}
+ * is the same priority list widened to the bounded store surface, and the ledger it
+ * finds is still the ONLY one written.
  */
 export function findRecoveryLedgerForName(
-	store: RunStore,
+	store: RecoveryStore,
 	name: string,
-	opts: { sessionFile?: string | undefined } = {},
+	opts: { sessionFile?: string | undefined; ownRunOnly?: boolean } = {},
+): RecoveryLedger | undefined {
+	return findLedgerInStore(store, name, opts);
+}
+
+/**
+ * The read half of {@link findRecoveryLedgerForName}, reused by the cross-store walk.
+ *
+ * `ownRunOnly` narrows the search to runs whose `run.json` names OUR transcript —
+ * priority 1 without its fallback. That is what lets the cross-store lookup be
+ * "our own run anywhere first, then any store's newest leftover with this name"
+ * without a second copy of the open/query/close dance (a copy would eventually drift
+ * on `sanitizeNodeSlug` or on closing a handle it did not take).
+ */
+function findLedgerInStore(
+	store: RecoveryStore,
+	name: string,
+	opts: { sessionFile?: string | undefined; ownRunOnly?: boolean } = {},
 ): RecoveryLedger | undefined {
 	const slug = sanitizeNodeSlug(name);
+	const own = opts.sessionFile !== undefined ? path.resolve(opts.sessionFile) : undefined;
+	// No transcript to match means no run can be "ours": the narrowed pass finds nothing
+	// rather than silently widening to every run.
+	if (opts.ownRunOnly === true && own === undefined) return undefined;
 	for (const run of runsInRecoveryOrder(store, opts.sessionFile)) {
+		if (opts.ownRunOnly === true) {
+			if (run.sessionFile === undefined || path.resolve(run.sessionFile) !== own) continue;
+		}
 		const dbPath = path.resolve(legionDbPath(store.runDir(run.runId)));
 		if (!fs.existsSync(dbPath)) continue;
 		let db: DatabaseSync | undefined;
@@ -207,6 +244,45 @@ export function findRecoveryLedgerForName(
 			// An unreadable ledger is not this call's verdict; keep looking.
 			try { db?.close(); } catch { /* already closed */ }
 		}
+	}
+	return undefined;
+}
+
+/** A ledger found under one of several stores, plus the store that owns it. */
+export interface CrossStoreRecoveryLedger extends RecoveryLedger {
+	/** The `rootDir` of the store holding this ledger — the run to reconcile with. */
+	storeRoot: string;
+}
+
+/**
+ * #450: {@link findRecoveryLedgerForName} over the bounded store surface
+ * (`discoverLocalStores`), session store first.
+ *
+ * Two passes, and the order is the contract:
+ *
+ *  1. **a run whose `sessionFile` is OUR transcript, in any store.** This is the
+ *     reopen case, and it must win everywhere: a name is reused across runs by
+ *     design, so the run this process is continuing is the only one whose ledger is
+ *     unambiguously ours, whichever directory it was launched from;
+ *  2. **the first store (session store first, then discovery order) holding a
+ *     ledger row with that name** — settled or not, so a second `recover` answers
+ *     `already settled` about the SAME ledger instead of picking a fresher stranger.
+ *
+ * A miss (`undefined`) is answered by the caller, which knows the labels to print.
+ * Nothing is adopted: the handle returned here is opened and closed by that caller.
+ */
+export function findRecoveryLedgerAcrossStores(
+	stores: readonly RecoveryStore[],
+	name: string,
+	opts: { sessionFile?: string | undefined } = {},
+): CrossStoreRecoveryLedger | undefined {
+	for (const store of stores) {
+		const own = findLedgerInStore(store, name, { ...opts, ownRunOnly: true });
+		if (own) return { ...own, storeRoot: path.resolve(store.rootDir) };
+	}
+	for (const store of stores) {
+		const hit = findLedgerInStore(store, name, opts);
+		if (hit) return { ...hit, storeRoot: path.resolve(store.rootDir) };
 	}
 	return undefined;
 }
@@ -236,7 +312,7 @@ export interface RecoverableLeftover {
 }
 
 export function listRecoverableLeftovers(
-	store: RunStore,
+	store: RecoveryStore,
 	opts: { sessionFile?: string | undefined } = {},
 ): RecoverableLeftover[] {
 	const out: RecoverableLeftover[] = [];
@@ -288,7 +364,7 @@ export function listRecoverableLeftovers(
  * across runs by design).
  */
 function runsInRecoveryOrder(
-	store: RunStore,
+	store: RecoveryStore,
 	sessionFile: string | undefined,
 ): Array<{ runId: string; sessionFile?: string; cwd?: string }> {
 	const all = runsNewestFirst(store);
@@ -310,7 +386,7 @@ function runsInRecoveryOrder(
  * same millisecond cannot make `recover` answer about a different ledger on the
  * second call, which is exactly what "already settled is idempotent" forbids.
  */
-function runsNewestFirst(store: RunStore): Array<{ runId: string; sessionFile?: string; cwd?: string }> {
+function runsNewestFirst(store: RecoveryStore): Array<{ runId: string; sessionFile?: string; cwd?: string }> {
 	const runs = store.listRuns().map((run) => ({
 		runId: run.runId,
 		stamp: Date.parse(run.createdAt) || 0,

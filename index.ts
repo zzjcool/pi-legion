@@ -12,6 +12,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type {
@@ -69,8 +70,20 @@ import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTermina
 import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { orphanFateOf } from "./src/legion/orphan.ts";
+import {
+	findOrphanedRecordsInStore,
+	inspectOrphan,
+	isOrphanedRecord,
+	ORPHAN_RECLAIM_LOG_FILE,
+	orphanOwnerGate,
+	orphanRowKey,
+	orphanSubjectFor,
+	reclaimOrphan,
+	type OrphanEvidence,
+	type OrphanRow,
+} from "./src/runs/orphan-reclaim.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
-import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
+import { type ExecutionStatus, type LegionSettings, type WorktreeSource } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
 import {
@@ -152,6 +165,11 @@ import {
 	unknownChildMessage,
 	type CandidateStore,
 } from "./src/runs/store-lookup.ts";
+// #450: the bounded store surface (`<cwd>/.pi-subagents` today, every store this machine
+// plausibly knows about when the cwd lives inside `$HOME`). Discovery is the ONE place
+// that decides which roots are worth reading — `status`, `list all:true`, `recover` and
+// the session-start re-attach all ask it rather than each inventing a walk.
+import { discoverLocalStores, formatStoreLabel, sameStore, storeCwdOf } from "./src/runs/store-scan.ts";
 import { RUN_OWNER_FILE, isPidAlive, ownerState, readOwnerFile } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
@@ -170,7 +188,7 @@ import {
 	type RemoteTerminalProbe,
 	type RemoteTerminalProbeRequest,
 } from "./src/runs/remote-artifact.ts";
-import { findRecoveryLedgerForName, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
+import { findRecoveryLedgerAcrossStores, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION, type RecoveryStore } from "./src/runs/remote-recover.ts";
 import {
 	createReattachSettle,
 	deliverReattachNotice,
@@ -315,7 +333,7 @@ const TaskItem = Type.Object({
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
-				"Parent decides isolation for this child. true = own git branch, child delivers that branch (an MR when the repository has a remote). false = write the current checkout. Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
+				"Isolation for THIS step. An explicit value overrides the role card: true = own git branch, child delivers that branch (an MR when the repository has a remote); false = work in the checkout this launch already selected (create no tree, status shows worktreeSource=request). Omitted = the card decides (today's behaviour; a centurion in a Legion tree still always gets one). Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
 		}),
 	),
 	host: Type.Optional(
@@ -387,7 +405,7 @@ const SubagentParams = Type.Object({
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
-				"Parent decides isolation. true = isolated git branch, child delivers that branch (an MR when the repository has a remote). false = edit the current checkout. Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit.",
+				"Isolation for this launch. An explicit value overrides the role card (a per-item `tasks[].worktree` overrides this call-level one): true = isolated git branch, child delivers that branch (an MR when the repository has a remote); false = work in the checkout this launch already selected — no tree is created, `node.worktreePath` is NULL and status says `worktreeSource=request`. Omitted everywhere = the card decides (a centurion in a Legion tree still always gets one). Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit, or pre-build N worktrees and pin each launch with `cwd` for parallel writes.",
 		}),
 	),
 	host: Type.Optional(
@@ -447,7 +465,7 @@ const SubagentParams = Type.Object({
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children under cwd — with `all:true` the retired/finished children are listed below it too (omit `name` for the overview, no `all` needed).",
+			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children across this machine's stores — with `all:true` the retired/finished children are listed below it too (omit `name` for the overview, no `all` needed). list: with `all:true` the roster is followed by every store's live children (a record from another store carries `store=<label>`).",
 		}),
 	),
 	runId: Type.Optional(
@@ -2025,8 +2043,40 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
 				});
 				const log = reattachLogSink(store.rootDir);
-				const report = await runReattachPass({ store, sessionFile, settings, log });
-				const summary = formatReattachSummary(report);
+				// #450: the pass looks at every store this machine plausibly knows about, not
+				// just this cwd's. `discoverLocalStores` is the bounded, hermetic surface
+				// (`store-scan.ts`): a cwd outside `$HOME` yields its own store only, and a
+				// truncated scan is REPORTED through `storeScan` instead of silently narrowing
+				// the pass. Every write below is routed to the store the record came from —
+				// adoption, the run-record mirror and the notice latch all belong to THAT
+				// store, and stamping them into the session's store would leave the real
+				// record owed forever (and create a run dir nobody launched).
+				const home = os.homedir();
+				const discovered = discoverLocalStores({ cwd, home });
+				const surfaceStores: RunStore[] = [store];
+				const storesByRoot = new Map<string, RunStore>([[path.resolve(store.rootDir), store]]);
+				const extraStores: RunStore[] = [];
+				for (const located of discovered.stores) {
+					const rootDir = path.resolve(located.rootDir);
+					if (storesByRoot.has(rootDir)) continue;
+					const foreign = new RunStore({ rootDir: located.rootDir });
+					extraStores.push(foreign);
+					surfaceStores.push(foreign);
+					storesByRoot.set(rootDir, foreign);
+				}
+				/** The store a watcher target / pending notice came from; the session's store when unknown. */
+				const storeForRoot = (rootDir: string | undefined): RunStore =>
+					(rootDir !== undefined ? storesByRoot.get(path.resolve(rootDir)) : undefined) ?? store;
+				const report = await runReattachPass({
+					store,
+					sessionFile,
+					settings,
+					log,
+					stores: extraStores,
+					storeScan: discovered.stats,
+					home,
+				});
+				const summary = formatReattachSummary(report, { home });
 				if (summary) {
 					// ONE line, and NOT the transcript (#445 §6) — the same channel the storage
 					// sweep uses, for the same reason.
@@ -2040,7 +2090,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 						// #445: the record follows the ledger. `status` reads run.json, so a child
 						// that finished over there must stop claiming `working` HERE.
 						recordSettlement: async (target, recovery) => {
-							await store.updateChild(target.runId, target.name, (child) => {
+							await storeForRoot(target.storeRoot).updateChild(target.runId, target.name, (child) => {
 								child.state = "retired";
 								child.retiredAt ??= new Date(Date.now()).toISOString();
 								child.execution = recovery.execution;
@@ -2050,7 +2100,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 						},
 						markNotified: async (target, at) => {
 							// #445 §7: write-once, and only after a delivered send.
-							await store.updateChild(target.runId, target.name, (child) => {
+							await storeForRoot(target.storeRoot).updateChild(target.runId, target.name, (child) => {
 								if (child.reattached) child.reattached.notifiedAt ??= at;
 							});
 						},
@@ -2058,6 +2108,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					});
 					for (const child of report.adopted) {
 						reattachWatcher.add({
+							storeRoot: child.storeRoot,
+							storeCwd: child.storeCwd,
 							runId: child.runId,
 							name: child.name,
 							host: child.host,
@@ -2069,11 +2121,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					reattachWatcher.start();
 				}
 				// The latch's other half: a notice a previous session could not deliver is
-				// owed, not lost. Delivered here, then latched — once.
-				for (const entry of pendingReattachNotices(store)) {
+				// owed, not lost. Delivered here, then latched — once, in the store that
+				// actually holds the record (a notice from `~/code/anotify` is not this
+				// store's to stamp).
+				for (const entry of pendingReattachNotices(surfaceStores)) {
 					if (!reattachNotice(pendingReattachNotice(entry).content)) continue;
 					const at = Date.now();
-					await store.updateChild(entry.runId, entry.name, (child) => {
+					await storeForRoot(entry.storeRoot).updateChild(entry.runId, entry.name, (child) => {
 						if (child.reattached) child.reattached.notifiedAt ??= at;
 					});
 				}
@@ -2718,6 +2772,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					// run.json records the arbitrated backend; a legacy record has none,
 					// and `renderLiveChildStatus` renders that as `unknown` — never `rpc`.
 					...(child.spawnMode ? { spawnMode: child.spawnMode } : {}),
+					// #451: who asked for the worktree, on the slash surface too.
+					...childWorktreeFacts(child),
 					alive,
 					...(owner ? { owner } : {}),
 					...(inFlightTools ? { inFlightTools } : {}),
@@ -2871,7 +2927,31 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
 			});
 
-			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
+			if (action === "list") {
+				const roster = renderAgentList(agents, team, teamWarnings);
+				// #450: `all:true` follows the roster with every store's LIVE children, rendered
+				// by the SAME surface `status` uses (`store=` markers included), so a row cannot
+				// read differently depending on which call asked for it. Without `all` the
+				// answer is the roster and nothing else — byte for byte what it was.
+				if (params.all !== true) return ok(roster);
+				// `ownLegionIdentity()` is the identity this session has ADOPTED so far; `list`
+				// runs before the per-call legion resolution below, and a read of this session's
+				// own `nodes` rows needs nothing more (absent = the renderer omits the line).
+				const legion = ownLegionIdentity();
+				const overview = renderScanOverview({
+					surface: scanSurfaceFor({
+						store,
+						cwd,
+						...(ctx.cwd && ctx.cwd !== cwd ? { callerCwd: ctx.cwd } : {}),
+					}),
+					supervisor,
+					runtime,
+					ledgerNodeFor: (child: StatusChildRecord) =>
+						legion && child.nodeId ? getNode(legion.db, child.nodeId) : undefined,
+					now: Date.now(),
+				}).text;
+				return ok(`${roster}\n\n${overview}`);
+			}
 			if (action === "diagnose") {
 				let sections;
 				try {
@@ -3780,6 +3860,21 @@ async function controlAction(input: {
 	if (action === "stop") {
 		const force = params.force === true;
 		const retireOpts = force ? { graceful: false as const } : undefined;
+		// #456: a name that resolves to an ORPHANED leftover is reclaimed before the
+		// tracked-child path runs. Without this, the empirical case answered `unknown
+		// child … (not tracked by this session)` forever: the record lives in a previous
+		// session's store, no supervisor holds it, and the remote terminal keeps the
+		// process alive.
+		const reclaimed = await reclaimOrphanOnStop({
+			params,
+			runtime: input.runtime,
+			store,
+			cwd,
+			...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
+			crossMachine: input.settings.crossMachine,
+			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
+		});
+		if (reclaimed !== undefined) return reclaimed;
 		return stopAction({
 			params,
 			runtime: input.runtime,
@@ -3844,61 +3939,39 @@ async function controlAction(input: {
 			);
 		}
 		if (!params.name) {
-			const runs = store.listRuns();
-			// Liveness facts are read once per name and reused by both the filter and
-			// the block, so `status` cannot classify a child one way and render it
-			// another (display-liveness D6 exit 1).
-			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack }>();
-			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
-				const cached = factsByName.get(child.name);
-				if (cached) return cached;
-				const alive = input.supervisor.isAlive(child.name);
-				const owner = ownerVerdictFor(store, () => runs, child.name, alive);
-				// A pid only exists for a child this process actually tracks; a
-				// record from another session has none, and none is invented.
-				const pid = input.runtime.get(child.name)?.pid;
-				// #315/#331: same rule for the in-flight stack — only this process's
-				// live backend can answer, and `undefined` renders no line.
-				const inFlightTools = inFlightToolStackOf(input.supervisor, child.name);
-				const facts = {
-					alive,
-					...(owner ? { owner } : {}),
-					...(pid ? { pid } : {}),
-					...(inFlightTools ? { inFlightTools } : {}),
-				};
-				factsByName.set(child.name, facts);
-				return facts;
-			};
-			const classified = classifyChildrenForStatus(runs, factsFor);
 			const now = Date.now();
-			// 6.2.5 / D5: the run-store record is the first source for where a child runs;
-			// this session's ledger row for the same node is the second (a run.json written
-			// by a rebuild or an older build can lack the pair, while the ledger has it).
-			const overview = renderStatusOverview(
-				classified.map(({ child, live }) => {
-					const { pid, inFlightTools, ...facts } = factsFor(child);
-					const remote = childRemoteFacts(child, ledgerNodeFor(child));
-					return {
-						child: { ...child, ...remote },
-						...facts,
-						...(pid ? { pid } : {}),
-						...(inFlightTools ? { inFlightTools } : {}),
-						live,
-					};
-				}),
+			// #450: children from EVERY store on the bounded scan surface, not just this
+			// cwd's. A record is keyed by `(store, name)`, so `status` must read each store
+			// under its own rules and mark a foreign row with `store=<label>` — the header
+			// text and the single-store output stay exactly what they were.
+			const surface = scanSurfaceFor({ store, cwd, callerCwd: input.callerCwd });
+			// #456: an orphaned row is inspected (bounded, read-only) so `status` can
+			// say `orphaned (terminal gone, work done)` instead of leaving the reader to
+			// guess whether it is still working. A machine that cannot answer renders
+			// `orphaned (liveness unknown)`; the inspection never writes anything.
+			const orphanFacts = await inspectOrphansForSurface(surface, input.settings.crossMachine);
+			const { text: overview, liveNames } = renderScanOverview({
+				surface,
+				supervisor: input.supervisor,
+				runtime: input.runtime,
+				ledgerNodeFor,
 				now,
-			);
+				orphanFacts,
+			});
 			// D7 (polish round): `all` has to MEAN something. The overview above is
 			// live-only by construction (`TERMINAL_STATUS_CHILD_STATES` is skipped), so
 			// `all` used to be a switch that changed nothing — the second of the two
 			// shapes the contract allows. It now adds the retired/finished records below
 			// the live overview; omitting `all` gives exactly what it gave before.
 			if (params.all !== true) return ok(overview);
+			// #450: `retired/finished` stays the SESSION store's history. The widened surface
+			// is for what is still running (or owed); dumping every repository's past into
+			// `status all` would be a wall of rows the caller never asked about (measured on
+			// this machine: 195 terminal names in one neighbouring store) — the exact noise
+			// #442/#445 forbid. A foreign LIVE row is still listed above, with its marker.
+			const sessionSurface = surface[0]!;
 			const finished = renderFinishedStatusSection(
-				listFinishedChildrenForStatus(
-					runs,
-					classified.map(({ child }) => child.name),
-				),
+				listFinishedChildrenForStatus(sessionSurface.runs, liveNames.get(sessionSurface.rootDir) ?? []),
 			);
 			return ok(finished ? `${overview}\n\n${finished}` : overview);
 		}
@@ -3926,13 +3999,25 @@ async function controlAction(input: {
 		}
 		// #270: a miss in this store is not a miss overall — a worktree child's
 		// record lives under its own store, which this one cannot enumerate.
-		const found = scope.found ?? findChildAcrossStores({
-			name: params.name,
-			cwd,
-			callerCwd: input.callerCwd,
-			ownRoot: store.rootDir,
-		});
+		//
+		// #450: the search is the same bounded store surface `status`/`list` read. It
+		// returns EVERY store that holds the name, not just the first: a name is scoped
+		// to a store, so two repositories' `worker-0` are two different children.
+		const elsewhere = scope.found
+			? []
+			: findChildrenAcrossStores({ name: params.name, cwd, callerCwd: input.callerCwd, ownRoot: store.rootDir });
+		if (elsewhere.length > 1) {
+			return fail(crossStoreAmbiguityMessage("status", params.name, elsewhere), ErrorCodes.NOT_FOUND);
+		}
+		const crossStore = elsewhere[0];
+		const found = scope.found ?? crossStore;
 		if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
+		// #450: which store the record was ACTUALLY read from. A scoped hit is this
+		// store's; anything else came from another store, whose run dir the owner
+		// verdict has to read (`ownerVerdictFor` is per run dir, never global).
+		const foundRoot = crossStore !== undefined ? crossStore.storeRoot : store.rootDir;
+		const foreign = !sameStore(foundRoot, store.rootDir);
+		const foundStore = foreign ? new RunStore({ rootDir: foundRoot }) : store;
 		// #312: when the record is not this session's own child, say which run it
 		// came from. A direct hit adds nothing — the existing output is unchanged.
 		//
@@ -3947,7 +4032,33 @@ async function controlAction(input: {
 		const alive = input.supervisor.isAlive(params.name);
 		// #312: the owner verdict belongs to the run dir of the record just resolved
 		// (`found.runId`) — not to whatever `pickChildByName` prefers across runs.
-		const owner = ownerVerdictFor(store, scope.runs, params.name, alive, found.runId);
+		// #450: and the STORE it was resolved in: a foreign run dir must not be probed
+		// through the session store's path (`<sessionRoot>/runs/<foreign id>` is a
+		// directory that does not exist, which would read as `owner: dead`).
+		const owner = ownerVerdictFor(
+			foundStore,
+			foreign ? () => foundStore.listRuns() : scope.runs,
+			params.name,
+			alive,
+			found.runId,
+		);
+		// #456: the same bounded inspection the overview does, for one orphaned record.
+		const orphanFacts = isOrphanedRecord(found.child)
+			? await raceWithTimeout(
+				inspectOrphan(
+					orphanSubjectFor({
+						storeRoot: foundRoot,
+						runId: found.runId,
+						runDir: foundStore.runDir(found.runId),
+						run: found.run,
+						child: found.child,
+					}),
+					{ crossMachine: input.settings.crossMachine },
+				),
+				ORPHAN_INSPECT_DEADLINE_MS,
+				() => undefined,
+			)
+			: undefined;
 		// #315: what it is doing and for how long, prepended to the block when this
 		// process is actually running a tool for it.
 		const snapshot = renderLiveChildStatus({
@@ -3963,8 +4074,13 @@ async function controlAction(input: {
 			// renderer, so the machine and terminal come from the record on both.
 			// 6.2.5 / D5: the ledger row answers when the record cannot.
 			...childRemoteFacts(found.child, ledgerNodeFor(found.child)),
+			// #451: the worktree provenance, same fields on both surfaces.
+			...childWorktreeFacts(found.child),
+			...(orphanFacts ? { orphan: { verdict: orphanFacts.verdict, ...(orphanFacts.evidence ? { evidence: orphanFacts.evidence } : {}) } } : {}),
 			alive,
 			...(owner ? { owner } : {}),
+			// #450: a record from another store says which one, right after `session=`.
+			...(foreign ? { store: formatStoreLabel(foundRoot) } : {}),
 		});
 		const inFlightTools = inFlightToolStackOf(input.supervisor, found.child.name);
 		const rendered = withInFlightToolLine(snapshot, inFlightTools, Date.now());
@@ -4266,6 +4382,36 @@ function ambiguousChildMessage(
 		describeChildScopeCandidates(candidates) +
 		"\nPass `runId` to name the run that holds the one you mean."
 	);
+}
+
+/**
+ * #450: the same name, found in more than one STORE.
+ *
+ * `ambiguousChildMessage` above is the within-store case (two runs of one store) and is
+ * untouched. This is its cross-store sibling, and it exists because the scan surface is
+ * now wider than one repository: `worker-0` in `~/agents` and `worker-0` in
+ * `~/code/anotify` are two unrelated children, and answering about one of them while
+ * the caller meant the other is the cross-talk a widened surface must never introduce.
+ *
+ * The candidates are printed as `store=<label> run=<id>` because a run id is unique
+ * only inside its own store: two ids without their stores would read like a formatting
+ * bug, and one id alone would be the silent pick this refuses to make.
+ */
+function crossStoreAmbiguityMessage(
+	action: string,
+	name: string,
+	candidates: readonly CrossStoreChild[],
+): string {
+	const lines = [
+		`${name} is ambiguous: ${candidates.length} stores hold a child with that name, so \`${action}\` will not guess which one you mean (a name is scoped to a store, and answering from the wrong one would mix two projects).`,
+	];
+	for (const candidate of candidates) {
+		lines.push(`  store=${formatStoreLabel(candidate.storeRoot)} run=${candidate.runId}`);
+	}
+	lines.push(
+		"Fix: run the call from that store's directory, or pass `cwd:` with one of the store directories above so only one store is searched.",
+	);
+	return lines.join("\n");
 }
 
 /**
@@ -5485,11 +5631,20 @@ async function launchStep(
 			// The origin distinguishes a deliberate per-run model from the parent's
 			// model falling through; the launch line reports which one won.
 			modelOrigin: model.modelOrigin,
+			// #451: the value is pre-resolved exactly as before (per-step field wins
+			// over the call-level one, then the role card); `worktreeSource` is what
+			// says whether the CALLER actually decided, so the orchestrator can both
+			// honour an explicit override and keep "nobody asked" byte-identical
+			// (a pre-resolved `true` from the card must never masquerade as a request).
 			worktree: resolveLaunchWorktree({
 				roleDefault: effective.worktree,
 				launch: session.params.worktree,
 				step: step.worktree,
 			}),
+			worktreeSource:
+				step.worktree !== undefined || session.params.worktree !== undefined
+					? "request"
+					: "role",
 			...(host ? { host } : {}),
 			...(hostTarget ? { hostTarget } : {}),
 			// D5: a RELATIVE `cwd` next to `host` names the checkout on THIS machine
@@ -6769,6 +6924,27 @@ const TERMINAL_STATUS_CHILD_STATES = new Set<string>([
 type StatusChildRecord = NonNullable<ReturnType<RunStore["findChild"]>>;
 
 /**
+ * #451: what every status surface needs to say WHO asked for the worktree.
+ *
+ * Only facts the record actually holds are handed over — a legacy record grows
+ * no line at all (`renderLiveChildStatus` skips an absent `worktreeSource`), so
+ * the pre-#451 output stays byte-identical. An empty `worktreePath` is NOT
+ * mapped to `undefined` here: the renderer's `worktree=none` comes from the
+ * source+absence pair, never from a guessed empty string.
+ */
+function childWorktreeFacts(child: {
+	worktreeSource?: WorktreeSource;
+	worktreePath?: string | null;
+	worktreeBranch?: string;
+}): { worktreeSource?: WorktreeSource; worktreePath?: string; worktreeBranch?: string } {
+	return {
+		...(child.worktreeSource ? { worktreeSource: child.worktreeSource } : {}),
+		...(child.worktreePath ? { worktreePath: child.worktreePath } : {}),
+		...(child.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
+	};
+}
+
+/**
  * Liveness facts for one child, supplied by the caller.
  *
  * `alive` is this process's in-memory supervisor answer (it never holds a child
@@ -6779,6 +6955,13 @@ export interface StatusLivenessFacts {
 	alive: boolean;
 	/** `undefined` while `alive` — in-memory liveness already decided (#209-3). */
 	owner?: "live" | "dead" | "unknown";
+	/**
+	 * #456: the record is an orphaned leftover, so it holds no slot and is never
+	 * counted live — whatever `owner.json` says. A live owner pid here is the
+	 * PREVIOUS session's marker (or a reused pid), and counting it live is how the
+	 * rail kept showing a finished child.
+	 */
+	orphaned?: boolean;
 }
 
 /** One run record after the status filter ran (display-liveness D6 exit 1). */
@@ -6822,7 +7005,11 @@ export function classifyChildrenForStatus(
 			// Dead = the run dir's owner pid is gone AND this process is not running
 			// it. `owner === "unknown"` (no marker, or no pid in it) is never dead:
 			// unknown must not be collapsed into dead (display-liveness D2).
-			const live = !(facts?.owner === "dead" && !facts.alive);
+			//
+			// #456: an orphaned leftover is not live either way. It is not a failure
+			// (`failed` would be a verdict), so the overview lists it as orphaned and
+			// stops counting it in the live header.
+			const live = facts?.orphaned !== true && !(facts?.owner === "dead" && !facts.alive);
 			candidates.push({ child, live });
 		}
 	}
@@ -6889,6 +7076,9 @@ export function listFinishedChildrenForStatus(
  * One line each, so the section stays a list of what EXISTS rather than a second
  * rendering of the live blocks above; the outcome detail reuses the wording the
  * retired-record notes already use (`execution: success, retired at …`).
+ *
+ * #450: this section stays the SESSION store's history (`status all`), so it needs no
+ * `store=` marker: every line below it is a row of the store the caller is standing in.
  */
 export function renderFinishedStatusSection(children: StatusChildRecord[]): string | undefined {
 	if (children.length === 0) return undefined;
@@ -6911,6 +7101,11 @@ export interface StatusChildEntry {
 	/** Run-dir ownership verdict (#209-3); see {@link renderLiveChildStatus}. */
 	owner?: "live" | "dead" | "unknown";
 	/**
+	 * #450: `store=<label>` for a record that came from another store than the
+	 * session's own. Absent ⇒ the block is byte-identical to the single-store one.
+	 */
+	store?: string;
+	/**
 	 * Own process of an `rpc` child, when this session launched it. A pid is
 	 * not persisted, so a record from another session has none — and none is
 	 * invented here (D3).
@@ -6927,13 +7122,24 @@ export interface StatusChildEntry {
 	 * the supervisor; absent means no activity fact, which renders no line at all.
 	 */
 	inFlightTools?: InFlightToolStack;
+	/**
+	 * #456: the reclaim verdict for an orphaned record. Absent for every other
+	 * record (and for a caller that did not inspect), which keeps the block
+	 * byte-identical to the pre-#456 output.
+	 */
+	orphan?: OrphanEvidence;
 }
 
 /** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
 export function renderStatusOverview(children: StatusChildEntry[], now: number = Date.now()): string {
-	const deadCount = children.filter((entry) => entry.live === false).length;
-	const liveCount = children.length - deadCount;
-	const blocks = children.map(({ child, alive, owner, pid, inFlightTools }) =>
+	// #456: an orphaned record counts as orphaned in the header even when the
+	// (capped) inspection left it without a verdict word — calling it `dead` would
+	// be a verdict nobody reached.
+	const isOrphan = (entry: StatusChildEntry): boolean => entry.orphan !== undefined || isOrphanedRecord(entry.child);
+	const orphanCount = children.filter(isOrphan).length;
+	const deadCount = children.filter((entry) => entry.live === false && !isOrphan(entry)).length;
+	const liveCount = children.length - deadCount - orphanCount;
+	const blocks = children.map(({ child, alive, owner, pid, inFlightTools, store, orphan }) =>
 		withInFlightToolLine(
 			renderLiveChildStatus({
 				name: child.name,
@@ -6951,8 +7157,15 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				// #409: and whose terminal it hangs from — or why nobody can say.
 				...(child.parentTerminal ? { parentTerminal: child.parentTerminal } : {}),
 				...(child.parentAbsent ? { parentAbsent: child.parentAbsent } : {}),
+				// #451: the overview block answers the same question as the named one.
+				...childWorktreeFacts(child),
+				// #456: the verdict word (`orphaned (terminal gone, work done)`).
+				...(orphan ? { orphan } : {}),
 				alive,
 				...(owner ? { owner } : {}),
+				// #450: after the ownership verdict, one `store=` line for a foreign record
+				// (the renderer prints it right after the `session=` meta line).
+				...(store ? { store } : {}),
 				...(pid ? { pid } : {}),
 			}),
 			inFlightTools,
@@ -6964,14 +7177,382 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 		// Nothing live. With no record at all this stays the exact literal the
 		// tests pin; with records that are all dead the count line below says so,
 		// instead of implying the run directory is empty.
-		parts.push("No live children.");
+		parts.push(orphanCount > 0 ? `Status · 0 live children (${orphanCount} orphaned)` : "No live children.");
 	} else {
 		const noun = liveCount === 1 ? "child" : "children";
-		parts.push(`Status · ${liveCount} live ${noun}`);
+		parts.push(`Status · ${liveCount} live ${noun}${orphanCount > 0 ? ` (${orphanCount} orphaned)` : ""}`);
 	}
 	if (deadCount > 0) parts.push(`(${deadCount} dead)`);
 	if (blocks.length > 0) parts.push("", blocks.join("\n\n"));
 	return parts.join("\n");
+}
+
+/**
+ * #450: one store on the `status` / `list all:true` scan surface.
+ *
+ * `label` is the `store=<label>` marker, and it is set ONLY for a store that is not the
+ * session's own: a single-store session therefore renders exactly what it rendered
+ * before #450 (`renderLiveChildStatus` prints no line at all without it).
+ */
+interface ScanSurfaceStore {
+	/** Resolved `<cwd>/.pi-subagents`. */
+	rootDir: string;
+	store: RunStore;
+	/** `store=` marker; absent for the session's own store. */
+	label?: string;
+	runs: ReturnType<RunStore["listRuns"]>;
+}
+
+/**
+ * #450: the store surface a `status` / `list all:true` call reads.
+ *
+ * The session's own store first — that is the store this call already loaded, and its
+ * records keep their position in the output — then every root `discoverLocalStores`
+ * judges worth looking at. Discovery owns the bounded, hermetic rules (`store-scan.ts`):
+ * a cwd outside `$HOME` yields its own store only, so a throwaway directory never
+ * inherits the live children of whatever repository happens to sit at home.
+ *
+ * A store that cannot be read contributes nothing: one unreadable directory must not
+ * cost the session the others (the same rule `scanLocalStoreRuns` states).
+ */
+function scanSurfaceFor(input: {
+	store: RunStore;
+	cwd: string;
+	callerCwd?: string | undefined;
+}): ScanSurfaceStore[] {
+	const surface: ScanSurfaceStore[] = [];
+	const seen = new Set<string>();
+	const sessionRoot = path.resolve(input.store.rootDir);
+	const push = (rootDir: string, store: RunStore): void => {
+		const resolved = path.resolve(rootDir);
+		if (seen.has(resolved)) return;
+		seen.add(resolved);
+		let runs: ReturnType<RunStore["listRuns"]> = [];
+		try {
+			runs = store.listRuns();
+		} catch {
+			// Unreadable store: keep the surface, drop the rows.
+		}
+		surface.push({ rootDir: resolved, store, runs });
+	};
+	push(sessionRoot, input.store);
+	try {
+		for (const located of discoverLocalStores({
+			cwd: input.cwd,
+			...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
+		}).stores) {
+			if (seen.has(path.resolve(located.rootDir))) continue;
+			push(located.rootDir, new RunStore({ rootDir: located.rootDir }));
+		}
+	} catch {
+		// Discovery is a convenience: a session that cannot scan still sees its own store.
+	}
+	for (const entry of surface) {
+		if (entry.rootDir === sessionRoot) continue;
+		entry.label = formatStoreLabel(entry.rootDir);
+	}
+	return surface;
+}
+
+/** The overview text plus the per-store live names the `all` section excludes. */
+interface ScanOverview {
+	text: string;
+	/** `rootDir` → the names this store reports as live (its `all` section subtracts them). */
+	liveNames: Map<string, string[]>;
+}
+
+/**
+ * #450: the live-children overview across the WHOLE scan surface.
+ *
+ * Every classification rule is the single-store one, applied PER STORE: the run-dir
+ * ownership verdict is read from THAT store's runs (`ownerVerdictFor(thatStore, …)`),
+ * while `supervisor.isAlive` / `runtime.get(name)?.pid` / the in-flight stack stay
+ * global by name — this process's registry is global, and a foreign child has no job
+ * here, so `alive=false` is the correct answer for it.
+ *
+ * Names are deduped inside a store (the pre-existing name-reuse rule) and never across
+ * stores: identity is `(store, name)`, so `~/agents` and `~/code/anotify` each showing a
+ * `worker-0` is two rows, not one — a silent cross-store pick is exactly the
+ * cross-talk the widened surface must not introduce.
+ */
+function renderScanOverview(input: {
+	surface: ScanSurfaceStore[];
+	supervisor: LegionSupervisor;
+	runtime: SessionRuntime;
+	/** This session's ledger row for a node, when it owns one (6.2.5 / D5). */
+	ledgerNodeFor: (child: StatusChildRecord) => LegionNode | null | undefined;
+	now: number;
+	/**
+	 * #456: inspected verdicts, keyed by {@link orphanRowKey}. A caller that did not
+	 * inspect passes nothing, and the row renders exactly as it did before.
+	 */
+	orphanFacts?: ReadonlyMap<string, OrphanEvidence>;
+}): ScanOverview {
+	const entries: StatusChildEntry[] = [];
+	const liveNames = new Map<string, string[]>();
+	for (const surfaceStore of input.surface) {
+		const runs = surfaceStore.runs;
+		// Liveness facts are read once per name and reused by both the filter and the
+		// block, so `status` cannot classify a child one way and render it another
+		// (display-liveness D6 exit 1). One cache per store: the same name in two stores
+		// is two records, and its owner verdict comes from two different run dirs.
+		const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack }>();
+		// Key by the RECORD, not the name: two runs may reuse a name, and an orphaned
+		// newer record must not stamp `orphaned`/owner facts onto an older live one
+		// (review F10.5; the owner/alive dimensions had the same latent shape).
+		const factsKey = (child: StatusChildRecord): string => child.nodeId ?? `${child.name}\u0000${child.spawnedAt}`;
+		const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
+			const cached = factsByName.get(factsKey(child));
+			if (cached) return cached;
+			const alive = input.supervisor.isAlive(child.name);
+			const owner = ownerVerdictFor(surfaceStore.store, () => runs, child.name, alive);
+			// A pid only exists for a child this process actually tracks; a record from
+			// another session (or another store) has none, and none is invented.
+			const pid = input.runtime.get(child.name)?.pid;
+			const inFlightTools = inFlightToolStackOf(input.supervisor, child.name);
+			const facts = {
+				alive,
+				...(owner ? { owner } : {}),
+				// #456: "an orphaned record holds no slot", which is what keeps it out
+				// of the live count even when its owner pid still reads alive.
+				...(isOrphanedRecord(child) ? { orphaned: true } : {}),
+				...(pid ? { pid } : {}),
+				...(inFlightTools ? { inFlightTools } : {}),
+			};
+			factsByName.set(factsKey(child), facts);
+			return facts;
+		};
+		const classified = classifyChildrenForStatus(runs, factsFor);
+		liveNames.set(surfaceStore.rootDir, classified.flatMap(({ child, live }) => (live ? [child.name] : [])));
+		for (const { child, live } of classified) {
+			const { pid, inFlightTools, ...facts } = factsFor(child);
+			const remote = childRemoteFacts(child, input.ledgerNodeFor(child));
+			const orphan = isOrphanedRecord(child)
+				? input.orphanFacts?.get(orphanRowKey(surfaceStore.rootDir, child.name))
+				: undefined;
+			entries.push({
+				child: { ...child, ...remote },
+				...facts,
+				...(pid ? { pid } : {}),
+				...(inFlightTools ? { inFlightTools } : {}),
+				...(orphan ? { orphan } : {}),
+				live,
+				...(surfaceStore.label ? { store: surfaceStore.label } : {}),
+			});
+		}
+	}
+	return { text: renderStatusOverview(entries, input.now), liveNames };
+}
+
+// ── #456: reclaiming an orphaned row ────────────────────────────────────────
+
+/** How many orphaned rows one `status` call inspects. Rarer than live children. */
+const MAX_ORPHAN_INSPECTIONS = 8;
+/** The whole inspection batch (parallel); a slow machine must not hold `status`. */
+const ORPHAN_INSPECT_DEADLINE_MS = 4_000;
+
+/** Every store on the bounded surface a stop/status call may read leftovers from. */
+function orphanSurfaceStores(ownRoot: string, cwd: string, callerCwd?: string | undefined): RunStore[] {
+	const stores: RunStore[] = [];
+	for (const candidate of candidateStoreRoots({ cwd, ...(callerCwd !== undefined ? { callerCwd } : {}) })) {
+		if (sameStore(candidate.rootDir, ownRoot)) continue;
+		stores.push(new RunStore({ rootDir: candidate.rootDir }));
+	}
+	return stores;
+}
+
+/**
+ * Inspect every orphaned row visible on the `status` surface, in parallel and
+ * under ONE deadline. Read-only: no ledger write, no kill, no log line.
+ *
+ * Capped by {@link MAX_ORPHAN_INSPECTIONS}; a row the cap leaves out simply gets
+ * no verdict word and renders as `state=orphaned` (still explicit, just less
+ * specific). A row whose probe cannot answer yields `unknown`, which the renderer
+ * prints as `orphaned (liveness unknown)` — never as live.
+ */
+async function inspectOrphansForSurface(
+	surface: readonly ScanSurfaceStore[],
+	crossMachine: CrossMachineSettings | undefined,
+): Promise<ReadonlyMap<string, OrphanEvidence>> {
+	const rows: OrphanRow[] = [];
+	const seen = new Set<string>();
+	for (const entry of surface) {
+		for (const row of findOrphanedRecordsInStore(entry.store)) {
+			const key = orphanRowKey(entry.rootDir, row.child.name);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			rows.push(row);
+		}
+	}
+	const facts = new Map<string, OrphanEvidence>();
+	const selected = rows.slice(0, MAX_ORPHAN_INSPECTIONS);
+	// A status call must not fan out one `hc` subprocess per row: at most two are in
+	// flight, and the batch deadline stops STARTING new ones (review F7). Each wait
+	// is bounded by what is left of the budget, so the tool result cannot be held
+	// past it; the two already in flight at the deadline finish on their own.
+	const started = Date.now();
+	let next = 0;
+	const lane = async (): Promise<void> => {
+		for (;;) {
+			const remaining = ORPHAN_INSPECT_DEADLINE_MS - (Date.now() - started);
+			if (remaining <= 0) return;
+			const index = next++;
+			const row = selected[index];
+			if (row === undefined) return;
+			const evidence = await raceWithTimeout(
+				inspectOrphan(row.subject, { crossMachine }),
+				remaining,
+				() => undefined,
+			);
+			if (evidence !== undefined) facts.set(orphanRowKey(row.subject.storeRoot, row.child.name), evidence);
+		}
+	};
+	await Promise.all([lane(), lane()]);
+	return facts;
+}
+
+/**
+ * The evidence line every reclaim answer carries: what was asked, what answered.
+ * Kept in one place so the `stop` text, the `/legion status` block and the report
+ * quote the same sentence.
+ */
+function orphanVerdictLine(result: { verdict: string; evidence: string; ledgerStatus?: string; execution?: { status: string }; killed?: boolean }): string {
+	const ledger = result.ledgerStatus !== undefined
+		? `ledger ${result.ledgerStatus}${result.execution ? ` (execution: ${result.execution.status})` : ""}`
+		: "";
+	return [
+		`verdict: ${result.verdict} (${result.evidence})`,
+		...(ledger ? [ledger] : []),
+		...(result.killed ? ["terminal killed"] : []),
+	].join(" · ");
+}
+
+/**
+ * `subagent({action:"stop", name})` on an ORPHANED leftover (#456).
+ *
+ * Returns `undefined` when the name is not an orphaned leftover, so the caller
+ * runs the ordinary stop path unchanged. When it IS one, the answer is one of
+ * three facts and nothing else:
+ *
+ *   - `Reclaimed …` — the terminal is gone (or was idle and quiet, and has been
+ *     killed), the ledger row ended, run.json retired;
+ *   - `Refusing …` — the child is still working, the machine could not answer, or
+ *     another LIVE session owns the row (the #445 owner gate). Nothing was written;
+ *   - the ambiguity refusal — one name in two stores is two children, and stop
+ *     never guesses (#312/#450).
+ *
+ * The row is settled through `reclaimOrphan`, so `stop` and any future sweep share
+ * exactly one write path.
+ */
+async function reclaimOrphanOnStop(input: {
+	params: { name?: string; all?: boolean; runId?: string };
+	runtime: SessionRuntime;
+	store: RunStore;
+	cwd: string;
+	callerCwd?: string | undefined;
+	crossMachine: CrossMachineSettings | undefined;
+	sessionFile?: string | undefined;
+}): Promise<AgentToolResult<unknown> | undefined> {
+	const name = input.params.name?.trim();
+	// `stop all` stays runtime-only ON PURPOSE: `all` means the jobs this session
+	// tracks. A leftover row is addressed by its `(store, name)` identity; sweeping
+	// every store's leftovers without naming one would be a cleanup the caller never
+	// asked for. The status overview names them, so `stop <name>` is one call away.
+	if (!name || input.params.all === true) return undefined;
+	// A live job with this name is the ordinary stop path's business (it holds a
+	// handle; reclaiming is for the row nobody holds).
+	const job = input.runtime.get(name);
+	if (job !== undefined && job.state !== "retired") return undefined;
+	const runId = input.params.runId;
+	// The session store's own pick decides FIRST. If it is a non-terminal, non-orphaned
+	// record (a live/working child of an older session), this call is the ordinary
+	// stop's, not a reclaim's — a same-named leftover in another store must not
+	// capture a name the caller's own store already answers for.
+	let picked: ReturnType<typeof pickChildByName> = null;
+	try {
+		picked = runId === undefined ? pickChildByName(input.store.listRuns(), name) : null;
+	} catch {
+		// A store this call cannot list has no answer for the name; let the ordinary
+		// stop path report that instead of failing the whole call here.
+		picked = null;
+	}
+	// If the session's own store answers for the name with anything that is NOT this
+	// orphan, the ordinary stop owns the call — even when that answer is `failed` or
+	// `settled` history. Reclaiming a same-named leftover from another project would
+	// otherwise capture a name this store already answered (review F2).
+	if (picked && !isOrphanedRecord(picked.child)) return undefined;
+	// One row per store: the newest run wins (the same preference `pickChildByName`
+	// and the status overview use). A `runId` narrows the search to that run only.
+	const newestPerStore = (rows: readonly OrphanRow[], storeRoot: string): OrphanRow | undefined =>
+		rows.find((row) => sameStore(row.subject.storeRoot, storeRoot));
+	const ownRow = newestPerStore(findOrphanedRecordsInStore(input.store, { name, ...(runId !== undefined ? { runId } : {}) }), input.store.rootDir);
+	const candidates: OrphanRow[] = [];
+	if (ownRow) {
+		candidates.push(ownRow);
+	} else if (runId === undefined) {
+		for (const store of orphanSurfaceStores(input.store.rootDir, input.cwd, input.callerCwd)) {
+			const row = newestPerStore(findOrphanedRecordsInStore(store, { name }), store.rootDir);
+			if (row) candidates.push(row);
+		}
+	}
+	if (candidates.length === 0) return undefined;
+	if (candidates.length > 1) {
+		const lines = [
+			`${name} is ambiguous: ${candidates.length} stores hold an orphaned child with that name, so \`stop\` will not guess which one you mean.`,
+		];
+		for (const row of candidates) {
+			lines.push(`  store=${formatStoreLabel(row.subject.storeRoot)} run=${row.subject.runId} state=${row.subject.recordState}`);
+		}
+		lines.push("Fix: run the call from that store's directory, or pass `cwd:` with one of the store directories above so only one store is searched.");
+		return fail(lines.join("\n"), ErrorCodes.NOT_FOUND);
+	}
+	const row = candidates[0]!;
+	// #445 §3 owner gate: a row another live session holds is not ours to touch.
+	const owned = orphanOwnerGate(row.subject);
+	if (owned !== undefined) {
+		return ok(`Not reclaiming ${name}: ${owned.reason}.`);
+	}
+	const evidence = await inspectOrphan(row.subject, { crossMachine: input.crossMachine });
+	const rowStore = sameStore(row.subject.storeRoot, input.store.rootDir)
+		? input.store
+		: new RunStore({ rootDir: row.subject.storeRoot });
+	const result = await reclaimOrphan(row.subject, evidence, {
+		store: rowStore,
+		crossMachine: input.crossMachine,
+		...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
+	});
+	if (!result.ok) {
+		// A refusal can follow a kill (the ledger write failed): say so — an operator
+		// must not read "refused" as "nothing was cleaned up" (review F5).
+		const killed = result.killed ? "the idle terminal WAS killed; " : "";
+		return ok(`Refusing to reclaim ${name}: ${killed}${result.reason}. ${orphanVerdictLine(result)}`);
+	}
+	const half = result.ledgerStatus === "missing"
+		? " (the ledger row was not found; run.json is the half that was written)"
+		: result.ledgerStatus === "already-ended"
+			? " (the ledger row had already ended)"
+			: "";
+	const recordLine = result.recordWritten
+		? `run record: retired; log: ${formatStoreLabel(row.subject.storeRoot)}/${ORPHAN_RECLAIM_LOG_FILE}`
+		: `run record: NOT retired (${result.recordNote ?? "the run.json write failed"}); retry the stop — log: ${formatStoreLabel(row.subject.storeRoot)}/${ORPHAN_RECLAIM_LOG_FILE}`;
+	return ok(
+		[
+			`Reclaimed ${name}. ${orphanVerdictLine(result)}${half}.`,
+			recordLine,
+			`result still fetchable: subagent({ action: "recover", name: ${JSON.stringify(name)} })`,
+		].join("\n"),
+		{
+			reclaim: {
+				name,
+				runId: row.subject.runId,
+				host: row.subject.host,
+				terminal: evidence.terminal?.address ?? row.subject.remoteTerminal,
+				verdict: result.verdict,
+				ledgerStatus: result.ledgerStatus,
+				...(result.execution ? { execution: result.execution.status } : {}),
+			},
+		},
+	);
 }
 
 /**
@@ -7418,25 +7999,57 @@ export async function recoverAction(input: {
 			ErrorCodes.INVALID_PARAMS,
 		);
 	}
-	// D1: this session's own ledger wins; otherwise the store on disk decides, because
+	// D1: this session's own ledger wins; otherwise the stores on disk decide, because
 	// a fresh process has no runtime identity by construction (only a launch creates
 	// one). A handle discovered here is OURS to close.
-	const discovered = input.legion === undefined && input.store !== undefined
-		? findRecoveryLedgerForName(input.store as RunStore, name, { sessionFile: input.sessionFile })
+	//
+	// #450: "the stores on disk" is the bounded surface `discoverLocalStores` returns,
+	// session store first — a leftover launched from `~/code/anotify` is still this
+	// machine's work, and scoping the search to today's cwd is what made a fresh session
+	// answer "no such child" about a child it launched yesterday. The ledger it finds is
+	// still the ONLY one written (invariant I1: one call never mixes two projects' rows).
+	const recoveryStores: RecoveryStore[] = [];
+	if (input.legion === undefined && input.store !== undefined) {
+		recoveryStores.push(input.store);
+		try {
+			const sessionRoot = input.store.rootDir;
+			for (const located of discoverLocalStores({ cwd: storeCwdOf(sessionRoot) }).stores) {
+				if (sameStore(located.rootDir, sessionRoot)) continue;
+				if (recoveryStores.some((entry) => sameStore(entry.rootDir, located.rootDir))) continue;
+				recoveryStores.push(new RunStore({ rootDir: located.rootDir }));
+			}
+		} catch {
+			// Discovery is a convenience: this session's own store is still searched.
+		}
+	}
+	const discovered = recoveryStores.length > 0
+		? findRecoveryLedgerAcrossStores(recoveryStores, name, { sessionFile: input.sessionFile })
 		: undefined;
 	const ledger = input.legion ?? discovered;
+	// The store whose ledger this call reads: a run record we have to reconcile lands
+	// THERE, never in the session's own store (which does not even hold that run).
+	const ledgerStore: RecoveryStore | undefined = discovered !== undefined
+		? recoveryStores.find((entry) => sameStore(entry.rootDir, discovered.storeRoot)) ?? input.store
+		: input.store;
 	if (!ledger) {
 		// D1: say WHERE we looked. A miss has to be actionable, and "no ledger in this
-		// session" was not: it never mentioned the directory the search is scoped to.
-		const where = input.store ? ` (searched ${path.join(input.store.rootDir, "runs")})` : "";
-		const recoverable = input.store
-			? listRecoverableLeftovers(input.store as RunStore, { sessionFile: input.sessionFile }).map((entry) => entry.node.name)
-			: [];
+		// session" was not: it never mentioned the directories the search is scoped to.
+		// #450: with a widened surface that list is the answer to "why didn't it find my
+		// child?" — every store the call actually opened, by its `store=` label.
+		const labels = recoveryStores.map((entry) => formatStoreLabel(entry.rootDir));
+		const where = labels.length === 0
+			? ""
+			: labels.length === 1
+				? ` (searched ${labels[0]})`
+				: ` (searched ${labels.length} stores: ${labels.join(", ")})`;
+		const recoverable = [...new Set(recoveryStores.flatMap((entry) =>
+			listRecoverableLeftovers(entry, { sessionFile: input.sessionFile }).map((leftover) => leftover.node.name),
+		))];
 		const hint = recoverable.length > 0
-			? ` Waiting for recovery: ${[...new Set(recoverable)].join(", ")} — call ${recoveryCallFor(recoverable[0]!)}.`
-			: " Nothing is waiting for recovery: no cross-machine node in this store is unsettled.";
+			? ` Waiting for recovery: ${recoverable.join(", ")} — call ${recoveryCallFor(recoverable[0]!)}.`
+			: " Nothing is waiting for recovery: no cross-machine node in these stores is unsettled.";
 		return ok(
-			`No cross-machine child named ${JSON.stringify(name)} in this session's or cwd's ledgers${where}.${hint} \`recover\` reads the tree a PREVIOUS session of this conversation left behind, so a launch that happened in another directory is recovered from that directory.`,
+			`No cross-machine child named ${JSON.stringify(name)} in this session's or cwd's ledgers${where}.${hint} \`recover\` reads the tree a PREVIOUS session of this conversation left behind, so a launch that happened in another directory is recovered with its store listed above.`,
 		);
 	}
 	let outcome;
@@ -7460,7 +8073,10 @@ export async function recoverAction(input: {
 			const recovery = outcome.recovery;
 			const directoryRunId = path.basename(path.dirname(ledger.dbPath));
 			const ownershipRunId = recovery.node.runId ?? (/^r-[0-9a-f]{6,}$/i.test(directoryRunId) ? directoryRunId : undefined);
-			const ownershipRun = ownershipRunId ? input.store?.listRuns().find((run) => run.runId === ownershipRunId) : undefined;
+			// #450: the run record is read from the store that OWNS the ledger just found
+			// (`ledgerStore`), not from the session's store — a foreign run dir has no entry
+			// there, which is how the ownership block lost its cwd/session facts.
+			const ownershipRun = ownershipRunId ? ledgerStore?.listRuns().find((run) => run.runId === ownershipRunId) : undefined;
 			const ownershipOwner = readOwnerFile(path.join(path.dirname(ledger.dbPath), RUN_OWNER_FILE));
 			recovery.ownership = {
 				name: recovery.node.name,
@@ -7494,7 +8110,9 @@ export async function recoverAction(input: {
 	// class of bug this release is fixing. Best-effort on purpose — the verdict is
 	// already written, and a record we cannot refresh must not fail the recovery.
 	if (recovery.kind === "settled-now" || recovery.kind === "already-settled") {
-		const store = input.store as { updateChild?: RunStore["updateChild"] } | undefined;
+		// #450: the mirror is written to the store the ledger lives in — `input.store` may be
+		// a different project's store, where this run id does not exist at all.
+		const store = ledgerStore as { updateChild?: RunStore["updateChild"] } | undefined;
 		if (store?.updateChild) {
 			const runId = path.basename(path.dirname(ledger.dbPath));
 			const at = new Date((input.now ?? Date.now)()).toISOString();
@@ -8130,32 +8748,62 @@ function findControlAgent(
  * nothing. The returned shape matches {@link findChild} so callers do not care
  * which store answered — except that `runDir` now belongs to the owning store,
  * which is why the caller re-derives its orchestrator run directory from it.
+ *
+ * #450: it now reports `storeRoot` too, because the widened surface can find the same
+ * name in several stores and the caller has to be able to name (and refuse) them.
  */
 function findChildAcrossStores(input: {
 	name: string;
 	cwd: string;
 	callerCwd?: string | undefined;
 	ownRoot: string;
-}): {
+}): CrossStoreChild | null {
+	return findChildrenAcrossStores(input)[0] ?? null;
+}
+
+/** A child record resolved outside the session's own store (#450). */
+interface CrossStoreChild {
 	runId: string;
-	run: ReturnType<RunStore["listRuns"]>[number];
+	run: RunRecord;
 	child: NonNullable<ReturnType<RunStore["findChild"]>>;
-} | null {
-	const { found } = resolveChildAcrossStores({
-		name: input.name,
-		cwd: input.cwd,
-		callerCwd: input.callerCwd,
-		roots: candidateStoreRoots({ cwd: input.cwd, callerCwd: input.callerCwd }).filter(
-			(candidate) => path.resolve(candidate.rootDir) !== path.resolve(input.ownRoot),
-		),
-	});
-	if (!found) return null;
-	// Read the owning store again for the full record: `resolveChildAcrossStores`
-	// only reports where the name was seen.
-	const runs = new RunStore({ rootDir: found.storeRoot }).listRuns();
-	const picked = pickChildByName(runs, input.name);
-	if (!picked) return null;
-	return { runId: picked.run.runId, run: picked.run, child: picked.child };
+	/** The store holding the record (never the session's own; see the caller). */
+	storeRoot: string;
+}
+
+/**
+ * #450: EVERY candidate store holding `name`, in store order, session store excluded.
+ *
+ * `candidateStoreRoots` is the widened #270/#450 surface: this cwd, the caller's cwd,
+ * their immediate children, the worktree stores below this run, and the bounded
+ * `discoverLocalStores` walk (which is hermetic when the cwd is outside `$HOME`).
+ *
+ * Returning all hits — where {@link findChildAcrossStores} returns the first — is what
+ * lets a caller refuse a cross-store ambiguity instead of silently answering about one
+ * repository's child with another repository's facts. It reads each store's runs once;
+ * a store that cannot be read is skipped, never fatal.
+ */
+function findChildrenAcrossStores(input: {
+	name: string;
+	cwd: string;
+	callerCwd?: string | undefined;
+	ownRoot: string;
+}): CrossStoreChild[] {
+	const hits: CrossStoreChild[] = [];
+	const own = path.resolve(input.ownRoot);
+	for (const candidate of candidateStoreRoots({ cwd: input.cwd, callerCwd: input.callerCwd })) {
+		const rootDir = path.resolve(candidate.rootDir);
+		if (rootDir === own) continue;
+		let runs: ReturnType<RunStore["listRuns"]>;
+		try {
+			runs = new RunStore({ rootDir }).listRuns();
+		} catch {
+			continue;
+		}
+		const picked = pickChildByName(runs, input.name);
+		if (!picked) continue;
+		hits.push({ runId: picked.run.runId, run: picked.run, child: picked.child, storeRoot: rootDir });
+	}
+	return hits;
 }
 
 function findChild(

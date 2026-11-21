@@ -50,11 +50,13 @@ import {
 	type AgentKind,
 	type RetireOptions,
 	type SpawnMode,
+	type WorktreeSource,
 } from "../shared/types.ts";
 import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
+import type { OrphanStatusFacts, OrphanReclaimVerdict } from "../shared/types.ts";
 import type { LegionEvent, LegionEventBus } from "./event-bus.ts";
 import { LEGION_EVENT_TYPES, isDetailDeltaEvent } from "./event-bus.ts";
 import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
@@ -575,6 +577,17 @@ export interface LiveChildStatusInput {
 	 * never a guessed `rpc`.
 	 */
 	spawnMode?: string;
+	/**
+	 * #451: who decided this launch's worktree isolation — `role` (the role card)
+	 * or `request` (the caller's explicit launch argument). Absent on records
+	 * written before the field existed, and then no line is invented: the block
+	 * stays byte-identical.
+	 */
+	worktreeSource?: WorktreeSource;
+	/** Isolated tree this child holds (#451 display); absent = no tree. */
+	worktreePath?: string | null;
+	/** Branch created in that tree; shown instead of the path when both exist. */
+	worktreeBranch?: string;
 	/** RPC process is still running. */
 	alive: boolean;
 	/**
@@ -625,6 +638,21 @@ export interface LiveChildStatusInput {
 	 * `accumulateUsage` source of truth the widget reads.
 	 */
 	contextTokens?: number;
+	/**
+	 * #450: which run store this record lives in (`store=<label>`), when it is NOT the
+	 * session's own store. A child record is keyed by `(store, name)`, so a name alone
+	 * cannot tell a reader where to look; the line names the directory instead.
+	 *
+	 * Absent for every child of the session's own store (and for every caller that does
+	 * not do a cross-store scan), which keeps every pre-#450 block byte-identical.
+	 */
+	store?: string;
+	/**
+	 * #456: set only for a row whose run.json/ledger says orphaned/unfetched; absent
+	 * leaves the pre-#456 output byte-identical. Display only — it never decides
+	 * liveness or writes anything.
+	 */
+	orphan?: OrphanStatusFacts;
 	now?: number;
 }
 
@@ -762,6 +790,26 @@ export function formatMirrorLine(facts: LiveMirrorFacts | undefined): string | u
 }
 
 /**
+ * #456: the state word an orphaned row is allowed to show.
+ *
+ * The four verdicts `src/runs/orphan-reclaim.ts` can reach are the four answers a
+ * reader needs; `state=orphaned` alone was true and useless — a row whose terminal
+ * was gone and whose work was done read exactly like one still running over there.
+ */
+export function orphanVerdictWord(verdict: OrphanReclaimVerdict): string {
+	switch (verdict) {
+		case "terminal-gone":
+			return "terminal gone, work done";
+		case "stale-orphan":
+			return "idle, transcript quiet";
+		case "working":
+			return "still working";
+		case "unknown":
+			return "liveness unknown";
+	}
+}
+
+/**
  * Status text for one child (`/legion status <name>` and `subagent status`).
  *
  * Living children lead with `alive · quiet Ns` so a long silent reasoning
@@ -798,9 +846,17 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const execution = stale
 		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
 		: input.execution;
+	// #456: the verdict is a presentation suffix on the frozen state word — the
+	// stale/ownerDead/shell rules above still decide what `state` says.
+	const orphanWord = input.orphan ? ` (${orphanVerdictWord(input.orphan.verdict)})` : "";
 	const lines = [
-		`${input.name} — state=${state} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
+		`${input.name} — state=${state}${orphanWord} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
 	];
+	// Directly under the header: the one sentence the verdict rests on, so a reader
+	// can check the word instead of trusting it. Display only, no line otherwise.
+	if (input.orphan?.evidence !== undefined && input.orphan.evidence.trim().length > 0) {
+		lines.push(`orphan: ${input.orphan.evidence}`);
+	}
 	if (shell !== undefined) {
 		// A shell is not "quiet": nothing was ever running to be quiet. This line is
 		// the answer to "is it working?", and `unknown` is the only claim the facts
@@ -856,6 +912,14 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 			lines.push(parent);
 		}
 	}
+	// #451: WHO asked for the worktree. A `request` with no tree is the in-place
+	// shape (`worktree:false`), not a missing fact, so it prints `worktree=none`
+	// instead of vanishing; a legacy record has no source and grows no line.
+	if (input.worktreeSource !== undefined) {
+		lines.push(
+			`worktreeSource=${input.worktreeSource} worktree=${input.worktreeBranch ?? input.worktreePath ?? "none"}`,
+		);
+	}
 	// #411 §4: only a child whose transcript is a live mirror has a state file, so
 	// this line is absent for every local child (byte-identical output, by design).
 	// Placed after the host/terminal identity facts and before the snapshots: it is
@@ -883,6 +947,10 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const memory = memoryLine(input);
 	if (memory) lines.push(memory);
 	lines.push(...meta);
+	// #450: which store the record came from — right after the `session=` meta line it
+	// qualifies (both are path facts about the same record). One line, and only when the
+	// caller scanned more than one store: a same-store child grows no line at all.
+	if (input.store !== undefined) lines.push(`store=${input.store}`);
 	if (stale) {
 		const persistedExecution = input.execution
 			? `execution=${input.execution.status}${input.execution.reason ? ` (${input.execution.reason})` : ""}`
