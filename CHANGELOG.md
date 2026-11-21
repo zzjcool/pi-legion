@@ -9,6 +9,23 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [6.2.11] — 2026-11-21
+
+**一句话：重启 pi 之后不会再留下一批"干完了但退不掉"的远端进程 —— orphaned 行按它记下的终端地址自己结算；顺带让每条 hold 记录都带链上投票，事后可诊断。**
+
+- **`#456` PR #457 orphaned 行按终端地址回收。** 重启/会话替换后，上一个会话留下的 `orphaned` 行**既不能 stop、也不会自己结算**：`stop` 只查本会话/本 store，于是回 `unknown child (not tracked by this session)`；`status` 又按过期的 `owner.json` pid 把它算成 live → 远端终端把已经干完活的进程一直挂着（实测两条 centurion 干完活后挂了一天多，只能人工 `hc kill`）。四条落地：
+  - **按记录下来的终端地址结算**：`finished`/`killed`/`exited`/`missing` ⇒ `terminal-gone`，账本结算 + `run.json` retired；`missing` 只在地址是**记录下来的**时才算证据（推断地址的 miss 不算，沿用 `reattach.ts` 的既有守卫）。
+  - **idle-orphan**：终端 alive 但程序已结束 / 停在提示符 ⇒ 必须**两次 transcript 采样相等**才判 `stale-orphan` 并 kill+结算；增长 ⇒ `working`；取不到或变小 ⇒ `unknown`（两种都零写入）。
+  - **`stop` 接受 orphaned 句柄**：先本 store，再走 `candidateStoreRoots` 的有界跨 store 面；沿用 #445 的 owner 闸（别人活着的会话持有的行不碰），跨 store 同名**拒绝歧义**而不是猜。
+  - **导轨诚实**：`state=orphaned (terminal gone, work done)` / `(idle, transcript quiet)` / `(still working)` / `(liveness unknown)`；orphaned 行不再计入 live。每次清理写 `<storeRoot>/orphan-reclaim.log`（谁/何时/host+terminal/哪条证据/ledger 结果）。
+  - 验收 A1–A8 全用真 `hc` JSON-RPC + 真 `run.json`/ledger；**三条反向变异**实跑红后恢复：去掉「finished ⇒ 死行」→ A1 红；去掉两次采样/增长判据 → A2 红（反向用例：transcript 还在长 ⇒ 拒绝清理）；去掉 inferred-miss 守卫 → A7 红。
+- **`#439` PR #458 每条 hold 记录都带链上投票。** 前置 handler 明确返回 `continue:false` 时，hold 的投递出口原本无条件写回 `continue:true`，把别人的判断吞掉；而 pi 1.5.2 的 `emitBoundary` 里「前置 veto」与「还没人说话」是**同一个字节**（`false`），扩展侧没有传感器。6.2.10 的 `#440` 已落 `chainVote` 四态与 `peer-continue-false` 让路；本版补齐仍缺的三处：`HoldRecord.chainVote` 由可选改**必填**并覆盖 `hold:release`/`hold:commit`（1.5.2 用户唯一能看到的就是 `PI_LEGION_HOLD_TRACE` 这两行）、让路判决提到 `degraded`/`idle` 之前（投票是 boundary 的事实，不是本地 child 列表的事实；零行为差异，只让 outcome 如实）、四态矩阵 + 逐记录 + 1.5.2 整条 trace 的 `deepEqual`。
+  - 变异 4 条全红、恢复后 35/35 绿：恢复无条件 `continue:true` → 红×3；删「宿主可表达缺席」的学习 → 红×3；`false` 一律当否决（= 回滚 #417，红线）→ 红×2；只把 `chainVote` 从 release/commit 拿掉 → 红×2。
+  - 上游诉求不变：`BoundaryState.continue` 三态（`boolean | undefined`）或 `prior: BoundaryResult[]`；宿主不改，这一条在 1.5.2 上永远惰性。
+- **`#453` PR #453 并行写隔离配方以新用户身份实跑**：`#451` §3 的配方成立，审计面在 6.2.9 上不存在（文档变更，无代码）。
+
+**测试**：单测 2969（6.2.10 为 2907），集成 221（6.2.10 为 206），`npm run typecheck` exit 0。报告：`docs/reports/orphaned-reclaim.md`、`docs/reports/hold-439-peer-veto.md`、`docs/reports/2026-11-20-doc451-parallel-write-recipe.md`。
+
 ## [6.2.7] — 2026-11-20
 
 **一句话：通知不再因为"会话被替换/重载"而静默丢失，也不会再把整条正文刷进 transcript。**
