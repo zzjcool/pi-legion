@@ -9,6 +9,16 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [6.2.12] — 2026-11-23
+
+**一句话：监督读失败不再等于 child 死亡 —— transport 断掉时保留终端地址与 run 记录，`unreachable` 状态可见、可 stop、恢复后自动续跟；顺带堵住「远端还在干活却判 failed，然后被重派」这一类重复劳动。**
+
+- **`#460` PR #461 监督失联与进程死亡分开。** 真实事故：一次跨机派发中宿主侧的 `terminal.get` 读失败（`hc connect exited (code 0)`），被当成 child 已结束 → run 判 `failed`、地址丢失；而远端子进程一直在跑，把同一颗 issue 又实现了一遍并开出重复 PR。四条落地：
+  - **`unreachable` 状态**：`live | unreachable | finished | retired`。失联时保留地址与 run 记录、`isAlive` 视为存活；首轮 3 次失败后转 30s 慢轮询，成功读取一次即折回 `live`。
+  - **`collect`/`wait` 不再误报失败**：回 `running` + `SUPERVISION_UNREACHABLE_REASON`（"监督失联，child 可能在跑"），不 retire、不结算。
+  - **只有确证死亡才结算**：`terminal.get` 回 `not_found`、`finished`、或真进程退出。`finished`/`retired` 不会被失联路径复活。
+  - **`stop` 仍可到达**：失联地址照样发 `terminal.kill`；投递失败时保留 `host`/`remoteTerminal` 供 #456 的孤儿回收。
+
 ## [6.2.11] — 2026-11-21
 
 **一句话：重启 pi 之后不会再留下一批"干完了但退不掉"的远端进程 —— orphaned 行按它记下的终端地址自己结算；顺带让每条 hold 记录都带链上投票，事后可诊断。**
