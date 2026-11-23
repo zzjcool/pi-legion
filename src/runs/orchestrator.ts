@@ -519,9 +519,11 @@ export interface CollectResult {
  *
  * `"timeout"` is the only value that means "the wait budget ran out"; `"gone"`
  * means the process died, `"blocked"` that a child dialog is waiting on the
- * user and `"aborted"` that the parent turn was interrupted.
+ * user and `"aborted"` that the parent turn was interrupted. `"unreachable"`
+ * (#460) means the supervisor could not READ the child: the channel is down, so
+ * nothing is known — in particular, nothing says the child ended.
  */
-export type CollectWait = "settled" | "timeout" | "blocked" | "gone" | "aborted";
+export type CollectWait = "settled" | "timeout" | "blocked" | "gone" | "aborted" | "unreachable";
 
 export const COLLECT_GRACE_EXTENSIONS = 2;
 /**
@@ -538,6 +540,19 @@ export const COLLECT_GRACE_EXTENSIONS = 2;
 export const COLLECT_DEADLINE_REASON = "collect deadline (per collect attempt) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
+/**
+ * Shown when the supervisor's own read channel failed (#460).
+ *
+ * The run that produced this issue: `terminal.get` threw `hc connect exited (code
+ * 0)`, the wait threw, the collect became `execution: failed`, and the parent
+ * re-dispatched a child that was still working on the other machine — two
+ * implementations, two PRs. A failed READ is not a failed CHILD, so this says the
+ * narrow thing instead: supervision is lost, the child may be running, and both
+ * the run and its terminal address are kept so `collect`/`wait` (retry) and
+ * `stop` (kill) can still reach it.
+ */
+export const SUPERVISION_UNREACHABLE_REASON =
+	"supervision unreachable: this host cannot read the child's terminal (the hc channel failed), so the child may STILL be running — the run and its terminal address are kept; retry collect/wait, or stop to kill it";
 /**
  * Shown when a cross-machine transcript could not be read (xm-dispatch D3.3).
  *
@@ -3775,6 +3790,11 @@ export class Orchestrator {
 	 * first-turn path holds as `running` forever.
 	 *
 	 * Order matters and is deliberate:
+	 *   0. `"unreachable"` (#460) short-circuits EVERYTHING: the supervisor never read
+	 *      the child, so no transcript-derived verdict is a fact about this turn —
+	 *      and the absence of a reading is not a death certificate either. `running`
+	 *      + the supervision reason is the only honest answer, and it keeps the child
+	 *      out of `shouldRecycleAfterCollect`'s retirement set;
 	 *   1. a live child whose latest message is a connection blip is `running`
 	 *      (and keeps waiting), whatever the wait said;
 	 *   2. `"timeout"` on a live child is `running` — the wait budget ran out while
@@ -3801,7 +3821,15 @@ export class Orchestrator {
 		const name = child.name;
 		let parsed = input;
 		let execution = deriveOutcome(parsed);
-		if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
+		if (wait === "unreachable") {
+			// #460: the supervisor never read the child, so no transcript-derived verdict
+			// below is trustworthy as "this turn is over" — but the transcript is not a
+			// death certificate either. Report the one honest thing: still `running`,
+			// with the reason naming the lost channel. `running` is what makes the watch
+			// re-arm and `shouldRecycleAfterCollect` refuse to retire a child that may be
+			// working, instead of a `failed` verdict the parent would re-dispatch.
+			execution = { ...execution, status: "running", reason: SUPERVISION_UNREACHABLE_REASON };
+		} else if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
 			// Same non-terminal signal as the deadline path: watch() re-arms on
 			// `running` and does not retire. An already-settled blip has to keep
 			// waiting here, or the next collect would reproduce it instantly.
@@ -4108,8 +4136,14 @@ export class Orchestrator {
 		}
 	}
 
-	private settleDisposition(result: SettleResult, name: string): "settled" | "timeout" | "gone" {
+	private settleDisposition(result: SettleResult, name: string): CollectWait {
 		if (result.settled) return "settled";
+		// #460: a transport failure is a fact about the CHANNEL, not about the child.
+		// It must never reach the `gone` branch below: that is the branch that turned
+		// "I cannot see it" into "it is over" and re-dispatched a working child. The
+		// supervisor reports this with `abnormal:false` for the same reason — this
+		// check exists so no second reading of that flag (or of `reason`) can drift.
+		if (result.unreachable !== undefined) return "unreachable";
 		if (result.reason === "timeout" || (!result.abnormal && this.supervisor.isAlive(name))) return "timeout";
 		// A connection blip reported as an abnormal settle must not look like
 		// the process exited while that process is still alive.

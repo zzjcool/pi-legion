@@ -227,6 +227,17 @@ export interface SettleResult {
 	exitCode?: number | null;
 	signal?: NodeJS.Signals | null;
 	reason?: string;
+	/**
+	 * #460: the observation channel failed, so this wait learned NOTHING about the
+	 * child — it is not a verdict that the child is over.
+	 *
+	 * Present only on a `{settled:false, abnormal:false}` result whose cause was a
+	 * transport failure (`terminal.get` threw, the `hc` connection dropped, a
+	 * heartbeat read failed). Such a result must never be read as `failed`: the
+	 * child may still be running on the other machine. `detail` is the transport
+	 * failure as text, for the operator — it is diagnostic, not a child fact.
+	 */
+	unreachable?: { detail: string; strikes: number };
 }
 
 /** Cumulative usage reported by the Pi RPC `get_session_stats` command. */

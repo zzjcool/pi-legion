@@ -112,6 +112,43 @@ const ILLEGAL_NAME_CHARS = /[^a-z0-9_-]/g;
 export const SETTLE_POLL_INTERVAL_MS = 1_000;
 
 /**
+ * #460: consecutive transport failures `waitSettled` tolerates before it answers
+ * `unreachable`, on top of the caller's own deadline.
+ *
+ * Three reads at the production cadence is ~3 s of one dropped `hc` connection —
+ * long enough for the socket to be re-established, short enough that a caller is
+ * told "I cannot see it" instead of being held for the whole turn budget.
+ */
+export const UNREACHABLE_STRIKE_LIMIT = 3;
+
+/**
+ * #460: poll cadence once an outage has ALREADY been announced to the caller.
+ *
+ * The first `unreachable` verdict is answered fast (a few seconds: the caller must
+ * learn the channel is down), but the outage is then established fact — answering
+ * early on every later call is what would turn the watch's immediate re-arm
+ * (`runtime.ts` `rearmLiveWatch`, which is only not a busy loop because the collect
+ * blocks) into a ~3 s retry loop. From the second epoch on, the wait polls at this
+ * cadence and answers at the caller's deadline, i.e. exactly the cost a live child
+ * costs. The issue's "no unbounded retry" is satisfied here, not only per wait.
+ */
+export const UNREACHABLE_SLOW_POLL_MS = 30_000;
+
+/** Hard cap on slow polls for a caller that asked for no timeout at all (`deadline = Infinity`). */
+const UNREACHABLE_SLOW_MAX_POLLS = 8;
+
+/**
+ * #460: the `reason` on a `SettleResult` that carries `unreachable`.
+ *
+ * A stable token (not prose): the orchestrator keys its collect disposition off
+ * it, and its own user-facing text lives in
+ * `SUPERVISION_UNREACHABLE_REASON` there. It must never be confused with
+ * `timeout` — that one means "the child is alive and still working", this one
+ * means "this host cannot see the child at all".
+ */
+export const SUPERVISION_UNREACHABLE_REASON = "supervision unreachable";
+
+/**
  * How long a REMOTE launch waits for proof that the child STARTED
  * (`docs/contracts/remote-child-fate-v1.md` §4, revised by #423).
  *
@@ -200,6 +237,25 @@ interface HcSendResult {
 	status?: string | null;
 }
 
+/**
+ * #460: what this backend currently knows about a child's supervision.
+ *
+ * `unreachable` is a statement about THIS HOST's observation channel, never about
+ * the child: the `hc` connection dropped (or the heartbeat read threw), so the
+ * last fact we hold may be minutes old. It is deliberately NOT a terminal state —
+ * the address, the record and the worktree all stay, `isAlive` stays true (the
+ * process may well be running over there) and a later successful read returns the
+ * child to `live`.
+ */
+export type TerminalChildState = "live" | "unreachable" | "finished" | "retired";
+
+/** The one supervision read callers/tests may take of a tracked child (#460). */
+export interface TerminalSupervision {
+	state: TerminalChildState;
+	/** Present exactly while `state === "unreachable"`. */
+	unreachable?: { detail: string; since: number; strikes: number; epochs: number };
+}
+
 interface TerminalChildRecord {
 	/** Legion registry key (the orchestrator's node name). */
 	readonly name: string;
@@ -234,7 +290,17 @@ interface TerminalChildRecord {
 	/** The address the core really holds for this terminal (`host/name`). */
 	remoteTerminal?: string;
 	tempDir?: string;
-	state: "live" | "finished" | "retired";
+	state: TerminalChildState;
+	/**
+	 * #460: why the supervision channel is down, and for how long.
+	 *
+	 * Only set while `state === "unreachable"`; cleared by the first successful
+	 * read. `strikes` is the CONSECUTIVE transport failures that produced the
+	 * current marker (reset on success), `since` is when the current outage began,
+	 * and `epochs` counts how many waits have already ANSWERED `unreachable` for it
+	 * (0 = not announced yet, so the next answer is still the fast one).
+	 */
+	unreachable?: { detail: string; since: number; strikes: number; epochs: number };
 	/** Last observed turn counter. */
 	turn: number;
 	/** Last observed 7501 status word (`idle`, `working`, `done`, …). */
@@ -266,6 +332,19 @@ export interface TerminalSupervisorOptions {
 	runId?: string;
 	/** Poll cadence for `waitSettled`; tests shrink it, production uses 1 s. */
 	pollIntervalMs?: number;
+	/**
+	 * #460: how many CONSECUTIVE transport failures `waitSettled` tolerates before
+	 * it hands the caller an `unreachable` result instead of polling on.
+	 *
+	 * A transport failure is retried (the connection often recovers on its own, and
+	 * the child never stopped running), but not forever: the issue's "不做" list
+	 * rules out an unbounded retry, and a caller that never hears back cannot tell
+	 * a blip from a dead machine. Defaults to
+	 * {@link UNREACHABLE_STRIKE_LIMIT}; every failure is visible on the record
+	 * (`supervision()`), so the state is readable whether this budget is spent or
+	 * not.
+	 */
+	unreachableStrikeLimit?: number;
 	/**
 	 * Bound on the post-`terminal.run` start-up gate of a REMOTE launch (§4).
 	 *
@@ -300,6 +379,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private readonly runId: string | undefined;
 	private readonly pollIntervalMs: number;
 	private readonly remoteStartupConfirmMs: number;
+	/** #460: consecutive transport failures `waitSettled` retries before answering `unreachable`. */
+	private readonly unreachableStrikeLimit: number;
 	private client: HcClient | undefined;
 	/** Parent space label; `null` = not read yet, `undefined` = no space known. */
 	private parentSpace: string | null | undefined = null;
@@ -318,6 +399,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		this.runId = options.runId;
 		this.pollIntervalMs = options.pollIntervalMs ?? SETTLE_POLL_INTERVAL_MS;
 		this.remoteStartupConfirmMs = options.remoteStartupConfirmMs ?? REMOTE_STARTUP_CONFIRM_MS;
+		this.unreachableStrikeLimit = options.unreachableStrikeLimit ?? UNREACHABLE_STRIKE_LIMIT;
 		this.clientFactory =
 			options.clientFactory ??
 			(() => hcCliClient({ env: this.env, ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}) }));
@@ -380,12 +462,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 			);
 		}
 		const previous = this.children.get(input.name);
-		if (previous && previous.state === "live") {
+		if (previous && (previous.state === "live" || previous.state === "unreachable")) {
 			// Review M8: an address, not just a name. A name whose retire failed stays
 			// live (that is deliberate — the terminal may really be running), so this
 			// refusal is the operator's only clue. `vps/lgl-…` says WHICH machine to
 			// clear; a bare `root.worker-0` says only that something is stuck.
+			//
+			// #460: an `unreachable` child holds its terminal too. Letting a new spawn
+			// take the name would be the accident the issue measured set up again — the
+			// first child may be working over there while the second one runs here.
 			const previousAddress = terminalAddress(previous);
+			if (previous.state === "unreachable") {
+				throw new SubagentError(
+					`child is already registered and its terminal is still held: ${previousAddress} (supervision unreachable: ${previous.unreachable?.detail ?? "no detail"} — the child may still be running there; retry \`collect\`/\`wait\`, or \`stop\` to kill it)`,
+					ErrorCodes.NAME_TAKEN,
+				);
+			}
 			throw new SubagentError(
 				previousAddress === input.name
 					? `child is already registered and alive: ${input.name}`
@@ -1064,6 +1156,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// unusable by anybody (the child never started), and leaving the tree
 				// behind would make the re-dispatch fail on `git worktree add` — the
 				// other half of req 6.
+				//
+				// #460 req 3 needs nothing extra HERE: the `confirmRemoteStartup` refusal
+				// already killed and removed the terminal it created (#423 req 6), so a
+				// failed launch does not walk away from a live corpse on that path.
 				this.removeTempDir(tempDir);
 				await rollbackRemoteWorktree();
 				await rollbackRemoteDir();
@@ -1249,6 +1345,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 * not about the task. A timeout resolves
 	 * `{settled:false, abnormal:false, reason:"timeout"}` — it throws nothing and
 	 * kills nothing.
+	 *
+	 * #460: a TRANSPORT failure of the read is NOT a fact about the child. The
+	 * incident behind the issue: `terminal.get` answered `hc connect exited (code
+	 * 0)`, this method threw, the collect became `execution: failed`, the run was
+	 * re-dispatched — and the original child, still working on the other machine,
+	 * finished its job and opened a second PR. So a failing read now moves the
+	 * record to `unreachable` (address, worktree and run record all kept), retries
+	 * up to `unreachableStrikeLimit` consecutive times, and — if the channel never
+	 * comes back within that budget or the caller's deadline — answers
+	 * `{settled:false, abnormal:false, reason:SUPERVISION_UNREACHABLE_REASON,
+	 * unreachable:{detail,strikes}}`. `abnormal:false` is the load-bearing part: no
+	 * caller may spell this as `failed`/`gone`. A read that succeeds afterwards
+	 * returns the child to `live` and tracking continues where it left off.
+	 *
+	 * Only CONFIRMED death still settles as death: `not_found` (the core no longer
+	 * knows the address), or the terminal itself reporting `finished`.
 	 */
 	async waitSettled(
 		name: string,
@@ -1262,17 +1374,50 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0
 			? Date.now() + timeoutMs
 			: Number.POSITIVE_INFINITY;
+		/** Consecutive read failures; ANY successful read resets it (#460). */
+		let strikes = 0;
+		/** Slow polls spent in THIS wait once the outage was already announced (#460). */
+		let slowPolls = 0;
 		for (;;) {
 			let facts: HcTerminalFacts;
 			try {
 				facts = await this.readTerminal(child);
 			} catch (error) {
 				if (isNotFound(error)) {
+					// Confirmed death: the core does not know this address any more.
 					child.state = "finished";
+					this.clearUnreachable(child);
 					return { settled: false, abnormal: true, reason: "terminal not found" };
 				}
-				throw this.failure("terminal.get", child.terminalName, error);
+				if (child.state === "finished" || child.state === "retired") {
+					// The record already says the child is over (the core reported `finished`,
+					// or this parent retired it while this wait was in flight). A failing read
+					// must not resurrect it: `unreachable` here would make `isAlive` true again,
+					// hold the name forever and paint a dead child as possibly-working.
+					return { settled: false, abnormal: true, reason: `terminal ${child.state}` };
+				}
+				strikes += 1;
+				const detail = describeFailure(error);
+				const announced = (child.unreachable?.epochs ?? 0) > 0;
+				this.markUnreachable(child, detail, strikes);
+				const remainingFromFailure = deadline - Date.now();
+				if (announced) slowPolls += 1;
+				const outOfBudget = remainingFromFailure <= 0 || (announced && slowPolls >= UNREACHABLE_SLOW_MAX_POLLS);
+				// The FIRST epoch answers as soon as the strike budget is spent (the caller has
+				// to learn the channel is down). Later epochs only answer at the caller's own
+				// deadline, at the slow cadence: the outage is known, and a caller that re-arms
+				// on `running` must not be handed a ~3 s retry loop.
+				if (outOfBudget || (!announced && strikes >= this.unreachableStrikeLimit)) {
+					return this.unreachableResult(child, detail, strikes);
+				}
+				const cadence = announced ? UNREACHABLE_SLOW_POLL_MS : this.pollIntervalMs;
+				const interruptedRetry = await this.sleep(Math.min(cadence, remainingFromFailure), signal);
+				if (interruptedRetry) {
+					return { settled: false, abnormal: false, reason: "aborted by parent" };
+				}
+				continue;
 			}
+			strikes = 0;
 			this.applyFacts(child, facts);
 			if (facts.state === "finished") {
 				return {
@@ -1299,7 +1444,35 @@ export class TerminalSupervisor implements LegionSupervisor {
 
 	isAlive(name: string): boolean {
 		const child = this.children.get(name);
-		return child !== undefined && child.state === "live";
+		// #460: `unreachable` is alive for every caller that matters. The process was
+		// never observed to end — only this host's VIEW of it did — so `status` must
+		// still list the child and `stop` must still try to reach its address. This is
+		// exactly the flag that used to answer `false`, which turned "I cannot see it"
+		// into "it is gone" and re-dispatched a living child.
+		return child !== undefined && (child.state === "live" || child.state === "unreachable");
+	}
+
+	/**
+	 * #460: the supervision facts for one child, for callers (and tests) that must
+	 * tell "alive" from "cannot be seen right now".
+	 *
+	 * This is the RECORD-side view: `execution.reason` on the collect/status surface
+	 * is what an operator reads (`SUPERVISION_UNREACHABLE_REASON`), and `stop` works
+	 * off `isAlive`. Nothing in `src/` consumes this accessor yet — a UI that wants
+	 * to paint the outage as its own state (instead of `running` + a long reason)
+	 * reads it here.
+	 *
+	 * `undefined` means this backend tracks no such child. An `unreachable` state
+	 * carries the transport failure, when the outage began and how many waits have
+	 * already reported it, and is cleared by the next successful read.
+	 */
+	supervision(name: string): TerminalSupervision | undefined {
+		const child = this.children.get(name);
+		if (!child) return undefined;
+		return {
+			state: child.state,
+			...(child.unreachable !== undefined ? { unreachable: { ...child.unreachable } } : {}),
+		};
 	}
 
 	/**
@@ -1373,6 +1546,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const client = await this.ensureClient();
 		const address = terminalAddress(child);
 		try {
+			// #460: `stop` addresses the terminal by the address on the record, which is
+			// exactly what an `unreachable` child still holds. A kill that cannot be
+			// DELIVERED is not a kill that did not happen over there, so the record keeps
+			// its address (the throw below leaves `state` untouched) and the run row keeps
+			// the machine — which is what the orphan sweep kills by (legion#456). Losing
+			// the address here is how a real child became an untraceable orphan.
 			await client.request("terminal.kill", {
 				terminal: address,
 				...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
@@ -1391,6 +1570,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 			/* D11: best effort — a killed terminal that cannot be removed is not an error */
 		}
 		child.state = "retired";
+		this.clearUnreachable(child);
 		// D9: the parent temp dir is ours to remove; the mirrored remote copy is
 		// not (same posture as a child's worktree/session — it stays put).
 		this.removeTempDir(child.tempDir);
@@ -2037,7 +2217,61 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private applyFacts(child: TerminalChildRecord, facts: HcTerminalFacts): void {
 		child.turn = normalizedTurn(facts.turn);
 		if (typeof facts.status?.state === "string") child.statusState = facts.status.state;
-		if (facts.state === "finished") child.state = "finished";
+		if (facts.state === "finished") {
+			child.state = "finished";
+		} else if (child.state === "unreachable") {
+			// #460: the channel is back. The child was never observed to end, so it
+			// returns to `live` with the reading this call just folded in — tracking
+			// continues from here instead of from a fabricated death.
+			child.state = "live";
+		}
+		this.clearUnreachable(child);
+	}
+
+	/**
+	 * #460: record that THIS HOST lost sight of the child, not that the child ended.
+	 *
+	 * Nothing about the child is touched — `terminalName`, `host`, `remoteTerminal`,
+	 * `worktree*` and `promptTurn` all stay, because a dropped `hc` connection says
+	 * only that the observation channel is down. `state` becomes `unreachable`,
+	 * which `isAlive` still counts as alive (`status` lists the child, `stop` still
+	 * reaches its address) and which a later successful read clears.
+	 */
+	private markUnreachable(child: TerminalChildRecord, detail: string, strikes: number): void {
+		// A record that already ended is never reopened by a failing read: only a live
+		// (or already-unreachable) child can lose its supervision channel.
+		if (child.state === "finished" || child.state === "retired") return;
+		child.state = "unreachable";
+		child.unreachable = {
+			detail,
+			// The outage is dated from its FIRST failure, so an operator reading the
+			// record (or `legion doctor`) sees how long the channel has been down even
+			// while the poll keeps retrying.
+			since: child.unreachable?.since ?? Date.now(),
+			strikes,
+			epochs: child.unreachable?.epochs ?? 0,
+		};
+	}
+
+	/**
+	 * #460: the verdict of a wait that could not read the child.
+	 *
+	 * `abnormal:false` is the load-bearing part — this is NOT a death — and the
+	 * epoch counter is bumped so the NEXT wait for the same outage knows it may not
+	 * answer early again (see `UNREACHABLE_SLOW_POLL_MS`).
+	 */
+	private unreachableResult(child: TerminalChildRecord, detail: string, strikes: number): SettleResult {
+		if (child.unreachable !== undefined) child.unreachable.epochs += 1;
+		return {
+			settled: false,
+			abnormal: false,
+			reason: SUPERVISION_UNREACHABLE_REASON,
+			unreachable: { detail, strikes },
+		};
+	}
+
+	private clearUnreachable(child: TerminalChildRecord): void {
+		child.unreachable = undefined;
 	}
 
 	private requireChild(name: string): TerminalChildRecord {

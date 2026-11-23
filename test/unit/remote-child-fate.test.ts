@@ -687,3 +687,39 @@ test("§4 (#423): silence is NOT a launch — no transcript within the window re
 		h.cleanup();
 	}
 });
+
+/**
+ * #460: the incident this file's sibling covers a corner of — a supervision READ
+ * failing on a child that is still running on the other machine.
+ *
+ * The address is the whole point: `stop` (and the #456 orphan sweep) reach a remote
+ * child by `host/name`, so an outage must not degrade it to a bare name or drop the
+ * host. This is the one case in this file that asks a REMOTE child, because a local
+ * fixture could never observe the `host/` prefix.
+ */
+test("#460: a remote child that becomes unreachable keeps its host-qualified address, and stop still kills it there", async () => {
+	const h = launchHarness({ sessionArrives: true });
+	try {
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root));
+		assert.equal(handle.remoteTerminal, "vps/lgl-worker-0");
+		// The channel dies AFTER the launch was confirmed — exactly the incident.
+		h.client.on("terminal.get", () => {
+			throw new HcRpcError({ code: -32603, message: "hc connect exited (code 0)", data: { kind: "transport" } });
+		});
+		const settled = await h.supervisor.waitSettled(CHILD, 5_000);
+		assert.equal(settled.abnormal, false, "the child was never observed to end");
+		assert.notEqual(settled.unreachable, undefined);
+		assert.equal(h.supervisor.isAlive(CHILD), true, "status still lists it");
+
+		h.client.on("terminal.kill", () => ({ address: "t9", state: "finished" }));
+		h.client.on("terminal.rm", () => ({ removed: "t9" }));
+		await h.supervisor.retire(CHILD);
+		assert.deepEqual(
+			h.client.paramsFor("terminal.kill").map((params) => params.terminal),
+			["vps/lgl-worker-0"],
+			"the host-qualified address survived the outage",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
