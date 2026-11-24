@@ -2956,6 +2956,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					ledgerNodeFor: (child: StatusChildRecord) =>
 						legion && child.nodeId ? getNode(legion.db, child.nodeId) : undefined,
 					now: Date.now(),
+					...(lastSessionFile !== undefined ? { sessionFile: lastSessionFile } : {}),
 				}).text;
 				return ok(`${roster}\n\n${overview}`);
 			}
@@ -3981,6 +3982,7 @@ async function controlAction(input: {
 				ledgerNodeFor,
 				now,
 				orphanFacts,
+				...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 			});
 			// D7 (polish round): `all` has to MEAN something. The overview above is
 			// live-only by construction (`TERMINAL_STATUS_CHILD_STATES` is skipped), so
@@ -4078,6 +4080,7 @@ async function controlAction(input: {
 				name: found.child.name,
 				alive,
 				runtime: input.runtime,
+				...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 			}));
 		// #456: the same bounded inspection the overview does, for one orphaned record.
 		const orphanFacts = isOrphanedRecord(found.child)
@@ -7357,6 +7360,8 @@ function renderScanOverview(input: {
 	 * inspect passes nothing, and the row renders exactly as it did before.
 	 */
 	orphanFacts?: ReadonlyMap<string, OrphanEvidence>;
+	/** The session ASKING (`ctx.sessionManager.getSessionFile()`), so #463 can tell "I adopted it" from "somebody adopted it". */
+	sessionFile?: string | undefined;
 }): ScanOverview {
 	const entries: StatusChildEntry[] = [];
 	const liveNames = new Map<string, string[]>();
@@ -7397,6 +7402,7 @@ function renderScanOverview(input: {
 					name: child.name,
 					alive,
 					runtime: input.runtime,
+					...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 				}));
 			const facts = {
 				alive,
@@ -7690,6 +7696,7 @@ async function settleUnsupervisedOnStop(input: {
 			name: child.name,
 			alive: input.supervisor.isAlive(child.name),
 			runtime: input.runtime,
+			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 		}));
 		return verdict === undefined ? undefined : { run, child, verdict };
 	};
@@ -7748,6 +7755,7 @@ async function settleUnsupervisedOnStop(input: {
 						name: child.name,
 						alive: input.supervisor.isAlive(child.name),
 						runtime: input.runtime,
+						...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 					}),
 				})[0];
 				if (row !== undefined) candidates.push({ store, row });
@@ -8047,6 +8055,8 @@ function unsupervisedFactsFor(input: {
 	name: string;
 	alive: boolean;
 	runtime: SessionRuntime;
+	/** The session ASKING (`ctx.sessionManager.getSessionFile()`), so an adoption it made counts as holding the child. */
+	sessionFile?: string | undefined;
 }): UnsupervisedFacts {
 	const marker = input.runId === undefined
 		? undefined
@@ -8059,6 +8069,9 @@ function unsupervisedFactsFor(input: {
 		owner: ownerVerdictOf(marker),
 		...(marker?.pid !== undefined ? { ownerPid: marker.pid } : {}),
 		...(marker?.host ? { ownerHost: marker.host } : {}),
+		// #445 §1 / #450 A1: a leftover THIS session re-attached is held by the
+		// re-attach watcher — no supervisor entry, no job — so the stamp is the fact.
+		...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 	};
 }
 

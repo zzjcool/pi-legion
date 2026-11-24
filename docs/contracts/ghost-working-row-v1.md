@@ -56,8 +56,11 @@ export interface UnsupervisedMark {
   evidence: string;
   /** The session that converged the row. */
   sessionFile?: string;
-  /** What the ledger said when the row was converged. */
-  ledger?: "running" | "ended" | "missing";
+  /**
+   * What the ledger said when the row was converged — only the two OPEN readings:
+   * a row whose ledger row already `ended` is never converged at all (§4.3).
+   */
+  ledger?: "running" | "missing";
 }
 ```
 
@@ -81,10 +84,14 @@ export interface UnsupervisedFacts {
   ownerPid?: number;
   /** this process's pid (default `process.pid`). */
   pid?: number;
+  /** the session ASKING (its own transcript) — `reattached.sessionFile` is compared to it. */
+  sessionFile?: string;
 }
 /**
  * The convergence answer (session-start scan): the row is a leftover nobody here
- * holds, whether its owner marker is dead, absent, or this very process.
+ * holds, whether its owner marker is dead, absent, or this very process. A row THIS
+ * session adopted (`reattached.sessionFile` = `facts.sessionFile`) is held — by the
+ * #445 re-attach watcher, which is neither a supervisor entry nor a job.
  */
 export function convergeVerdict(child, facts): UnsupervisedVerdict | undefined;
 /**
@@ -136,9 +143,9 @@ The #445 pass already walks every store's leftovers under one budget; it now als
 
 | leftover | pass decision |
 |---|---|
-| ledger row `hasEnded` (settled/retired/failed) | converge the record half: `state="retired"`, `retiredAt`, `unsupervised` mark with `ledger: "ended"`. The ledger is the authority (#456), so no ledger write. |
-| not live (probe said not-live, or a **local** leftover with no supervisor) and no live foreign owner | stamp `unsupervised` (state unchanged) with `ledger: "running"` — `status` now says `unreachable (no supervisor)` and `stop` settles it. The question is asked with `convergeVerdict`, the wider scan answer. |
-| live / adopted / live foreign owner / ledger unreadable / #456 orphan (`isOrphanLeftover`) | untouched (byte-identical to 6.2.12) |
+| not live (probe said not-live, or a **local** leftover with no supervisor) and no live foreign owner | stamp `unsupervised` (state unchanged) with `ledger: "running"`/`"missing"` — `status` now says `unreachable (no supervisor)` and `stop` settles it. The question is asked with `convergeVerdict`, the wider scan answer. |
+| ledger row `hasEnded` (settled/retired/failed) | untouched, logged only: **#445 A3 froze this shape** — "a settled/retired child is not adopted and not announced", the record is left exactly as found (`state=working` stays, #209-3's word stands). The ledger is the authority (#456); this pass has no verdict about a row that already ended. |
+| live / adopted / live foreign owner / this session's own adoption / ledger unreadable / #456 orphan (`isOrphanLeftover`) | untouched (byte-identical to 6.2.12) |
 
 A record already `retired`/`exited` is never touched. Adoption (`state="working"`,
 `reattached`) still clears any `unsupervised` mark it may carry.
@@ -156,9 +163,10 @@ A record already `retired`/`exited` is never touched. Adoption (`state="working"
    dir's `owner.json` pid is alive **and is this process** ⇒ `status` must not say
    `working` (it says `unreachable (no supervisor)`) and `stop` must settle it
    (`state=retired` + ledger row ended). Both single-store and foreign-store shapes.
-2. Restart convergence: a leftover whose ledger row already ended is converged to
-   `retired` by the pass; one whose ledger row still runs gets the `unsupervised` mark
-   and is then stoppable.
+2. Restart convergence: a leftover whose ledger row still runs gets the `unsupervised`
+   mark and is then stoppable; one whose ledger row already ended is left **exactly as
+   found** (#445 A3 is the boundary this may not cross — `test/integration/reattach-live-children.test.ts`
+   "#445 A3", `test/unit/reattach-converge.test.ts` "✕ #445 A3").
 3. Mutation: deleting the ghost verdict (predicate returns `undefined`) turns
    acceptance 1 red.
 4. `npm run typecheck` + `npm test` (compare against the `origin/master` baseline).

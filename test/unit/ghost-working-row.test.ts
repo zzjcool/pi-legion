@@ -272,6 +272,50 @@ test("#463 A: another LIVE session's marker holds the row, a foreign-host marker
 	);
 });
 
+// ── the #450 A1 boundary: an adoption by THIS session is holding ───────────
+
+/**
+ * The regression this boundary exists for (CI red on #450 A1): a leftover the
+ * session-start pass ADOPTED is `state=working` with no supervisor entry and no job —
+ * the re-attach watcher holds it — and `owner.json` names the very process that just
+ * wrote the adoption. Without the `reattached.sessionFile` fact, `status` called that
+ * child `unreachable (no supervisor)` and dropped it out of the live count, so #450's
+ * re-attach became invisible exactly where it had just succeeded.
+ *
+ * The scope matters as much as the rule: a stamp from an EARLIER session is #463's
+ * ghost (that session is gone), so the exemption must be "me", not "any adoption".
+ */
+test("#463 A ✕ #450 A1: the session that ADOPTED the row holds it; an earlier session's stamp does not", () => {
+	const thisSession = "/tmp/sessions/current.jsonl";
+	const adopted = childRecord("anotify-uishift-budget", {
+		host: "njbox",
+		reattached: { at: 1_000, host: "njbox", sessionFile: thisSession, evidence: "terminal is live" },
+	});
+	// The facts of the re-attach case: no supervisor entry, no job, and `owner.json`
+	// naming this very process (any write to the run dir refreshes it).
+	const mine = { alive: false, tracked: false, owner: "live" as const, ownerPid: process.pid, pid: process.pid, sessionFile: thisSession };
+	assert.equal(unsupervisedVerdict(adopted, mine), undefined, "`status` must not call the row I just adopted a ghost");
+	assert.equal(convergeVerdict(adopted, mine), undefined, "and neither may a later pass of the same session");
+	const classified = classifyChildrenForStatus([{ runId: "r-1", createdAt: STAMP, children: [adopted] }] as never, () => mine);
+	assert.equal(classified[0]?.live, true, "an adopted child is live: never `0 live children (1 unreachable)` (the CI red)");
+	// The overview #450 A1 reads, built the way `renderScanOverview` builds it.
+	const text = renderStatusOverview([{
+		child: adopted,
+		alive: false,
+		owner: "live",
+		live: classified[0]!.live,
+		unsupervised: unsupervisedVerdict(adopted, mine),
+	}]);
+	assert.match(text, /^Status · 1 live child$/m, "the adopted child is counted, with no `unreachable` bucket");
+	assert.doesNotMatch(text, /unreachable/, "no verdict word and no evidence line: the block is the pre-#463 one");
+
+	// The SAME record, adopted by a session that is gone: the ghost #463 is about.
+	const stale = { ...mine, sessionFile: "/tmp/sessions/previous.jsonl" };
+	assert.equal(unsupervisedVerdict(adopted, stale)?.reason, UNSUPERVISED_REASON, "a dead session's adoption holds nothing");
+	// A caller with no session identity of its own cannot claim the stamp either.
+	assert.equal(unsupervisedVerdict(adopted, { ...mine, sessionFile: undefined })?.reason, UNSUPERVISED_REASON);
+});
+
 test("#463 A: the scan converges a dead or markerless owner, the hand-settle does not", () => {
 	const child = childRecord("worker-0");
 	const dead = { alive: false, tracked: false, owner: "dead" as const, ownerPid: 2_147_483_000, pid: process.pid };

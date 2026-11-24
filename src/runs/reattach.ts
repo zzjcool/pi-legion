@@ -85,26 +85,24 @@
  * a live child and `stop` could not settle it (the "ghost working row"). The pass now
  * CONVERGES those rows in place, in the store that holds them:
  *
- *   - the LEDGER row already ended (`hasEnded`) ⇒ the record follows it (`state =
- *     "retired"`, `retiredAt`, the `orphaned` marker dropped) and carries an
- *     `unsupervised` mark with `ledger: "ended"`. No ledger write: the ledger is the
- *     authority (#456), and a row that ended stays as it ended;
  *   - the ledger row still runs (or is gone) and NOBODY HERE holds the child ⇒ the
- *     record keeps its state and gets the same mark with `ledger: "running"` /
- *     `"missing"`, so `status` says `unreachable (no supervisor)` and `stop` can
+ *     record keeps its state and gets an `unsupervised` mark with `ledger: "running"`
+ *     / `"missing"`, so `status` says `unreachable (no supervisor)` and `stop` can
  *     settle it. That question is asked in exactly ONE place — `convergeVerdict`
  *     in `src/runs/unsupervised-row.ts` — so `status`, `stop` and this pass cannot
  *     answer it differently.
  *
- * Deliberately NOT converged (byte-identical to 6.2.12): an ADOPTED child (adoption
- * clears the mark), a live one, a row another LIVE session's `owner.json` holds (and
- * a marker written on another HOST, which cannot be checked from here), an #456
- * orphan (its own path owns it), a row whose ledger could not be READ ("unreadable"
- * is not "ended"), a row an earlier pass already marked, and anything terminal. The
- * step is bounded ({@link REATTACH_CONVERGE_MAX_ROWS} rows, the same pass deadline),
- * makes no wire call and writes no ledger, and it never grows a sentence of its own:
- * ` (N converged)` is a suffix on the ONE line the pass already had, and only when
- * N > 0.
+ * Deliberately NOT converged (byte-identical to 6.2.12): a row whose LEDGER row already
+ * ended (`hasEnded`) — #445 A3 froze that shape ("a settled/retired child is not adopted
+ * and not announced", the record left exactly as found, #209-3's word kept); an ADOPTED
+ * child (adoption clears the mark and its `reattached` stamp names the session that
+ * holds it), a live one, a row another LIVE session's `owner.json` holds (and a marker
+ * written on another HOST, which cannot be checked from here), an #456 orphan (its own
+ * path owns it), a row whose ledger could not be READ ("unreadable" is not "ended"), a
+ * row an earlier pass already marked, and anything terminal. The step is bounded
+ * ({@link REATTACH_CONVERGE_MAX_ROWS} rows, the same pass deadline), makes no wire call
+ * and writes no ledger, and it never grows a sentence of its own: ` (N converged)` is a
+ * suffix on the ONE line the pass already had, and only when N > 0.
  */
 
 import * as fs from "node:fs";
@@ -826,15 +824,11 @@ export async function adoptCandidate(
 
 // ── #463: convergence ───────────────────────────────────────────────────────
 
-/** Which half of the record/ledger pair converged a leftover (#463 §4.3). */
-export type ReattachConvergeHow = "ledger-ended" | "no-supervisor";
-
 /** One row the pass converged, with the store it had to be written back into. */
 export interface ReattachConverged {
 	name: string;
 	/** #450: the store the record lives in (resolved) — convergence writes THERE, never the session store. */
 	storeRoot: string;
-	how: ReattachConvergeHow;
 	runId: string;
 }
 
@@ -916,18 +910,18 @@ function takenInWindow(child: Pick<ChildRecord, "state" | "reattached">, started
  * For every scanned store, for every `run.json` child that is not terminal and was not
  * adopted by this pass:
  *
- *   1. the ledger row already ENDED ⇒ the record follows it (`state="retired"`,
- *      `retiredAt`, the `orphaned` marker dropped) and carries an `unsupervised` mark
- *      with `ledger: "ended"`. The ledger is NOT written: it is the authority, and a
- *      row that ended stays as it ended;
- *   2. the ledger row still runs (or is gone) and the ONE predicate
+ *   1. the ledger row still runs (or is gone) and the ONE predicate
  *      (`convergeVerdict`, `src/runs/unsupervised-row.ts`) says nobody here holds
- *      the child ⇒ the record keeps its state (`retiredAt` untouched) and gets the same
- *      mark with `ledger: "running"`/`"missing"`. `status` now says
- *      `unreachable (no supervisor)` and `stop` can settle it;
- *   3. everything else — adopted, live, a live foreign owner, a marker on another host,
- *      an #456 orphan, a row an earlier pass already marked, a ledger that could not be
- *      read, a terminal record — is left byte-identical to 6.2.12.
+ *      the child ⇒ the record keeps its state (`retiredAt` untouched) and gets an
+ *      `unsupervised` mark with `ledger: "running"`/`"missing"`. `status` now says
+ *      `unreachable (no supervisor)` and `stop` can settle it. The ledger is NOT
+ *      written: it is the authority (#456);
+ *   2. everything else — a row whose ledger row already ENDED (#445 A3: "a
+ *      settled/retired child is not adopted and not announced", so the record is left
+ *      exactly as found — #209-3's word included), adopted, live, a live foreign owner,
+ *      a marker on another host, an #456 orphan, a row an earlier pass already marked,
+ *      a ledger that could not be read, a terminal record — is left byte-identical
+ *      to 6.2.12.
  *
  * No wire call, no ledger write, no throw: a store with no `updateChild` converges
  * nothing (a mark that exists only in memory is worse than no mark), and one failed
@@ -988,43 +982,24 @@ async function convergeLeftovers(opts: {
 					continue;
 				}
 				if (reading.ledger === "ended") {
-					const evidence = `ledger row ${reading.nodeId} already ended (${reading.nodeStatus}), so the record is converged to retired`;
-					let changed = false;
-					try {
-						await write.call(store, run.runId, child.name, (fresh) => {
-							if (takenInWindow(fresh, opts.startedAt)) return;
-							fresh.state = "retired";
-							fresh.retiredAt = new Date(at).toISOString();
-							delete fresh.orphaned;
-							fresh.unsupervised = {
-								// A row converged before keeps the moment it was FIRST converged.
-								at: fresh.unsupervised?.at ?? at,
-								reason: UNSUPERVISED_REASON,
-								evidence,
-								ledger: "ended",
-								...markSession,
-							};
-							changed = true;
-						});
-					} catch (error) {
-						opts.log(`${new Date(at).toISOString()} ${child.name} run=${run.runId} store=${label}: the record could not be converged (${messageOf(error)})`);
-						continue;
-					}
-					if (!changed) {
-						opts.log(`${new Date(at).toISOString()} left ${child.name} run=${run.runId} store=${label}: settled or adopted by someone else while the pass was running`);
-						continue;
-					}
-					rows.push({ name: child.name, storeRoot, how: "ledger-ended", runId: run.runId });
-					opts.log(`${new Date(at).toISOString()} converged ${child.name} run=${run.runId} store=${label} how=ledger-ended record=${child.state}: ${evidence}`);
+					// #445 A3 froze this shape: the LEDGER is the authority and a
+					// settled/retired row is not adopted AND NOT ANNOUNCED — the record is
+					// left exactly as found (`state=working` stays #209-3's word), so a pass
+					// here would be the over-reach #463 is not allowed to make. Logged, never
+					// written: the row is history, not a leftover this step reconciles.
+					opts.log(`${new Date(at).toISOString()} left ${child.name} run=${run.runId} store=${label} record=${child.state}: ledger row ${reading.nodeId} already ended (${reading.nodeStatus}), and a settled/retired child is not adopted and not announced`);
 					continue;
 				}
 				// A row an earlier pass already converged is history here: byte-identical.
 				if (child.unsupervised !== undefined) continue;
 				const verdict = convergeVerdict(child, {
 					// At a session start nobody here holds it: no supervisor entry, no job.
+					// A `reattached` stamp naming THIS session would say otherwise, and the
+					// pass is asked the same question every other reader asks.
 					alive: false,
 					tracked: opts.tracked(child.name),
 					pid: opts.pid,
+					...(own !== undefined ? { sessionFile: own } : {}),
 					...ownerFactsFor(runDir, opts.alive),
 				});
 				if (verdict === undefined) continue;
@@ -1047,7 +1022,7 @@ async function convergeLeftovers(opts: {
 					continue;
 				}
 				if (!changed) continue;
-				rows.push({ name: child.name, storeRoot, how: "no-supervisor", runId: run.runId });
+				rows.push({ name: child.name, storeRoot, runId: run.runId });
 				opts.log(`${new Date(at).toISOString()} converged ${child.name} run=${run.runId} store=${label} how=no-supervisor ledger=${reading.ledger} record=${child.state}: ${verdict.evidence}`);
 			}
 		}
@@ -1206,7 +1181,7 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 		report.converged = converge.rows;
 		report.deferredConverge = converge.deferred;
 		if (converge.rows.length > 0 || converge.deferred > 0) {
-			const named = converge.rows.map((row) => `${row.how}:${row.name}`).join(",");
+			const named = converge.rows.map((row) => row.name).join(",");
 			log(`${new Date(now()).toISOString()} reattach converge converged=${converge.rows.length} (${named || "-"}) deferred=${converge.deferred}`);
 		}
 		// Mirror-only orphans: no record and no row, so they cannot be adopted — but a

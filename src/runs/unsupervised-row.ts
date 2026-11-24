@@ -22,6 +22,7 @@
  * | fact | answer |
  * |---|---|
  * | a live supervisor entry / job in this process (`alive`/`tracked`) | held — not a ghost |
+ * | an adoption stamp naming THIS session (`reattached.sessionFile`) | held — the re-attach watcher (#445 §1) owns it |
  * | another LIVE session's `owner.json` pid (not this process) | held — left alone (#445 §3, #456 F8) |
  * | marker on ANOTHER host | cannot be checked from here — left alone (#456 F8) |
  * | an #456 orphaned leftover | #456 owns it — not this module's row |
@@ -42,6 +43,7 @@
  */
 
 import * as os from "node:os";
+import * as path from "node:path";
 
 import type { ChildRecord, RunRecord } from "../shared/types.ts";
 
@@ -80,8 +82,12 @@ export interface UnsupervisedMark {
 	evidence: string;
 	/** The session that converged it — the "who" a later reader can check. */
 	sessionFile?: string;
-	/** What the ledger said at convergence time (`ended` ⇒ the record was retired). */
-	ledger?: "running" | "ended" | "missing";
+	/**
+	 * What the ledger said at convergence time. Only the two OPEN readings: a row whose
+	 * ledger row already `ended` is never converged at all (#445 A3: a settled/retired
+	 * child is not adopted and not announced), so the record is left as found.
+	 */
+	ledger?: "running" | "missing";
 }
 
 declare module "../shared/types.ts" {
@@ -110,6 +116,16 @@ export interface UnsupervisedFacts {
 	ownerHost?: string | undefined;
 	/** This machine's hostname (defaults to the caller's `os.hostname()`). */
 	hostname?: string | undefined;
+	/**
+	 * The session ASKING (its own transcript path), when it has one.
+	 *
+	 * It is what turns an adoption stamp into a fact: `reattached.sessionFile` names the
+	 * session that adopted the child, so a stamp naming THIS session is proof that the
+	 * re-attach watcher holds it (#445 §1) — the fix for #450 A1, where an adopted
+	 * leftover has no supervisor entry and no job and was therefore read as a ghost.
+	 * A stamp naming an EARLIER session proves nothing: that session is gone.
+	 */
+	sessionFile?: string | undefined;
 }
 
 /** The verdict a ghost row renders and is settled under. */
@@ -151,7 +167,7 @@ export function unsupervisedMarkOf(child: Pick<ChildRecord, "unsupervised" | "st
  * existing behaviour alone". Total and pure: no fs, no wire, no clock.
  */
 function unheld(
-	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "name">,
+	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "name" | "reattached">,
 	facts: UnsupervisedFacts,
 ): { evidence: string } | undefined {
 	// 1. History is never resurrected (a retired row is not a ghost).
@@ -159,6 +175,15 @@ function unheld(
 	// 2. Somebody here holds it: an in-memory supervisor entry, or a job in the
 	//    session's own table (a queued/launching child exists before a handle does).
 	if (facts.alive || facts.tracked) return undefined;
+	// 2b. THIS session adopted it. An adopted leftover is held by the re-attach
+	//     watcher (#445 §1), which is neither a supervisor entry nor a job — so the
+	//     two facts above cannot see it, and without this rule #450's re-attach would
+	//     be called a ghost by the very session that just adopted it. The stamp's
+	//     `sessionFile` is the evidence; a stamp from an EARLIER session proves
+	//     nothing (that session is gone, which is #463's row).
+	if (facts.sessionFile !== undefined && child.reattached?.sessionFile !== undefined) {
+		if (path.resolve(child.reattached.sessionFile) === path.resolve(facts.sessionFile)) return undefined;
+	}
 	// 3. #456's leftovers answer to their own predicate and their own verdict word.
 	if (isOrphanLeftover(child)) return undefined;
 	// 4. Only a state that owes work can be a ghost.
@@ -187,7 +212,7 @@ function unheld(
  * missing marker — both frozen display contracts) into the honest one.
  */
 export function convergeVerdict(
-	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name">,
+	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name" | "reattached">,
 	facts: UnsupervisedFacts,
 ): UnsupervisedVerdict | undefined {
 	const base = unheld(child, facts);
@@ -211,7 +236,7 @@ export function convergeVerdict(
  * scan, which is where the evidence for a stronger word actually gets gathered.
  */
 export function unsupervisedVerdict(
-	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name">,
+	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name" | "reattached">,
 	facts: UnsupervisedFacts,
 ): UnsupervisedVerdict | undefined {
 	const verdict = convergeVerdict(child, facts);

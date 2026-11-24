@@ -10,17 +10,16 @@
  * The pass now reconciles those records with what the LEDGER says, in the store that
  * holds them, and writes the `unsupervised` mark the status/stop predicate reads:
  *
- *   - ledger row ENDED ⇒ the record follows it (`retired`), mark `ledger: "ended"`,
- *     no ledger write (the ledger is the authority — #456);
  *   - ledger row still running / missing and NOBODY here holds the child ⇒ the record
  *     keeps its state and gets the mark (`ledger: "running"` / `"missing"`), so
  *     `status` renders `unreachable (no supervisor)` and `stop` settles it.
  *
- * Everything else must stay byte-identical to 6.2.12: an adopted child (adoption
- * CLEARS the mark), a live one, a row another live session holds, a row a previous
- * pass already marked, an #456 orphan, a ledger that could not be read, a terminal
- * record — and a store with no `updateChild` (a mark that exists only in memory is
- * worse than no mark).
+ * Everything else must stay byte-identical to 6.2.12: a row whose ledger row already
+ * ENDED (#445 A3 — "a settled/retired child is not adopted and not announced", the
+ * record left exactly as found), an adopted child (adoption CLEARS the mark), a live
+ * one, a row another live session holds, a row a previous pass already marked, an #456
+ * orphan, a ledger that could not be read, a terminal record — and a store with no
+ * `updateChild` (a mark that exists only in memory is worse than no mark).
  *
  * Real on-disk stores and the real `legion.db` schema: this step's whole job is that
  * a LATER session reads what an EARLIER one wrote, so a fake store would test the
@@ -170,9 +169,9 @@ test("#463: a local leftover nobody holds gets the mark, and keeps its state", a
 		assert.equal(report.converged?.length, 1, "the row is reported as converged");
 		assert.deepEqual(report.converged?.[0] && {
 			name: report.converged[0].name,
-			how: report.converged[0].how,
+			storeRoot: path.resolve(report.converged[0].storeRoot),
 			runId: report.converged[0].runId,
-		}, { name: "ghost-0", how: "no-supervisor", runId: f.runId });
+		}, { name: "ghost-0", storeRoot: path.resolve(f.store.rootDir), runId: f.runId });
 
 		const record = recordOf(f);
 		assert.equal(record.state, "working", "an open ledger row is not a retirement: the state stays the record's");
@@ -188,9 +187,9 @@ test("#463: a local leftover nobody holds gets the mark, and keeps its state", a
 	}
 });
 
-// ── 2. ledger ended ⇒ the record follows it, no ledger write ────────────────
+// ── 2. ledger ended ⇒ THE BOUNDARY: nothing is written (the #445 A3 shape) ──
 
-test("#463: a leftover whose ledger row already ended is converged to retired (and the ledger is not written)", async () => {
+test("#463 ✕ #445 A3: a leftover whose ledger row already ended is left exactly as found", async () => {
 	const f = fixture();
 	try {
 		await f.store.addChild(f.runId, ghostRecord());
@@ -205,20 +204,22 @@ test("#463: a leftover whose ledger row already ended is converged to retired (a
 		})();
 
 		const report = await runReattachPass(passInput(f));
-		assert.equal(report.converged?.[0]?.how, "ledger-ended");
-
+		assert.equal(report.converged?.length ?? 0, 0, "an ended ledger row is the LEDGER's verdict, not this step's");
 		const record = recordOf(f);
-		assert.equal(record.state, "retired", "the record half mirrors the ended ledger row");
-		assert.ok(record.retiredAt, "a retirement carries its moment");
-		assert.equal(record.unsupervised?.ledger, "ended");
-		assert.match(record.unsupervised?.evidence ?? "", /already ended \(settled\)/);
+		assert.equal(record.state, "working", "the record is untouched: the pass has no verdict about an ended row");
+		assert.equal(record.retiredAt, undefined);
+		assert.equal(record.unsupervised, undefined, "no mark, no word: #209-3's `state=working` stands");
+		assert.equal(formatReattachSummary(report), undefined, "and nothing is announced");
+		assert.match(
+			f.logLines.join("\n"),
+			/left ghost-0 .*already ended \(settled\), and a settled\/retired child is not adopted and not announced/,
+			"the reason is logged, once, without inventing a summary line",
+		);
 
 		const after = (() => {
 			const db = openLegionDb(legionDbPath(f.runDir));
 			try {
-				const node = readEventsAfter(db, 0, { nodeId });
-				assert.ok(hasEnded({ status: "settled" } as never) === true);
-				return node.length;
+				return readEventsAfter(db, 0, { nodeId }).length;
 			} finally {
 				db.close();
 			}
@@ -355,7 +356,7 @@ test("#463: the summary stays ONE line, and only mentions convergence when it ha
 	};
 	assert.equal(formatReattachSummary({ ...base }), undefined, "nothing to say ⇒ no line, exactly as before");
 	assert.equal(
-		formatReattachSummary({ ...base, converged: [{ name: "ghost-0", storeRoot: "/tmp/work/.pi-subagents", how: "no-supervisor", runId: "r-1" }] }),
+		formatReattachSummary({ ...base, converged: [{ name: "ghost-0", storeRoot: "/tmp/work/.pi-subagents", runId: "r-1" }] }),
 		undefined,
 		"convergence alone is bookkeeping, not news: it never invents a summary line",
 	);
@@ -368,8 +369,8 @@ test("#463: the summary stays ONE line, and only mentions convergence when it ha
 		...base,
 		adopted: [{ name: "worker-0", host: HOST, runId: "r-1", storeRoot: "/tmp/work/.pi-subagents", storeCwd: "/tmp/work", evidence: "terminal is live", ledgerDbPath: "/tmp/work/legion.db" }],
 		converged: [
-			{ name: "ghost-0", storeRoot: "/tmp/work/.pi-subagents", how: "no-supervisor", runId: "r-1" },
-			{ name: "ghost-1", storeRoot: "/tmp/work/.pi-subagents", how: "ledger-ended", runId: "r-1" },
+			{ name: "ghost-0", storeRoot: "/tmp/work/.pi-subagents", runId: "r-1" },
+			{ name: "ghost-1", storeRoot: "/tmp/work/.pi-subagents", runId: "r-1" },
 		],
 	});
 	assert.equal(both, "legion: reattached 1 live child (worker-0) (2 converged)");
@@ -381,7 +382,7 @@ test("#463: the pass logs every convergence into the ONE reattach log (never the
 		await f.store.addChild(f.runId, ghostRecord());
 		seedLedger(f);
 		await runReattachPass(passInput(f));
-		assert.match(f.logLines.join("\n"), /converge converged=1 \(no-supervisor:ghost-0\) deferred=0/);
+		assert.match(f.logLines.join("\n"), /converge converged=1 \(ghost-0\) deferred=0/);
 		assert.equal(REATTACH_LOG_FILE, "reattach-live-children.log");
 	} finally {
 		f.cleanup();
