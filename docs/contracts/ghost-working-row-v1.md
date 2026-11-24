@@ -82,18 +82,34 @@ export interface UnsupervisedFacts {
   /** this process's pid (default `process.pid`). */
   pid?: number;
 }
-export function unsupervisedVerdict(child, facts): { reason: "no supervisor"; evidence: string } | undefined;
+/**
+ * The convergence answer (session-start scan): the row is a leftover nobody here
+ * holds, whether its owner marker is dead, absent, or this very process.
+ */
+export function convergeVerdict(child, facts): UnsupervisedVerdict | undefined;
+/**
+ * The display / hand-settle answer: only what a reader can PROVE at call time —
+ * the record already carries a mark, or `owner.json` names THIS process.
+ * An unmarked `owner: dead` record keeps #209-3's `state=failed` and an unmarked
+ * missing marker keeps `state=working`; the scan converges those.
+ */
+export function unsupervisedVerdict(child, facts): UnsupervisedVerdict | undefined;
 /** The record's own mark, when the startup pass already converged it. */
 export function unsupervisedMarkOf(child): UnsupervisedMark | undefined;
+/** `true` for the #456 leftover shape (host + orphan marker) — never ours. */
+export function isOrphanLeftover(child): boolean;
 export function isTerminalRecordState(state: string): boolean;
 ```
 
 ### 4.1 `status` (overview **and** named) — `index.ts`, `src/extension/runtime.ts`
 
 - `StatusLivenessFacts` gains `unsupervised?: { reason: string; evidence: string }`.
-- A ghost row is **not live** (not counted in `Status · N live children`, never in
-  `liveNames`), and the header carries `(N unreachable)` **only when N > 0** — with no
-  ghost row the output is byte-identical to 6.2.12.
+- Facts: `unsupervised: unsupervisedVerdict(child, facts)`; a ghost row is **not live**
+  (not counted in `Status · N live children`, never in `liveNames`), and the header
+  carries `(N unreachable)` **only when N > 0** — with no ghost row the output is
+  byte-identical to 6.2.12. #209-3's frozen words are untouched: an unmarked
+  `owner: dead` record still renders `state=failed`, an unmarked missing marker still
+  `state=working`.
 - `renderLiveChildStatus({ …, unsupervised })` renders, as a suffix on the frozen state
   word (same shape as #456's `orphanWord`):
   `state=unreachable (no supervisor)` plus one `unreachable: <evidence>` line directly
@@ -121,8 +137,8 @@ The #445 pass already walks every store's leftovers under one budget; it now als
 | leftover | pass decision |
 |---|---|
 | ledger row `hasEnded` (settled/retired/failed) | converge the record half: `state="retired"`, `retiredAt`, `unsupervised` mark with `ledger: "ended"`. The ledger is the authority (#456), so no ledger write. |
-| not live (probe said not-live, or a **local** leftover with no supervisor) and no live foreign owner | stamp `unsupervised` (state unchanged) with `ledger: "running"` — `status` now says `unreachable (no supervisor)` and `stop` settles it. |
-| live / adopted / live foreign owner / ledger unreadable | untouched (byte-identical to 6.2.12) |
+| not live (probe said not-live, or a **local** leftover with no supervisor) and no live foreign owner | stamp `unsupervised` (state unchanged) with `ledger: "running"` — `status` now says `unreachable (no supervisor)` and `stop` settles it. The question is asked with `convergeVerdict`, the wider scan answer. |
+| live / adopted / live foreign owner / ledger unreadable / #456 orphan (`isOrphanLeftover`) | untouched (byte-identical to 6.2.12) |
 
 A record already `retired`/`exited` is never touched. Adoption (`state="working"`,
 `reattached`) still clears any `unsupervised` mark it may carry.
