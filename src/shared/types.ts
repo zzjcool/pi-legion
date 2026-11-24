@@ -438,8 +438,15 @@ export interface OrphanRecord {
 	sessionFile?: string;
 }
 
-/** #456: what one orphan-reclaim inspection concluded (see src/runs/orphan-reclaim.ts). */
-export type OrphanReclaimVerdict = "terminal-gone" | "stale-orphan" | "working" | "unknown";
+/**
+ * #456: what one orphan-reclaim inspection concluded (see src/runs/orphan-reclaim.ts).
+ *
+ * #463 adds `no-supervisor`: the row is a leftover nobody in this process holds a
+ * supervisor for (`src/runs/unsupervised-row.ts`). It is a REACHABILITY verdict,
+ * not a death verdict — the row is settled as `retired` (or with its graded
+ * outcome), never as `failed` for lack of an answer (#460).
+ */
+export type OrphanReclaimVerdict = "terminal-gone" | "stale-orphan" | "working" | "unknown" | "no-supervisor";
 
 /** #456: the verdict + the one-sentence evidence a status surface renders for an orphaned row. */
 export interface OrphanStatusFacts {

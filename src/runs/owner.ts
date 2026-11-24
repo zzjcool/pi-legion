@@ -54,8 +54,19 @@ export function isPidAlive(pid: number): boolean {
  * host so we cannot tell), "dead" (owner gone), or "unknown" (no marker).
  */
 export function ownerState(file: string, alive: (pid: number) => boolean = isPidAlive): "live" | "dead" | "unknown" {
-	const owner = readOwnerFile(file);
+	return ownerVerdictOf(readOwnerFile(file), alive);
+}
+
+/**
+ * The same verdict from an ALREADY-READ marker, so a caller that needs the pid
+ * too (#463's ghost row) reads `owner.json` once instead of twice.
+ */
+export function ownerVerdictOf(
+	owner: OwnerRecord | undefined,
+	alive: (pid: number) => boolean = isPidAlive,
+	hostname: string = os.hostname(),
+): "live" | "dead" | "unknown" {
 	if (!owner) return "unknown";
-	if (owner.host && owner.host !== os.hostname()) return "live";
+	if (owner.host && owner.host !== hostname) return "live";
 	return alive(owner.pid) ? "live" : "dead";
 }

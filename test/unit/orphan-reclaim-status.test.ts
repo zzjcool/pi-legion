@@ -39,6 +39,10 @@ const VERDICT_WORDS: Record<OrphanReclaimVerdict, string> = {
 	"stale-orphan": "idle, transcript quiet",
 	working: "still working",
 	unknown: "liveness unknown",
+	// #463: a local leftover nobody holds a supervisor for. It never rides the
+	// orphan suffix in production (`state=unreachable (no supervisor)` is its own
+	// line), but the word has to exist for the exhaustive map.
+	"no-supervisor": "no supervisor",
 };
 
 /**
@@ -118,11 +122,13 @@ test("#456: the other three verdict words render exactly, and no evidence means 
 	}
 });
 
-test("#456: orphanVerdictWord maps all four verdicts", () => {
+test("#456: orphanVerdictWord maps every verdict", () => {
 	for (const verdict of Object.keys(VERDICT_WORDS) as OrphanReclaimVerdict[]) {
 		assert.equal(orphanVerdictWord(verdict), VERDICT_WORDS[verdict]);
 	}
-	assert.equal(Object.keys(VERDICT_WORDS).length, 4, "the verdict union has exactly four members");
+	// #463 added `no-supervisor` to the union (a local leftover nobody holds); the
+	// exhaustive Record above is what keeps a future member from rendering blank.
+	assert.equal(Object.keys(VERDICT_WORDS).length, 5, "the verdict union has exactly five members");
 });
 
 test("#456: without orphan facts the block is byte identical to the pre-#456 rendering", () => {
