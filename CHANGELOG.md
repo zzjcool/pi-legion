@@ -9,6 +9,16 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [6.2.13] — 2026-11-24
+
+**一句话：`status` 与 `stop` 对同一条记录必须给出一致的答案 —— 已经交付完的 in-process child 不再在重启后复活成 `working`，没人持有的行显示为 `unreachable (no supervisor)` 且仍能 stop 结算。**
+
+- **`#463` PR #464 幽灵 working 行。** 真实事故：一条 11/23 就交付完并退休的 in-process child，重启后在 `status` 里永远显示 `working`（`owner.json` 的 pid 是宿主自己，所以"活着"），而 `stop` 回 `unknown child (not tracked by this session)` —— 能列出、清不掉。三处落地：
+  - **一个判据**：新增 `src/runs/unsupervised-row.ts`，`status` 与 `stop` 共用（启动扫描用同一来源的更宽版本）；"有人持有"的判据包含 `sessionFile` 比对 —— 指向**本会话**才算持有，上一个会话的戳仍算幽灵。
+  - **重启收敛**：`reattach.ts` 的 `convergeLeftovers` 只打标记不写账本；账本已终态的行**原样保留**（#445 冻结的语义：既不收养也不公告）。
+  - **静默两侧边界**：#450 的"换 cwd 重启仍要重挂并显示 `store=`"与 #445 的"账本终态行不公告"都有回归测试钉住；`reclaimOrphan` 的收养竞态守卫收窄成同一口径，避免退化成"列得出停不掉"。
+  - 已知边缘（报告 §7）：会话标识 ≠ 进程标识的两种情形保守不收敛。
+
 ## [6.2.12] — 2026-11-23
 
 **一句话：监督读失败不再等于 child 死亡 —— transport 断掉时保留终端地址与 run 记录，`unreachable` 状态可见、可 stop、恢复后自动续跟；顺带堵住「远端还在干活却判 failed，然后被重派」这一类重复劳动。**
