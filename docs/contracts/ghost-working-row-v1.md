@@ -30,7 +30,12 @@ Two independent causes, both must be fixed:
      marker; those keep their existing path), and state ∈ {`working`, `launching`, `awaiting`};
   3. is **not** held by another live session: the run dir's `owner.json` is absent,
      unreadable, dead, **or** its pid **is** this process. A marker written on another
-     host is "cannot check from here" and is therefore **not** a ghost (#456 review F8).
+     host is "cannot check from here" and is therefore **not** a ghost (#456 review F8);
+  4. was **not adopted by the session asking**: a `reattached` stamp whose
+     `sessionFile` names this session means the #445 re-attach watcher holds the child
+     (it is neither a supervisor entry nor a job), so the row is **not** a ghost
+     (#450 A1). A stamp from an EARLIER session proves nothing — that session is gone,
+     which is the shape this contract is about.
 - **`no supervisor`** — the display/settle verdict for a ghost row: the child was
   launched by a session this process no longer has any handle for, so no one can
   collect it, and `owner.json` cannot prove life. It is **not** a death verdict: the

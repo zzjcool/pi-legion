@@ -524,6 +524,41 @@ test("#463 C3: a ghost in ANOTHER store is listed and settlable (the issue's exa
 	});
 });
 
+test("#463 C5: a row a GONE session adopted is still settlable (a stamp is not a live claim)", async () => {
+	await inTempHome(async ({ root }) => {
+		const cwd = path.join(root, "work");
+		mkdirSync(cwd, { recursive: true });
+		const h = indexHarness({ root, cwd });
+		try {
+			// The shape #463 declares in scope: an earlier session adopted the child
+			// (`reattached`), then died. #450 A1 makes that stamp NOT a holder, so the two
+			// views must agree on the other edge too — a row `status` lists as a ghost has
+			// to be one `stop` can settle. It used to answer
+			// "another session adopted this child …" forever, because #456's race guard
+			// read ANY stamp as a live adoption.
+			const previousSession = path.join(root, "sessions", "previous.jsonl");
+			mkdirSync(path.dirname(previousSession), { recursive: true });
+			writeFileSync(previousSession, "");
+			const child = childRecord("ghost-adopted", {
+				host: "njbox",
+				reattached: { at: 1_000, host: "njbox", sessionFile: previousSession, evidence: "terminal was live" },
+			});
+			const runDir = writeStoreRun(h.storeRoot, { runId: "r-adopted", cwd, children: [child] });
+			writeOwnerFile(path.join(runDir, RUN_OWNER_FILE), process.pid);
+
+			const overview = await h.invoke({ action: "status" });
+			assert.match(overview.text, /^ghost-adopted — state=unreachable \(no supervisor\)/m);
+
+			const stopped = await h.invoke({ action: "stop", name: "ghost-adopted" });
+			assert.equal(stopped.details?.error, undefined, `a listed row must be stoppable: ${stopped.text}`);
+			assert.match(stopped.text, /^Settled ghost-adopted\./m, "a dead session's adoption stamp is not a live claim");
+			assert.equal(h.store.findChild("r-adopted", "ghost-adopted")?.state, "retired");
+		} finally {
+			await h.cleanup();
+		}
+	});
+});
+
 test("#463 C4: another live session's child is left exactly as it was", async () => {
 	await inTempHome(async ({ root }) => {
 		const cwd = path.join(root, "work");

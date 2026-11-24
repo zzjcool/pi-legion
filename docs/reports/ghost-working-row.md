@@ -7,10 +7,10 @@
 - 契约：`docs/contracts/ghost-working-row-v1.md`（冻结后实现）。
 - 范围：issue 的四条期望 + 三条验收（含两个变异）。**不动** #445 的接回决策、#456 的
   orphan 回收路径、#460 的 `unreachable` 语义、#209-3 的 dead/unknown 显示词。
-- 门禁（第二轮，修完 CI 红）：`npm run typecheck` ✔；`npm test` **3005 tests / 2973 pass /
+- 门禁（第二轮，修完 CI 红）：`npm run typecheck` ✔；`npm test` **3006 tests / 2974 pass /
   14 fail**，14 条与 `origin/master` 逐条同名（基线 **2983 / 2951 / 14 / 18 skipped**），
-  新增 22 条测试全绿；`npm run test:integration` **221 / 211 pass / 10 fail**，10 条与基线
-  逐条同名（macOS 既存红，见 §6）。第二轮修的两条 CI 红见 §8。
+  新增 23 条测试全绿；`npm run test:integration` **221 / 211 pass / 10 fail**，10 条与基线
+  逐条同名（macOS 既存红，见 §6）。CI（ubuntu）在该提交上四个步骤全绿。两轮修的边界见 §8。
 
 ---
 
@@ -114,15 +114,15 @@ store、同一个 5s 预算、一次 `listRuns()` 读两用）多走一步 `conv
 
 ## §5 验收
 
-### 5.1 单测（新增 22 条，全绿）
+### 5.1 单测（新增 23 条，全绿）
 
-`test/unit/ghost-working-row.test.ts`（12）：
+`test/unit/ghost-working-row.test.ts`（13）：
 
 | 组 | 断言 |
 |---|---|
 | A 判据 | 持有/终态/#456 形态/别的活 pid/别的 host ⇒ 无判决；owner 死/无标记只有 `convergeVerdict` 收敛、`unsupervisedVerdict` 不（保住 #209-3 两个词）；已有标记即使 pid 随后死掉仍然有效 |
 | B 渲染 | `state=unreachable (no supervisor)` + 紧跟其后的 `unreachable:` 证据行；去掉该后缀即逐字节还原旧块；概览不计 live + 表头 `(1 unreachable)`；被持有的同名 child 保持 `state=working` |
-| C 端到端（真 `index.ts` + 真 `RunStore` + 真 SQLite + 真 `subagent` 工具） | **C1** 账本 `working` + 内存无此 child + `owner.json` pid = 本进程 ⇒ `status` 不再出现 `working`、`stop` 输出 `Settled …`、记录 `retired` + `reclaimed.verdict="no-supervisor"`、标记清空、再查 `status` 已不列；**C2** 本地 transcript 可评级 ⇒ 账本 `settled` + `node_settled{reclaimed:true}` + 记录带 `execution.status=success`；**C3（issue 的确切形状）** 记录在另一个 store ⇒ `status` 列出（带 `store=`）且 `stop`（不带 `runId`）跨 store 结算；**C4** 记录被别的活会话持有 ⇒ 仍显示 `working`、零写入 |
+| C 端到端（真 `index.ts` + 真 `RunStore` + 真 SQLite + 真 `subagent` 工具） | **C1** 账本 `working` + 内存无此 child + `owner.json` pid = 本进程 ⇒ `status` 不再出现 `working`、`stop` 输出 `Settled …`、记录 `retired` + `reclaimed.verdict="no-supervisor"`、标记清空、再查 `status` 已不列；**C2** 本地 transcript 可评级 ⇒ 账本 `settled` + `node_settled{reclaimed:true}` + 记录带 `execution.status=success`；**C3（issue 的确切形状）** 记录在另一个 store ⇒ `status` 列出（带 `store=`）且 `stop`（不带 `runId`）跨 store 结算；**C4** 记录被别的活会话持有 ⇒ 仍显示 `working`、零写入；**C5** 记录被**已消失**的会话收养过 ⇒ `status` 说 `unreachable` 且 `stop` 能结算（§8.3） |
 
 `test/unit/reattach-converge.test.ts`（10）：running 账本打标记不动状态 / **ended 账本零写入、
 记录原样、不出声**（`#463 ✕ #445 A3`，§8）/ 别的活 pid 不动 / #456 orphan 不动 / 活体收养清标记 /
@@ -191,7 +191,7 @@ store、同一个 5s 预算、一次 `listRuns()` 读两用）多走一步 `conv
 | 家族 | 现有测试 | 结论 |
 |---|---|---|
 | #456 orphan 回收 | `test/unit/orphan-reclaim*.test.ts`、`test/integration/orphan-reclaim.test.ts` | 绿（orphan 路径未改；新增的 `no-supervisor` verdict 只在幽灵路径使用，`orphanVerdictWord` 补了对应词以保持穷尽 Record） |
-| #445 接回 / #450 跨 store 扫描 | `test/unit/reattach*.test.ts`、`test/integration/reattach*.test.ts` | 绿（adopt/gate/预算/一行 summary 未变；`#450 §3` 条 ledger-ended 的 foreign 行仍"不探测、不收养"——它现在只多一个记录半边的收敛，测试原样通过） |
+| #445 接回 / #450 跨 store 扫描 | `test/unit/reattach*.test.ts`、`test/integration/reattach*.test.ts` | 绿（adopt/gate/预算/一行 summary 未变；ledger-ended 的 foreign 行仍"不探测、不收养"，记录半边同样**零写入**——A3 的边界见 §8.1；#450 A1 的"刚收养就必须仍算 live"见 §8.2） |
 | #460 unreachable 不判死 | `test/unit/supervision-unreachable.test.ts` | 绿（supervisor 的 `unreachable` 状态、地址与记录保留语义未动；结算从不写 `failed`） |
 | #209-3 dead/unknown 显示词 | `test/unit/status-action.test.ts` | 绿（owner dead ⇒ `state=failed`；无 owner 标记 ⇒ `state=working` 且 `owner: unknown`，两者只有启动扫描会收敛） |
 | #312 作用域 | `test/unit/child-scope-actions.test.ts` | 绿（第一版曾把同名 decoy 结算掉，被该测试抓住后改成与 `stopAction` 完全一致的解析；见 §3） |
@@ -200,10 +200,10 @@ store、同一个 5s 预算、一次 `listRuns()` 读两用）多走一步 `conv
 
 ```
 npm run typecheck        → clean
-npm test                 → 3005 tests, 2973 pass, 14 fail, 18 skipped
+npm test                 → 3006 tests, 2974 pass, 14 fail, 18 skipped
 origin/master 基线 (unit) → 2983 tests, 2951 pass, 14 fail, 18 skipped
 逐条比对：14 条失败同名同因（provisionWorktree/npm 打包/v1.1 探测与 resolver/xm-dispatch），
-均为本机既存红；新增 22 条全绿。
+均为本机既存红；新增 23 条全绿。
 
 npm run test:integration → 221 tests, 211 pass, 10 fail
 origin/master 基线 (integration) → 221 tests, 211 pass, 10 fail（同样那 10 条）
@@ -230,6 +230,16 @@ origin/master 基线 (integration) → 221 tests, 211 pass, 10 fail（同样那 
    在那之前保持 #209-3 的词（`failed` / `working`）。这是刻意的：不覆盖更老的冻结契约。
 4. 收敛只写记录，不写账本；账本为 `running` 的幽灵被 `retired` 后仍可 `recover` 取结果
    （`execution: unknown` 是可取回的形状）。
+5. **会话标识 ≠ 进程标识**：§8.2 的豁免读 `reattached.sessionFile`（会话身份）。两种边缘因此
+   保守地**不**收敛（保持 6.2.12 的显示，不会误判成幽灵）：`pi --continue` 续接同一个 session
+   file 时，上一个进程写下的收养戳与本会话同名；收养时 `getSessionFile()` 为空（内存会话）则
+   根本没写戳。反过来的风险（同一进程内换会话、扩展实例存活 ⇒ 戳不再同名 ⇒ 一条 watcher 还持有
+   的行被显示/结算成幽灵）属于"持有者其实是内存里的 `ReattachWatcher`"这一层，本 PR 未改：
+   要彻底解决得把 watcher 的 `watching()` 作为一条 facts 传进来（identity 与判据的
+   `(storeRoot, runId, name)` 一致），留作后续。
+6. `convergeLeftovers` 的 `deferred` 计数发生在读账本之前，因此"账本已终态、永远不会再收敛"的
+   行也会被算进 `deferredConverge`（只影响日志里的数字，不影响 summary：summary 用的是
+   `report.deferred`，跨机那半边）。
 
 ## §8 与 #450/#445 的边界（PR #464 的 CI 红，两个方向各越界一次）
 
@@ -305,7 +315,29 @@ if (facts.sessionFile !== undefined && child.reattached?.sessionFile !== undefin
 （`status` 扫表 / 具名 `status` / `stop` 结算 / 启动扫描）一路传进 facts，收养与读取用的是
 **同一个**来源，因此两侧不会因为路径拼写不同而漏判（比较时 `path.resolve` 归一）。
 
-### 8.3 边界一句话
+### 8.3 `stop` 的收养竞态守卫：同一条判据，否则列得出来也停不掉
+
+```ts
+test("#463 C5: a row a GONE session adopted is still settlable (a stamp is not a live claim)")
+  …
+  assert.match(stopped.text, /^Settled ghost-adopted\./m, "a dead session's adoption stamp is not a live claim");
+```
+
+`reclaimOrphan` 的 `no-supervisor` 路径上有一条 #456 F8 的竞态守卫："记录在窗口内被别人收养
+（`reattached`）⇒ 零写入拒绝"。它原来把**任何** `reattached` 当活认领，于是 §8.2 判成幽灵的那种
+行（"**上一个**会话收养、会话已死"）会出现自相矛盾的一对回答：
+
+```
+status → ghost-adopted — state=unreachable (no supervisor)
+stop   → Refusing to settle ghost-adopted: another session adopted this child …
+```
+
+这正是 issue 期望 1（能列出就能 stop）禁止的形状。修法与 §8.2 同源：`heldByThisSession()` ——
+**只有写下时间戳的会话就是正在问的会话**才算活认领，比较方式（`path.resolve` 两侧）与判据里的
+收养条款逐字相同；读记录前的预检和 `updateChild` 里的二次预检都用它。变异验证：把
+`heldByThisSession` 退回"有戳即拒" ⇒ C5 立刻红（`Refusing to settle …`）。
+
+### 8.4 边界一句话
 
 | 面 | #463 可以动 | #463 不许动 |
 |---|---|---|

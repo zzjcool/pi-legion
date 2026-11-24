@@ -669,6 +669,26 @@ async function gradeTranscript(
 }
 
 /**
+ * #463: is this record's `reattached` stamp a claim by the session ASKING?
+ *
+ * A stamp names the session that adopted the child, and a `no-supervisor` row is by
+ * definition settled by a DIFFERENT session than the one that adopted it — the adopter
+ * is gone (`src/runs/unsupervised-row.ts` calls the row unheld for exactly that
+ * reason). So "some stamp exists" is not a live claim; only a stamp naming
+ * `sessionFile` is. Same rule and same comparison as `unheld`'s adoption clause, so
+ * `status` and `stop` cannot disagree about who holds a row. A caller with no session
+ * identity proves nothing and settles.
+ */
+function heldByThisSession(
+	child: { reattached?: { sessionFile?: string | undefined } | undefined },
+	sessionFile: string | undefined,
+): boolean {
+	const stamp = child.reattached?.sessionFile;
+	if (stamp === undefined || sessionFile === undefined) return false;
+	return path.resolve(stamp) === path.resolve(sessionFile);
+}
+
+/**
  * Settle one orphaned row, on evidence that already passed {@link inspectOrphan}.
  *
  * The write is three facts, in this order — the order matters:
@@ -734,13 +754,15 @@ export async function reclaimOrphan(
 	// (atomically, under the store lock) at write time (review F8).
 	//
 	// #463: a `no-supervisor` row is EXPECTED to say `working` — that lie is the
-	// whole point — so the state word is not the adoption signal there. The
-	// adoption signal is the `reattached` stamp every adoption writes; and a record
-	// that turned terminal in the window was settled by someone else.
+	// whole point — so the state word is not the adoption signal there. The stamp a
+	// LIVE claim would carry is `reattached`; but a stamp is only live when it names
+	// the session ASKING (a dead session's stamp is the ghost row itself — see
+	// `heldByThisSession`), and a record that turned terminal in the window was
+	// settled by someone else.
 	try {
 		const fresh = opts.store.findChild(subject.runId, subject.name);
 		if (fresh && noSupervisor) {
-			if (fresh.reattached !== undefined) {
+			if (heldByThisSession(fresh, opts.sessionFile)) {
 				return refuse("another session adopted this child while it was being inspected; nothing was settled");
 			}
 			if (isTerminalRecordState(fresh.state)) {
@@ -853,9 +875,12 @@ export async function reclaimOrphan(
 			// live adoption with our retirement.
 			//
 			// #463: for a `no-supervisor` row, `state === "working"` is the LIE being
-			// fixed, so the adoption stamp (`reattached`) is the only signal, and the
-			// `orphaned` marker is not required (a local leftover never has one).
-			const adoptedMeanwhile = child.reattached !== undefined;
+			// fixed, so an adoption stamp is the only signal, the `orphaned` marker is
+			// not required (a local leftover never has one), and — exactly as above — a
+			// stamp only counts when the session still here wrote it.
+			const adoptedMeanwhile = noSupervisor
+				? heldByThisSession(child, opts.sessionFile)
+				: child.reattached !== undefined;
 			const changedMeanwhile = noSupervisor
 				? adoptedMeanwhile || isTerminalRecordState(child.state)
 				: child.state === "working" || adoptedMeanwhile || child.orphaned === undefined;

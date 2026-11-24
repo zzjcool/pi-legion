@@ -2956,7 +2956,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					ledgerNodeFor: (child: StatusChildRecord) =>
 						legion && child.nodeId ? getNode(legion.db, child.nodeId) : undefined,
 					now: Date.now(),
-					...(lastSessionFile !== undefined ? { sessionFile: lastSessionFile } : {}),
+					// The SAME source `status`/`stop`/the re-attach pass use, so one session
+					// cannot look like two (#450 A1's adoption clause reads it).
+					...(ctx.sessionManager?.getSessionFile?.() !== undefined
+						? { sessionFile: ctx.sessionManager.getSessionFile() }
+						: {}),
 				}).text;
 				return ok(`${roster}\n\n${overview}`);
 			}
