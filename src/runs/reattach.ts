@@ -77,6 +77,34 @@
  * cross-talk. Every candidate, adopted child and watcher target carries its
  * `storeRoot` (identity = `(storeRoot, runId, name)`), and the one summary line
  * names a foreign store only when the adoption actually reached into one.
+ *
+ * #463 adds the OTHER half of the same walk: what this pass does with a leftover it
+ * cannot ADOPT (see {@link convergeLeftovers}). Adoption used to be the only answer,
+ * so a record nobody could adopt was logged and left exactly as it was — which, for a
+ * `run.json` child still saying `state=working`, meant forever: `status` counted it as
+ * a live child and `stop` could not settle it (the "ghost working row"). The pass now
+ * CONVERGES those rows in place, in the store that holds them:
+ *
+ *   - the LEDGER row already ended (`hasEnded`) ⇒ the record follows it (`state =
+ *     "retired"`, `retiredAt`, the `orphaned` marker dropped) and carries an
+ *     `unsupervised` mark with `ledger: "ended"`. No ledger write: the ledger is the
+ *     authority (#456), and a row that ended stays as it ended;
+ *   - the ledger row still runs (or is gone) and NOBODY HERE holds the child ⇒ the
+ *     record keeps its state and gets the same mark with `ledger: "running"` /
+ *     `"missing"`, so `status` says `unreachable (no supervisor)` and `stop` can
+ *     settle it. That question is asked in exactly ONE place — `convergeVerdict`
+ *     in `src/runs/unsupervised-row.ts` — so `status`, `stop` and this pass cannot
+ *     answer it differently.
+ *
+ * Deliberately NOT converged (byte-identical to 6.2.12): an ADOPTED child (adoption
+ * clears the mark), a live one, a row another LIVE session's `owner.json` holds (and
+ * a marker written on another HOST, which cannot be checked from here), an #456
+ * orphan (its own path owns it), a row whose ledger could not be READ ("unreadable"
+ * is not "ended"), a row an earlier pass already marked, and anything terminal. The
+ * step is bounded ({@link REATTACH_CONVERGE_MAX_ROWS} rows, the same pass deadline),
+ * makes no wire call and writes no ledger, and it never grows a sentence of its own:
+ * ` (N converged)` is a suffix on the ONE line the pass already had, and only when
+ * N > 0.
  */
 
 import * as fs from "node:fs";
@@ -96,7 +124,7 @@ import type {
 	SubagentsSettings,
 } from "../shared/types.ts";
 import { raceWithTimeout } from "../supervisor/race-timeout.ts";
-import { isPidAlive, readOwnerFile, writeRunOwner, RUN_OWNER_FILE } from "./owner.ts";
+import { isPidAlive, ownerState, readOwnerFile, writeRunOwner, RUN_OWNER_FILE } from "./owner.ts";
 import {
 	createRemoteTerminalProbe,
 	type RemoteTerminalProbe,
@@ -105,6 +133,13 @@ import {
 import { execResultText, normalizeHost, resolveReadTarget, type HcExecResult } from "./remote.ts";
 import { recoverCrossMachineChild, type CrossMachineRecovery } from "./remote-recover.ts";
 import { formatStoreLabel, STORE_DIR, storeCwdOf } from "./store-scan.ts";
+import {
+	convergeVerdict,
+	isOrphanLeftover,
+	isTerminalRecordState,
+	UNSUPERVISED_REASON,
+	type UnsupervisedFacts,
+} from "./unsupervised-row.ts";
 
 // ── frozen bounds (#445 §4) ─────────────────────────────────────────────────
 
@@ -128,6 +163,15 @@ export const REATTACH_LOG_FILE = "reattach-live-children.log";
 export const REATTACH_LOG_MAX_BYTES = 128 * 1024;
 /** The settings key (#445 §5). Absent = on. */
 export const REATTACH_SETTING_KEY = "reattachLiveChildren";
+/**
+ * #463: leftover rows ONE pass may converge (see {@link convergeLeftovers}).
+ *
+ * The step is local (no wire), but every converged row is a `run.json` write and a
+ * store can hold years of leftovers; a session start must stay bounded whatever it
+ * finds. Rows beyond this — or beyond the pass deadline — are reported as deferred
+ * and the next start picks them up.
+ */
+export const REATTACH_CONVERGE_MAX_ROWS = 20;
 
 /**
  * Record states a leftover can be found in.
@@ -273,6 +317,17 @@ export interface ReattachReport {
 	adopted: ReattachedChild[];
 	skipped: ReattachSkip[];
 	mirrorOnly: MirrorOnlyOrphan[];
+	/**
+	 * #463: leftover rows this pass CONVERGED (see {@link convergeLeftovers}) — the
+	 * records nobody could adopt, now reconciled with what the ledger says: retired where
+	 * the row ended, marked `unreachable (no supervisor)` where nobody here holds it.
+	 *
+	 * Optional so a report can be hand-built (a test, a caller replaying a log);
+	 * absence reads as "nothing converged", which is also the #445 shape.
+	 */
+	converged?: ReattachConverged[];
+	/** #463: leftover rows the convergence step did not LOOK at (its row cap, or the pass deadline). */
+	deferredConverge?: number;
 	/** #450: the session cwd store (`input.store`), resolved — the summary compares against it. */
 	sessionStoreRoot: string;
 	/** #450: the store surface this pass looked at. */
@@ -364,6 +419,16 @@ export interface ReattachPassInput {
 	probeDeadlineMs?: number;
 	maxCandidates?: number;
 	growthWaitMs?: number;
+	/** #463: rows the convergence step may write in one pass. Default {@link REATTACH_CONVERGE_MAX_ROWS}. */
+	maxConvergeRows?: number;
+	/**
+	 * #463: does THIS session's job table know `name` (`runtime.get(name) !== undefined`)?
+	 *
+	 * The one liveness fact the convergence step cannot read off disk. At a session
+	 * start the table is empty, so the default (`false`) is the truth there; a caller
+	 * that converges while it already runs children passes its own table.
+	 */
+	tracked?: (name: string) => boolean;
 }
 
 // ── candidates ──────────────────────────────────────────────────────────────
@@ -717,6 +782,9 @@ export async function adoptCandidate(
 		child.state = "working";
 		delete child.orphaned;
 		child.retiredAt = undefined;
+		// #463: an adoption is the proof that somebody DOES hold this child, so the
+		// "no supervisor" verdict a passive scan may have stamped is no longer true.
+		delete child.unsupervised;
 		child.reattached = {
 			at: now,
 			...(opts.sessionFile ? { sessionFile: path.resolve(opts.sessionFile) } : {}),
@@ -754,6 +822,237 @@ export async function adoptCandidate(
 		evidence,
 		ledgerDbPath: ledgerPath,
 	};
+}
+
+// ── #463: convergence ───────────────────────────────────────────────────────
+
+/** Which half of the record/ledger pair converged a leftover (#463 §4.3). */
+export type ReattachConvergeHow = "ledger-ended" | "no-supervisor";
+
+/** One row the pass converged, with the store it had to be written back into. */
+export interface ReattachConverged {
+	name: string;
+	/** #450: the store the record lives in (resolved) — convergence writes THERE, never the session store. */
+	storeRoot: string;
+	how: ReattachConvergeHow;
+	runId: string;
+}
+
+/** What the LEDGER says about one leftover — the one half this step must never write. */
+type LedgerReading =
+	| { ledger: "ended"; nodeId: string; nodeStatus: string }
+	| { ledger: "running" }
+	| { ledger: "missing" }
+	| { ledger: "unreadable"; reason: string };
+
+/**
+ * Ask the ledger about one leftover, read-only.
+ *
+ * `ended` is the authority (#456) and is never re-opened here; an open row is
+ * `running`, a row the ledger does not know is `missing` (the same two words the mark
+ * carries), and a ledger that cannot be READ is its own answer — unreadable is not
+ * ended (#456 F8), so the record is left exactly as it was.
+ */
+function ledgerReadingOf(runDir: string, nodeId: string | undefined): LedgerReading {
+	if (nodeId === undefined) return { ledger: "missing" };
+	const dbPath = path.resolve(legionDbPath(runDir));
+	// `openLegionDb` CREATES a missing file; a ledger that is not there says nothing.
+	if (!fs.existsSync(dbPath)) return { ledger: "missing" };
+	let db: ReturnType<typeof openLegionDb> | undefined;
+	try {
+		db = openLegionDb(dbPath);
+		const node = getNode(db, nodeId);
+		if (node === null) return { ledger: "missing" };
+		return hasEnded(node)
+			? { ledger: "ended", nodeId: node.id, nodeStatus: node.status }
+			: { ledger: "running" };
+	} catch (error) {
+		return { ledger: "unreadable", reason: messageOf(error) };
+	} finally {
+		try { db?.close(); } catch { /* already closed */ }
+	}
+}
+
+/**
+ * `owner.json`'s facts for one run dir, in the shape {@link convergeVerdict} reads.
+ *
+ * `ownerState` is the same rule `status` uses (a marker on ANOTHER host is "cannot be
+ * checked from here"), and pid/host travel beside it so the verdict can tell "this very
+ * process" — the #463 C1 lie — from "another live session holds it".
+ */
+function ownerFactsFor(
+	runDir: string,
+	alive: (pid: number) => boolean,
+): Pick<UnsupervisedFacts, "owner" | "ownerPid" | "ownerHost"> {
+	const file = path.join(runDir, RUN_OWNER_FILE);
+	const owner = readOwnerFile(file);
+	return {
+		owner: ownerState(file, alive),
+		...(owner !== undefined ? { ownerPid: owner.pid } : {}),
+		...(owner !== undefined && owner.host !== "" ? { ownerHost: owner.host } : {}),
+	};
+}
+
+/** `(storeRoot, runId, name)` — #450's identity, spelled once. */
+function storeChildKey(storeRoot: string, runId: string, name: string): string {
+	return `${path.resolve(storeRoot)}\u0000${runId}\u0000${name}`;
+}
+
+/**
+ * Did somebody else take this row while the pass was looking at it?
+ *
+ * A settle makes the record terminal; an ADOPTION (`reattached`) inside this pass's own
+ * window means another session now holds the child. Either way the record is no longer
+ * this step's to reconcile — the rule `reclaimOrphan` applies to the ledger half (#463).
+ */
+function takenInWindow(child: Pick<ChildRecord, "state" | "reattached">, startedAt: number): boolean {
+	if (isTerminalRecordState(child.state)) return true;
+	return child.reattached !== undefined && child.reattached.at >= startedAt;
+}
+
+/**
+ * #463 §4.3 — reconcile the leftovers this pass could NOT adopt, in place.
+ *
+ * For every scanned store, for every `run.json` child that is not terminal and was not
+ * adopted by this pass:
+ *
+ *   1. the ledger row already ENDED ⇒ the record follows it (`state="retired"`,
+ *      `retiredAt`, the `orphaned` marker dropped) and carries an `unsupervised` mark
+ *      with `ledger: "ended"`. The ledger is NOT written: it is the authority, and a
+ *      row that ended stays as it ended;
+ *   2. the ledger row still runs (or is gone) and the ONE predicate
+ *      (`convergeVerdict`, `src/runs/unsupervised-row.ts`) says nobody here holds
+ *      the child ⇒ the record keeps its state (`retiredAt` untouched) and gets the same
+ *      mark with `ledger: "running"`/`"missing"`. `status` now says
+ *      `unreachable (no supervisor)` and `stop` can settle it;
+ *   3. everything else — adopted, live, a live foreign owner, a marker on another host,
+ *      an #456 orphan, a row an earlier pass already marked, a ledger that could not be
+ *      read, a terminal record — is left byte-identical to 6.2.12.
+ *
+ * No wire call, no ledger write, no throw: a store with no `updateChild` converges
+ * nothing (a mark that exists only in memory is worse than no mark), and one failed
+ * write costs a log line and nothing else. Bounded by the caller's row cap and the pass
+ * deadline; rows it did not look at are REPORTED as deferred, never silently dropped.
+ */
+async function convergeLeftovers(opts: {
+	stores: readonly ReattachStore[];
+	/** What each store's `listRuns()` returned during the scan — read once, not twice. */
+	runsByRoot: ReadonlyMap<string, readonly ReattachRun[]>;
+	/** `(storeRoot, runId, name)` of everything this pass adopted: never converged. */
+	adopted: ReadonlySet<string>;
+	sessionFile?: string | undefined;
+	/** This session's job table (`runtime.get(name) !== undefined`); `false` at a session start. */
+	tracked: (name: string) => boolean;
+	pid: number;
+	alive: (pid: number) => boolean;
+	now: () => number;
+	/** When the pass started — an adoption after this instant is somebody else's claim. */
+	startedAt: number;
+	deadline: number;
+	maxRows: number;
+	storeLabel: (rootDir: string) => string;
+	log: (line: string) => void;
+}): Promise<{ rows: ReattachConverged[]; deferred: number }> {
+	const rows: ReattachConverged[] = [];
+	let deferred = 0;
+	const own = opts.sessionFile !== undefined ? path.resolve(opts.sessionFile) : undefined;
+	const markSession = own !== undefined ? { sessionFile: own } : {};
+	for (const store of opts.stores) {
+		const storeRoot = path.resolve(store.rootDir);
+		const write = store.updateChild;
+		// A store that cannot write records converges nothing: the same rule adoption applies.
+		if (write === undefined) continue;
+		for (const run of opts.runsByRoot.get(storeRoot) ?? []) {
+			// This session's OWN run is never a leftover (the rule discovery already applies).
+			if (own !== undefined && typeof run.sessionFile === "string" && path.resolve(run.sessionFile) === own) continue;
+			const leftovers = run.children.filter((child) => !isTerminalRecordState(child.state));
+			if (leftovers.length === 0) continue;
+			const runDir = store.runDir(run.runId);
+			const label = opts.storeLabel(storeRoot);
+			for (const child of leftovers) {
+				if (opts.adopted.has(storeChildKey(storeRoot, run.runId, child.name))) continue;
+				// #456 owns its leftovers end to end (own verdict words, own reclaim, own
+				// `stop` branch). Converging one here would silently replace the
+				// `orphaned (terminal gone, work done)` line a reader came for.
+				if (isOrphanLeftover(child)) continue;
+				if (rows.length >= opts.maxRows || opts.now() >= opts.deadline) {
+					// Not converged and not forgotten: the next start picks it up.
+					deferred += 1;
+					continue;
+				}
+				const at = opts.now();
+				const reading = ledgerReadingOf(runDir, child.nodeId);
+				if (reading.ledger === "unreadable") {
+					// A row we could not READ is not a row that ended (#456 F8).
+					opts.log(`${new Date(at).toISOString()} left ${child.name} run=${run.runId} store=${label} record=${child.state}: the ledger could not be read (${reading.reason})`);
+					continue;
+				}
+				if (reading.ledger === "ended") {
+					const evidence = `ledger row ${reading.nodeId} already ended (${reading.nodeStatus}), so the record is converged to retired`;
+					let changed = false;
+					try {
+						await write.call(store, run.runId, child.name, (fresh) => {
+							if (takenInWindow(fresh, opts.startedAt)) return;
+							fresh.state = "retired";
+							fresh.retiredAt = new Date(at).toISOString();
+							delete fresh.orphaned;
+							fresh.unsupervised = {
+								// A row converged before keeps the moment it was FIRST converged.
+								at: fresh.unsupervised?.at ?? at,
+								reason: UNSUPERVISED_REASON,
+								evidence,
+								ledger: "ended",
+								...markSession,
+							};
+							changed = true;
+						});
+					} catch (error) {
+						opts.log(`${new Date(at).toISOString()} ${child.name} run=${run.runId} store=${label}: the record could not be converged (${messageOf(error)})`);
+						continue;
+					}
+					if (!changed) {
+						opts.log(`${new Date(at).toISOString()} left ${child.name} run=${run.runId} store=${label}: settled or adopted by someone else while the pass was running`);
+						continue;
+					}
+					rows.push({ name: child.name, storeRoot, how: "ledger-ended", runId: run.runId });
+					opts.log(`${new Date(at).toISOString()} converged ${child.name} run=${run.runId} store=${label} how=ledger-ended record=${child.state}: ${evidence}`);
+					continue;
+				}
+				// A row an earlier pass already converged is history here: byte-identical.
+				if (child.unsupervised !== undefined) continue;
+				const verdict = convergeVerdict(child, {
+					// At a session start nobody here holds it: no supervisor entry, no job.
+					alive: false,
+					tracked: opts.tracked(child.name),
+					pid: opts.pid,
+					...ownerFactsFor(runDir, opts.alive),
+				});
+				if (verdict === undefined) continue;
+				let changed = false;
+				try {
+					await write.call(store, run.runId, child.name, (fresh) => {
+						if (takenInWindow(fresh, opts.startedAt)) return;
+						if (fresh.unsupervised !== undefined) return;
+						fresh.unsupervised = {
+							at,
+							reason: UNSUPERVISED_REASON,
+							evidence: verdict.evidence,
+							ledger: reading.ledger,
+							...markSession,
+						};
+						changed = true;
+					});
+				} catch (error) {
+					opts.log(`${new Date(at).toISOString()} ${child.name} run=${run.runId} store=${label}: the record could not be converged (${messageOf(error)})`);
+					continue;
+				}
+				if (!changed) continue;
+				rows.push({ name: child.name, storeRoot, how: "no-supervisor", runId: run.runId });
+				opts.log(`${new Date(at).toISOString()} converged ${child.name} run=${run.runId} store=${label} how=no-supervisor ledger=${reading.ledger} record=${child.state}: ${verdict.evidence}`);
+			}
+		}
+	}
+	return { rows, deferred };
 }
 
 // ── the pass ────────────────────────────────────────────────────────────────
@@ -807,6 +1106,8 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 		// from, so adoption/gating writes back into THAT store's run dir.
 		const stores = dedupeStores([input.store, ...(input.stores ?? [])]);
 		const storeByRoot = new Map<string, ReattachStore>();
+		/** #463: what each store's `listRuns()` returned, so convergence reads it once (not twice). */
+		const runsByRoot = new Map<string, readonly ReattachRun[]>();
 		const discovered: ReattachCandidate[] = [];
 		report.stores.scanned = stores.length;
 		// What discovery refused to look at is reported verbatim: a bounded surface must
@@ -827,6 +1128,8 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 				continue;
 			}
 			if (runs.length > 0) report.stores.withRuns += 1;
+			// #463: the same read feeds the convergence step below — one scan, not two.
+			runsByRoot.set(rootDir, runs);
 			discovered.push(...candidatesFromRuns(store, runs, { sessionFile: input.sessionFile }));
 		}
 		report.stores.candidates = discovered.length;
@@ -880,6 +1183,31 @@ export async function runReattachPass(input: ReattachPassInput): Promise<Reattac
 				report.skipped.push({ name: candidate.name, host: candidate.host, reason: `adoption failed (${messageOf(error)})` });
 				log(skipLine(now(), candidate, `adoption failed (${messageOf(error)})`, storeLabel));
 			}
+		}
+		// #463: the leftover nobody adopted. Same stores, no wire, the same budget: the
+		// record is reconciled with what the LEDGER already says, and written back through
+		// the store that HOLDS it. This is the half that keeps `status`/`stop` honest after
+		// a restart (see the module header).
+		const converge = await convergeLeftovers({
+			stores,
+			runsByRoot,
+			adopted: new Set(report.adopted.map((child) => storeChildKey(child.storeRoot, child.runId, child.name))),
+			sessionFile: input.sessionFile,
+			tracked: input.tracked ?? (() => false),
+			pid,
+			alive,
+			now,
+			startedAt,
+			deadline,
+			maxRows: input.maxConvergeRows ?? REATTACH_CONVERGE_MAX_ROWS,
+			storeLabel: labelOf,
+			log,
+		});
+		report.converged = converge.rows;
+		report.deferredConverge = converge.deferred;
+		if (converge.rows.length > 0 || converge.deferred > 0) {
+			const named = converge.rows.map((row) => `${row.how}:${row.name}`).join(",");
+			log(`${new Date(now()).toISOString()} reattach converge converged=${converge.rows.length} (${named || "-"}) deferred=${converge.deferred}`);
 		}
 		// Mirror-only orphans: no record and no row, so they cannot be adopted — but a
 		// live `no-run` dir on a reachable machine is the same fact #445 is about, so
@@ -941,8 +1269,15 @@ function skipLine(at: number, candidate: ReattachCandidate, reason: string, stor
  * noise); an adoption that reached into another store names it, in adoption order
  * and deduped, so "where did this child come from" is answerable from the line —
  * before the `; ` mirrorOnly/deferred suffixes.
+ *
+ * #463: still ONE line, byte-for-byte #450 unless the pass also CONVERGED leftovers, in
+ * which case the line ends with ` (N converged)`. Convergence is bookkeeping, not news,
+ * so it never becomes a sentence of its own: a pass that converged and has nothing else
+ * to say stays silent (nothing is owed and nothing is retried — `status` already shows
+ * the reconciled rows).
  */
 export function formatReattachSummary(report: ReattachReport, opts: { home?: string | undefined } = {}): string | undefined {
+	const converged = report.converged?.length ?? 0;
 	if (report.adopted.length === 0 && report.mirrorOnly.length === 0 && report.deferred === 0) return undefined;
 	const names = report.adopted.map((child) => child.name);
 	const parts: string[] = [];
@@ -977,7 +1312,8 @@ export function formatReattachSummary(report: ReattachReport, opts: { home?: str
 				: `legion: ${report.deferred} cross-machine leftover(s) not probed within ${seconds}s — the next start retries`,
 		);
 	}
-	return parts.join("; ");
+	const line = parts.join("; ");
+	return converged > 0 ? `${line} (${converged} converged)` : line;
 }
 
 /** Per-child detail sink: append under the run store root, never the transcript. */

@@ -121,8 +121,16 @@ export interface UnsupervisedVerdict {
 	mark?: UnsupervisedMark;
 }
 
-/** `true` for the #456 leftover shape (host + orphan marker/state) — not our row. */
-function isOrphanShape(child: Pick<ChildRecord, "state" | "host" | "orphaned">): boolean {
+/**
+ * `true` for the #456 leftover shape (a cross-machine record carrying the exit's
+ * `orphaned`/`unfetched` marker) — NOT this module's row.
+ *
+ * Exported because every consumer needs the same answer: an #456 leftover has its own
+ * verdict words, its own reclaim path and its own `stop` branch, and #463 must leave
+ * all three untouched (a scan that retired one underneath `reclaimOrphan` would also
+ * retire the `orphaned (terminal gone, work done)` line a reader needs).
+ */
+export function isOrphanLeftover(child: Pick<ChildRecord, "state" | "host" | "orphaned">): boolean {
 	if (typeof child.host !== "string" || child.host.trim().length === 0) return false;
 	return child.orphaned !== undefined || child.state === "orphaned" || child.state === "unfetched";
 }
@@ -152,7 +160,7 @@ function unheld(
 	//    session's own table (a queued/launching child exists before a handle does).
 	if (facts.alive || facts.tracked) return undefined;
 	// 3. #456's leftovers answer to their own predicate and their own verdict word.
-	if (isOrphanShape(child)) return undefined;
+	if (isOrphanLeftover(child)) return undefined;
 	// 4. Only a state that owes work can be a ghost.
 	if (!UNSUPERVISED_RECORD_STATES.includes(child.state)) return undefined;
 	// 5. Another LIVE session's marker: that session holds the child (#445 §3).

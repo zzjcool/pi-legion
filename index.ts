@@ -3893,6 +3893,7 @@ async function controlAction(input: {
 			supervisor: input.supervisor,
 			store,
 			cwd,
+			sessionRunId: input.legion?.runId,
 			...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
 			crossMachine: input.settings.crossMachine,
 			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
@@ -7668,6 +7669,8 @@ async function settleUnsupervisedOnStop(input: {
 	store: RunStore;
 	cwd: string;
 	callerCwd?: string | undefined;
+	/** The run this session owns (#312) — the scope `stopAction` resolves in. */
+	sessionRunId?: string | undefined;
 	crossMachine: CrossMachineSettings | undefined;
 	sessionFile?: string | undefined;
 }): Promise<AgentToolResult<unknown> | undefined> {
@@ -7679,52 +7682,75 @@ async function settleUnsupervisedOnStop(input: {
 	const job = input.runtime.get(name);
 	if (job !== undefined && job.state !== "retired") return undefined;
 	const runId = input.params.runId;
-	// Every ghost row in one store, newest run first (the order `findUnsupervisedRows`
-	// guarantees and `pickChildByName` mirrors). An unreadable store holds nothing.
-	const rowsFor = (store: RunStore): UnsupervisedRow[] => {
-		let runs: ReturnType<RunStore["listRuns"]>;
-		try {
-			runs = store.listRuns();
-		} catch {
-			return [];
-		}
-		return findUnsupervisedRows(runs, {
-			name,
-			...(runId !== undefined ? { runId } : {}),
-			factsFor: (child, run) => unsupervisedFactsFor({
-				store,
-				runId: run.runId,
-				name: child.name,
-				alive: input.supervisor.isAlive(child.name),
-				runtime: input.runtime,
-			}),
-		});
+	/** The ghost verdict for ONE record, or `undefined` when the ordinary stop owns it. */
+	const ghostRowOf = (store: RunStore, run: RunRecord, child: ChildRecord): UnsupervisedRow | undefined => {
+		const verdict = unsupervisedVerdict(child, unsupervisedFactsFor({
+			store,
+			runId: run.runId,
+			name: child.name,
+			alive: input.supervisor.isAlive(child.name),
+			runtime: input.runtime,
+		}));
+		return verdict === undefined ? undefined : { run, child, verdict };
 	};
 	const candidates: Array<{ store: RunStore; row: UnsupervisedRow }> = [];
-	const ownRows = rowsFor(input.store);
-	if (ownRows.length > 0) {
-		candidates.push({ store: input.store, row: ownRows[0]! });
-	} else {
-		// The session's own store answers for this name with something that is NOT a
-		// ghost row (a held child, a retired record): the ordinary stop owns the call.
-		// Reclaiming a same-named ghost from another project would capture a name this
-		// store already answered (the #456 review F2 rule).
-		let picked: ReturnType<typeof pickChildByName> = null;
-		if (runId === undefined) {
-			try {
-				picked = pickChildByName(input.store.listRuns(), name);
-			} catch {
-				picked = null;
-			}
+	// #312: this step resolves the name EXACTLY as `stopAction` does — same scope, same
+	// precedence — or a same-named row in another run would be settled while `stop`
+	// reported this session's child (the finding `child-scope-actions.test.ts` pins).
+	const ownRuns = (() => {
+		try {
+			return input.store.listRuns();
+		} catch {
+			return [] as ReturnType<RunStore["listRuns"]>;
 		}
-		if (picked !== null) return undefined;
-		// A miss in this store is not a miss overall: the record may live under another
-		// store on the SAME bounded surface `status` lists (#450), which is exactly how
-		// the issue's row was visible and unreachable at once.
-		if (runId === undefined) {
+	})();
+	const directRunId = scopeRunIdFor({
+		runId: input.params.runId,
+		sessionRunId: input.sessionRunId,
+		trackedRunId: input.runtime.get(name)?.runId,
+	});
+	const found = foundInScope(ownRuns, directRunId, name);
+	if (found) {
+		const row = ghostRowOf(input.store, found.run, found.child);
+		if (row === undefined) return undefined;
+		candidates.push({ store: input.store, row });
+	} else {
+		const hit = scopeHitFor({ name, directRunId, explicitRunId: input.params.runId, runs: ownRuns });
+		if (hit.kind === "elsewhere") {
+			// A same-named record in another run of THIS store: `stopAction` owns the name
+			// (it refuses the ambiguity, or adopts the single permissive match — #312).
+			// Settling it here would be the cross-run capture #312 banned.
+			if (hit.candidates.length > 1 || directRunId !== undefined) return undefined;
+			const permissive = foundElsewhere(ownRuns, name, hit);
+			if (permissive === null) return undefined;
+			const row = ghostRowOf(input.store, permissive.run, permissive.child);
+			if (row === undefined) return undefined;
+			candidates.push({ store: input.store, row });
+		} else {
+			// `absent`: no run in this store holds the name at all. Only then is the
+			// bounded cross-store surface (#450) consulted — and only when the call named
+			// no explicit run, the same rule `reclaimOrphanOnStop` follows. This is the
+			// issue's own shape: a record in a worktree's store, listed by `status` and
+			// unreachable by `stop`.
+			if (runId !== undefined) return undefined;
 			for (const store of orphanSurfaceStores(input.store.rootDir, input.cwd, input.callerCwd)) {
-				const rows = rowsFor(store);
-				if (rows.length > 0) candidates.push({ store, row: rows[0]! });
+				let rows: ReturnType<RunStore["listRuns"]>;
+				try {
+					rows = store.listRuns();
+				} catch {
+					continue;
+				}
+				const row = findUnsupervisedRows(rows, {
+					name,
+					factsFor: (child, run) => unsupervisedFactsFor({
+						store,
+						runId: run.runId,
+						name: child.name,
+						alive: input.supervisor.isAlive(child.name),
+						runtime: input.runtime,
+					}),
+				})[0];
+				if (row !== undefined) candidates.push({ store, row });
 			}
 		}
 	}
