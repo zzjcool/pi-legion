@@ -39,6 +39,10 @@ const VERDICT_WORDS: Record<OrphanReclaimVerdict, string> = {
 	"stale-orphan": "idle, transcript quiet",
 	working: "still working",
 	unknown: "liveness unknown",
+	// #463: a local leftover nobody holds a supervisor for. It never rides the
+	// orphan suffix in production (`state=unreachable (no supervisor)` is its own
+	// line), but the word has to exist for the exhaustive map.
+	"no-supervisor": "no supervisor",
 };
 
 /**

@@ -652,7 +652,24 @@ export interface LiveChildStatusInput {
 	 * leaves the pre-#456 output byte-identical. Display only — it never decides
 	 * liveness or writes anything.
 	 */
+	/**
+	 * #456: the orphaned-row verdict (terminal gone / idle / still working / unknown).
+	 *
+	 * #463: mutually exclusive with {@link unsupervised} — an orphaned leftover and a
+	 * row nobody holds are two different verdicts, and a record is only ever one.
+	 */
 	orphan?: OrphanStatusFacts;
+	/**
+	 * #463: the row is a leftover nobody in this process holds a supervisor for
+	 * (`src/runs/unsupervised-row.ts`).
+	 *
+	 * The state word becomes `unreachable (no supervisor)` and the evidence goes on
+	 * its own line right under the header: `working` was the lie that made `status`
+	 * count a child that finished and was retired as a live child forever, and
+	 * `owner: live` alone cannot refute it (the marker's pid is often the very
+	 * process reading it).
+	 */
+	unsupervised?: { reason: string; evidence: string };
 	now?: number;
 }
 
@@ -806,6 +823,11 @@ export function orphanVerdictWord(verdict: OrphanReclaimVerdict): string {
 			return "still working";
 		case "unknown":
 			return "liveness unknown";
+		// #463: not an orphaned row — a local leftover nobody holds a supervisor
+		// for. The state word is `unreachable (no supervisor)`, so this word only
+		// appears if a caller routes the verdict through the orphan suffix.
+		case "no-supervisor":
+			return "no supervisor";
 	}
 }
 
@@ -836,13 +858,19 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		...(input.remoteTerminal !== undefined ? { remoteTerminal: input.remoteTerminal } : {}),
 		transcriptBytes: transcriptBytesOf(input.sessionFile),
 	});
-	const state = shell !== undefined
-		? "unknown"
-		: stale
-			? "working"
-			: ownerDead && input.state === "working"
-				? "failed"
-				: input.state;
+	// #463: the ghost verdict wins over every other state rule — `working` is the lie
+	// this line exists to stop repeating, and a row nobody holds has no process whose
+	// silence could be read as `stale`. The reason is rendered verbatim so the word
+	// is `unreachable (no supervisor)`, never a bare `unknown`.
+	const state = input.unsupervised !== undefined
+		? `unreachable (${input.unsupervised.reason})`
+		: shell !== undefined
+			? "unknown"
+			: stale
+				? "working"
+				: ownerDead && input.state === "working"
+					? "failed"
+					: input.state;
 	const execution = stale
 		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
 		: input.execution;
@@ -852,6 +880,11 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const lines = [
 		`${input.name} — state=${state}${orphanWord} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
 	];
+	// #463: the reachability evidence, directly under the header like #456's — the
+	// reader must be able to check WHY a `working` record is not live.
+	if (input.unsupervised !== undefined && input.unsupervised.evidence.trim().length > 0) {
+		lines.push(`unreachable: ${input.unsupervised.evidence}`);
+	}
 	// Directly under the header: the one sentence the verdict rests on, so a reader
 	// can check the word instead of trusting it. Display only, no line otherwise.
 	if (input.orphan?.evidence !== undefined && input.orphan.evidence.trim().length > 0) {

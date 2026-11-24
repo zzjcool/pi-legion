@@ -82,6 +82,13 @@ import {
 	type OrphanEvidence,
 	type OrphanRow,
 } from "./src/runs/orphan-reclaim.ts";
+import {
+	findUnsupervisedRows,
+	unsupervisedVerdict,
+	type UnsupervisedFacts,
+	type UnsupervisedRow,
+	type UnsupervisedVerdict,
+} from "./src/runs/unsupervised-row.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings, type WorktreeSource } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
@@ -170,7 +177,7 @@ import {
 // that decides which roots are worth reading — `status`, `list all:true`, `recover` and
 // the session-start re-attach all ask it rather than each inventing a walk.
 import { discoverLocalStores, formatStoreLabel, sameStore, storeCwdOf } from "./src/runs/store-scan.ts";
-import { RUN_OWNER_FILE, isPidAlive, ownerState, readOwnerFile } from "./src/runs/owner.ts";
+import { RUN_OWNER_FILE, isPidAlive, ownerState, ownerVerdictOf, readOwnerFile } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
@@ -3875,6 +3882,22 @@ async function controlAction(input: {
 			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
 		});
 		if (reclaimed !== undefined) return reclaimed;
+		// #463: a GHOST row — a leftover nobody in this process holds a supervisor for
+		// — is settled here, from the same predicate `status` renders it with. Without
+		// it the empirical case answered `unknown child … (not tracked by this session)`
+		// forever: `status` listed the row as live (its `owner.json` pid was this very
+		// process), and no action existed that could clear it.
+		const settledGhost = await settleUnsupervisedOnStop({
+			params,
+			runtime: input.runtime,
+			supervisor: input.supervisor,
+			store,
+			cwd,
+			...(input.callerCwd !== undefined ? { callerCwd: input.callerCwd } : {}),
+			crossMachine: input.settings.crossMachine,
+			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
+		});
+		if (settledGhost !== undefined) return settledGhost;
 		return stopAction({
 			params,
 			runtime: input.runtime,
@@ -4042,6 +4065,19 @@ async function controlAction(input: {
 			alive,
 			found.runId,
 		);
+		// #463: `status` and `stop` must answer the same question about the same row.
+		// A record this process holds no supervisor for is a ghost row: rendered
+		// `unreachable (no supervisor)` instead of the record's `working` word, and
+		// settleable by `stop` (see `settleUnsupervisedOnStop`).
+		const unsupervised = alive
+			? undefined
+			: unsupervisedVerdict(found.child, unsupervisedFactsFor({
+				store: foundStore,
+				runId: found.runId,
+				name: found.child.name,
+				alive,
+				runtime: input.runtime,
+			}));
 		// #456: the same bounded inspection the overview does, for one orphaned record.
 		const orphanFacts = isOrphanedRecord(found.child)
 			? await raceWithTimeout(
@@ -4077,6 +4113,7 @@ async function controlAction(input: {
 			// #451: the worktree provenance, same fields on both surfaces.
 			...childWorktreeFacts(found.child),
 			...(orphanFacts ? { orphan: { verdict: orphanFacts.verdict, ...(orphanFacts.evidence ? { evidence: orphanFacts.evidence } : {}) } } : {}),
+			...(unsupervised ? { unsupervised } : {}),
 			alive,
 			...(owner ? { owner } : {}),
 			// #450: a record from another store says which one, right after `session=`.
@@ -6962,6 +6999,14 @@ export interface StatusLivenessFacts {
 	 * rail kept showing a finished child.
 	 */
 	orphaned?: boolean;
+	/**
+	 * #463: the row is a leftover nobody in this process holds a supervisor for
+	 * (`src/runs/unsupervised-row.ts`). Such a row is never counted live either: its
+	 * `state=working` is the record's word, not a fact, and `owner.json` cannot
+	 * refute it (that pid is usually this very process). Rendered as
+	 * `unreachable (no supervisor)` and settlable by `stop`.
+	 */
+	unsupervised?: UnsupervisedVerdict;
 }
 
 /** One run record after the status filter ran (display-liveness D6 exit 1). */
@@ -7009,7 +7054,13 @@ export function classifyChildrenForStatus(
 			// #456: an orphaned leftover is not live either way. It is not a failure
 			// (`failed` would be a verdict), so the overview lists it as orphaned and
 			// stops counting it in the live header.
-			const live = facts?.orphaned !== true && !(facts?.owner === "dead" && !facts.alive);
+			//
+			// #463: neither is a ghost row — a leftover nobody holds a supervisor for.
+			// Counting it live is exactly how a child that finished and retired kept
+			// being listed as `working` forever (`status` and `stop` must agree).
+			const live = facts?.orphaned !== true
+				&& facts?.unsupervised === undefined
+				&& !(facts?.owner === "dead" && !facts.alive);
 			candidates.push({ child, live });
 		}
 	}
@@ -7128,6 +7179,11 @@ export interface StatusChildEntry {
 	 * byte-identical to the pre-#456 output.
 	 */
 	orphan?: OrphanEvidence;
+	/**
+	 * #463: the ghost verdict (`no supervisor`). Absent for every held record, so
+	 * the block of a normal child stays byte-identical.
+	 */
+	unsupervised?: UnsupervisedVerdict;
 }
 
 /** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
@@ -7136,10 +7192,21 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 	// (capped) inspection left it without a verdict word — calling it `dead` would
 	// be a verdict nobody reached.
 	const isOrphan = (entry: StatusChildEntry): boolean => entry.orphan !== undefined || isOrphanedRecord(entry.child);
+	// #463: a ghost row is its own bucket — listing it as `dead` would be a verdict
+	// nobody reached (#460: an absent supervisor does not judge a child dead), and
+	// counting it live is the bug. The header says `unreachable`.
+	const isUnsupervised = (entry: StatusChildEntry): boolean => entry.unsupervised !== undefined && !isOrphan(entry);
 	const orphanCount = children.filter(isOrphan).length;
-	const deadCount = children.filter((entry) => entry.live === false && !isOrphan(entry)).length;
-	const liveCount = children.length - deadCount - orphanCount;
-	const blocks = children.map(({ child, alive, owner, pid, inFlightTools, store, orphan }) =>
+	const unreachableCount = children.filter((entry) => isUnsupervised(entry) && entry.live === false).length;
+	const deadCount = children.filter((entry) => entry.live === false && !isOrphan(entry) && !(entry.unsupervised !== undefined)).length;
+	const liveCount = children.length - deadCount - orphanCount - unreachableCount;
+	/** `(2 orphaned, 1 unreachable)` — only the buckets that exist, so old output is byte-identical. */
+	const countNotes = [
+		...(orphanCount > 0 ? [`${orphanCount} orphaned`] : []),
+		...(unreachableCount > 0 ? [`${unreachableCount} unreachable`] : []),
+	];
+	const countSuffix = countNotes.length > 0 ? ` (${countNotes.join(", ")})` : "";
+	const blocks = children.map(({ child, alive, owner, pid, inFlightTools, store, orphan, unsupervised }) =>
 		withInFlightToolLine(
 			renderLiveChildStatus({
 				name: child.name,
@@ -7161,6 +7228,8 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				...childWorktreeFacts(child),
 				// #456: the verdict word (`orphaned (terminal gone, work done)`).
 				...(orphan ? { orphan } : {}),
+				// #463: `unreachable (no supervisor)` for a row nobody here holds.
+				...(unsupervised ? { unsupervised } : {}),
 				alive,
 				...(owner ? { owner } : {}),
 				// #450: after the ownership verdict, one `store=` line for a foreign record
@@ -7177,10 +7246,10 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 		// Nothing live. With no record at all this stays the exact literal the
 		// tests pin; with records that are all dead the count line below says so,
 		// instead of implying the run directory is empty.
-		parts.push(orphanCount > 0 ? `Status · 0 live children (${orphanCount} orphaned)` : "No live children.");
+		parts.push(countNotes.length > 0 ? `Status · 0 live children${countSuffix}` : "No live children.");
 	} else {
 		const noun = liveCount === 1 ? "child" : "children";
-		parts.push(`Status · ${liveCount} live ${noun}${orphanCount > 0 ? ` (${orphanCount} orphaned)` : ""}`);
+		parts.push(`Status · ${liveCount} live ${noun}${countSuffix}`);
 	}
 	if (deadCount > 0) parts.push(`(${deadCount} dead)`);
 	if (blocks.length > 0) parts.push("", blocks.join("\n\n"));
@@ -7301,6 +7370,12 @@ function renderScanOverview(input: {
 		// newer record must not stamp `orphaned`/owner facts onto an older live one
 		// (review F10.5; the owner/alive dimensions had the same latent shape).
 		const factsKey = (child: StatusChildRecord): string => child.nodeId ?? `${child.name}\u0000${child.spawnedAt}`;
+		// #463: the run dir a record's `owner.json` lives in — keyed by the RECORD, so a
+		// reused name cannot borrow the marker of another run (#312).
+		const runIdByKey = new Map<string, string>();
+		for (const run of runs) {
+			for (const child of run.children) runIdByKey.set(factsKey(child), run.runId);
+		}
 		const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
 			const cached = factsByName.get(factsKey(child));
 			if (cached) return cached;
@@ -7310,12 +7385,25 @@ function renderScanOverview(input: {
 			// another session (or another store) has none, and none is invented.
 			const pid = input.runtime.get(child.name)?.pid;
 			const inFlightTools = inFlightToolStackOf(input.supervisor, child.name);
+			// #463: the row nobody here holds. Computed from the SAME record the filter
+			// and the block see, so `status` cannot classify it live and render it
+			// `unreachable` (the two-view bug, one layer down).
+			const unsupervised = alive
+				? undefined
+				: unsupervisedVerdict(child, unsupervisedFactsFor({
+					store: surfaceStore.store,
+					runId: runIdByKey.get(factsKey(child)),
+					name: child.name,
+					alive,
+					runtime: input.runtime,
+				}));
 			const facts = {
 				alive,
 				...(owner ? { owner } : {}),
 				// #456: "an orphaned record holds no slot", which is what keeps it out
 				// of the live count even when its owner pid still reads alive.
 				...(isOrphanedRecord(child) ? { orphaned: true } : {}),
+				...(unsupervised ? { unsupervised } : {}),
 				...(pid ? { pid } : {}),
 				...(inFlightTools ? { inFlightTools } : {}),
 			};
@@ -7556,6 +7644,148 @@ async function reclaimOrphanOnStop(input: {
 }
 
 /**
+ * `subagent({action:"stop", name})` on a GHOST row (#463).
+ *
+ * The issue's measured shape: `status` listed the row as a live child
+ * (`state=working`, `owner: live` — because `owner.json`'s pid was the very
+ * process asking), while `stop` answered `unknown child … (not tracked by this
+ * session)`. Both views were wrong about the same record. This step is the other
+ * half of the same predicate (`src/runs/unsupervised-row.ts`): what `status` no
+ * longer calls live, `stop` can settle.
+ *
+ * Returns `undefined` when the name is not a ghost row, so the caller runs the
+ * ordinary stop (a held child) or #456's reclaim exactly as before. When it IS
+ * one, the row is settled through the SAME write path `#456` uses
+ * (`reclaimOrphan`, verdict `no-supervisor`): ledger row ended with the graded
+ * outcome when the child's own transcript grades (a local file — no wire), else
+ * `retired` with `execution: unknown` (#460: never `failed` for lack of an answer),
+ * run.json `retired`, `reclaimed` stamped, the ghost mark dropped.
+ */
+async function settleUnsupervisedOnStop(input: {
+	params: { name?: string; all?: boolean; runId?: string };
+	runtime: SessionRuntime;
+	supervisor: LegionSupervisor;
+	store: RunStore;
+	cwd: string;
+	callerCwd?: string | undefined;
+	crossMachine: CrossMachineSettings | undefined;
+	sessionFile?: string | undefined;
+}): Promise<AgentToolResult<unknown> | undefined> {
+	const name = input.params.name?.trim();
+	// `stop all` stays runtime-only, exactly as #456 keeps it: `all` means the jobs
+	// this session tracks, and a ghost is addressed by its `(store, name)` identity.
+	if (!name || input.params.all === true) return undefined;
+	// A live job with this name is the ordinary stop path's business.
+	const job = input.runtime.get(name);
+	if (job !== undefined && job.state !== "retired") return undefined;
+	const runId = input.params.runId;
+	// Every ghost row in one store, newest run first (the order `findUnsupervisedRows`
+	// guarantees and `pickChildByName` mirrors). An unreadable store holds nothing.
+	const rowsFor = (store: RunStore): UnsupervisedRow[] => {
+		let runs: ReturnType<RunStore["listRuns"]>;
+		try {
+			runs = store.listRuns();
+		} catch {
+			return [];
+		}
+		return findUnsupervisedRows(runs, {
+			name,
+			...(runId !== undefined ? { runId } : {}),
+			factsFor: (child, run) => unsupervisedFactsFor({
+				store,
+				runId: run.runId,
+				name: child.name,
+				alive: input.supervisor.isAlive(child.name),
+				runtime: input.runtime,
+			}),
+		});
+	};
+	const candidates: Array<{ store: RunStore; row: UnsupervisedRow }> = [];
+	const ownRows = rowsFor(input.store);
+	if (ownRows.length > 0) {
+		candidates.push({ store: input.store, row: ownRows[0]! });
+	} else {
+		// The session's own store answers for this name with something that is NOT a
+		// ghost row (a held child, a retired record): the ordinary stop owns the call.
+		// Reclaiming a same-named ghost from another project would capture a name this
+		// store already answered (the #456 review F2 rule).
+		let picked: ReturnType<typeof pickChildByName> = null;
+		if (runId === undefined) {
+			try {
+				picked = pickChildByName(input.store.listRuns(), name);
+			} catch {
+				picked = null;
+			}
+		}
+		if (picked !== null) return undefined;
+		// A miss in this store is not a miss overall: the record may live under another
+		// store on the SAME bounded surface `status` lists (#450), which is exactly how
+		// the issue's row was visible and unreachable at once.
+		if (runId === undefined) {
+			for (const store of orphanSurfaceStores(input.store.rootDir, input.cwd, input.callerCwd)) {
+				const rows = rowsFor(store);
+				if (rows.length > 0) candidates.push({ store, row: rows[0]! });
+			}
+		}
+	}
+	if (candidates.length === 0) return undefined;
+	if (candidates.length > 1) {
+		const lines = [
+			`${name} is ambiguous: ${candidates.length} stores hold an uncollectable child with that name, so \`stop\` will not guess which one you mean.`,
+		];
+		for (const { store, row } of candidates) {
+			lines.push(`  store=${formatStoreLabel(store.rootDir)} run=${row.run.runId} state=${row.child.state}`);
+		}
+		lines.push("Fix: run the call from that store's directory, or pass `cwd:` with one of the store directories above so only one store is searched.");
+		return fail(lines.join("\n"), ErrorCodes.NOT_FOUND);
+	}
+	const { store: rowStore, row } = candidates[0]!;
+	const subject = orphanSubjectFor({
+		storeRoot: rowStore.rootDir,
+		runId: row.run.runId,
+		runDir: rowStore.runDir(row.run.runId),
+		run: row.run,
+		child: row.child,
+	});
+	const result = await reclaimOrphan(
+		subject,
+		{ verdict: "no-supervisor", evidence: row.verdict.evidence },
+		{
+			store: rowStore,
+			crossMachine: input.crossMachine,
+			...(input.sessionFile !== undefined ? { sessionFile: input.sessionFile } : {}),
+		},
+	);
+	if (!result.ok) {
+		return ok(`Refusing to settle ${name}: ${result.reason}. ${orphanVerdictLine(result)}`);
+	}
+	const half = result.ledgerStatus === "missing"
+		? " (the ledger row was not found; run.json is the half that was written)"
+		: result.ledgerStatus === "already-ended"
+			? " (the ledger row had already ended)"
+			: "";
+	const recordLine = result.recordWritten
+		? `run record: retired; log: ${formatStoreLabel(rowStore.rootDir)}/${ORPHAN_RECLAIM_LOG_FILE}`
+		: `run record: NOT retired (${result.recordNote ?? "the run.json write failed"}); retry the stop — log: ${formatStoreLabel(rowStore.rootDir)}/${ORPHAN_RECLAIM_LOG_FILE}`;
+	return ok(
+		[
+			`Settled ${name}. ${orphanVerdictLine(result)}${half}.`,
+			recordLine,
+			`result still fetchable: subagent({ action: "recover", name: ${JSON.stringify(name)} })`,
+		].join("\n"),
+		{
+			settle: {
+				name,
+				runId: row.run.runId,
+				verdict: result.verdict,
+				ledgerStatus: result.ledgerStatus,
+				...(result.execution ? { execution: result.execution.status } : {}),
+			},
+		},
+	);
+}
+
+/**
  * Resolve which children a wait targets.
  *
  * `all` covers every LIVE child of this session runtime (working or blocked);
@@ -7774,6 +8004,36 @@ function ownerVerdictFor(
 	const picked = pickChildByName(runs(), name);
 	if (!picked) return "unknown";
 	return ownerState(path.join(store.runDir(picked.run.runId), RUN_OWNER_FILE));
+}
+
+/**
+ * #463: the facts the ghost verdict reads for ONE record.
+ *
+ * `alive`/`tracked` are this process's own answers (its supervisor registry and
+ * its job table — the same two things `stop` consults before it answers "not
+ * tracked by this session"); the owner half comes from that record's OWN run dir,
+ * never from whatever `pickChildByName` prefers across runs (#312). One
+ * `owner.json` read.
+ */
+function unsupervisedFactsFor(input: {
+	store: RunStore;
+	runId?: string | undefined;
+	name: string;
+	alive: boolean;
+	runtime: SessionRuntime;
+}): UnsupervisedFacts {
+	const marker = input.runId === undefined
+		? undefined
+		: readOwnerFile(path.join(input.store.runDir(input.runId), RUN_OWNER_FILE));
+	const job = input.runtime.get(input.name);
+	return {
+		alive: input.alive,
+		// A retired job holds nothing; the session that ran it is done with it.
+		tracked: job !== undefined && job.state !== "retired",
+		owner: ownerVerdictOf(marker),
+		...(marker?.pid !== undefined ? { ownerPid: marker.pid } : {}),
+		...(marker?.host ? { ownerHost: marker.host } : {}),
+	};
 }
 
 /** The run a resolved `stop` target lives in (#312). */

@@ -59,6 +59,7 @@ import type {
 	RunRecord,
 } from "../shared/types.ts";
 import { raceWithTimeout } from "../supervisor/race-timeout.ts";
+import { isTerminalRecordState } from "./unsupervised-row.ts";
 import { deriveAcceptance, settledStatusFor } from "./orchestrator.ts";
 import { isPidAlive, ownerState, readOwnerFile, RUN_OWNER_FILE } from "./owner.ts";
 import {
@@ -147,6 +148,14 @@ export interface OrphanSubject {
 	ownerHost?: string;
 	/** That run's `sessionFile` — the session that left the child behind. */
 	ownerSessionFile?: string;
+	/**
+	 * #463: the CHILD's own transcript on this machine (`ChildRecord.sessionFile`).
+	 *
+	 * A local leftover has no `host`, so there is no machine to read a transcript
+	 * back from — the child's transcript is already here, and grading it is the same
+	 * ladder `collect`/`recover` use. A cross-machine subject leaves this unused.
+	 */
+	transcriptPath?: string;
 }
 
 /** A discovered leftover: the subject plus the record it was read from. */
@@ -192,6 +201,7 @@ export function orphanSubjectFor(input: {
 		...(owner ? { ownerPid: owner.pid } : {}),
 		...(owner?.host ? { ownerHost: owner.host } : {}),
 		...(input.run.sessionFile ? { ownerSessionFile: input.run.sessionFile } : {}),
+		...(input.child.sessionFile ? { transcriptPath: input.child.sessionFile } : {}),
 	};
 }
 
@@ -478,7 +488,7 @@ export type OrphanReclaimLedgerStatus = "settled" | "failed" | "retired" | "alre
 
 export interface OrphanReclaimResult {
 	ok: true;
-	verdict: "terminal-gone" | "stale-orphan";
+	verdict: "terminal-gone" | "stale-orphan" | "no-supervisor";
 	ledgerStatus: OrphanReclaimLedgerStatus;
 	/** The graded outcome, when a transcript was read and graded. */
 	execution?: Execution;
@@ -627,6 +637,18 @@ async function gradeTranscript(
 	opts: OrphanReclaimOptions,
 	deadlineMs: number,
 ): Promise<Grade> {
+	// #463: a LOCAL leftover (`host` empty) has no machine to read back from — its
+	// transcript is already on this disk (`ChildRecord.sessionFile`), so grade that
+	// file with the same ladder. No wire call, no deadline: a missing transcript
+	// grades as `unknown`, which the callers already handle (retired, no verdict).
+	if (subject.host.trim() === "") {
+		const local = subject.transcriptPath;
+		if (local === undefined) return { parsed: undefined };
+		const parsed = parseSessionFile(local);
+		const execution = deriveOutcome(parsed);
+		if (execution.status === "unknown" || execution.status === "running") return { parsed, execution };
+		return { parsed, execution, acceptance: deriveAcceptance(parsed, execution, undefined) };
+	}
 	const read = (opts.readback ?? createRemoteSessionReadback({ crossMachine: opts.crossMachine }))({
 		host: subject.host,
 		name: subject.name,
@@ -661,6 +683,13 @@ async function gradeTranscript(
  *      `reclaimed` stamped with who/when/evidence).
  *
  * The log line carries the same facts. Nothing is written for `working`/`unknown`.
+ *
+ * #463 adds one more accepted verdict, `no-supervisor`: a LOCAL leftover nobody in
+ * this process holds a supervisor for (`src/runs/unsupervised-row.ts`). It needs no
+ * kill and no terminal probe — the row is settled on the one fact that nobody can
+ * collect it. It is still NOT a death verdict: the child's own transcript is graded
+ * when it can be (a local file, no wire), and a transcript that grades nothing is
+ * retired with `execution: "unknown"`, never failed (#460).
  */
 export async function reclaimOrphan(
 	subject: OrphanSubject,
@@ -671,6 +700,8 @@ export async function reclaimOrphan(
 	const pid = opts.pid ?? process.pid;
 	const log = opts.log ?? orphanReclaimLogSink(opts.store.rootDir);
 	const deadline = opts.deadlineMs ?? ORPHAN_READBACK_DEADLINE_MS;
+	/** #463: settling a row no supervisor holds (no terminal, no kill, no probe). */
+	const noSupervisor = evidence.verdict === "no-supervisor";
 	let killed = false;
 	const refuse = (reason: string, verdict: OrphanReclaimVerdict = evidence.verdict): OrphanReclaimRefusal => {
 		const logLine = byLine({
@@ -685,7 +716,7 @@ export async function reclaimOrphan(
 		log(logLine);
 		return { ok: false, verdict, evidence: evidence.evidence, reason, ...(killed ? { killed } : {}), logLine };
 	};
-	if (evidence.verdict !== "terminal-gone" && evidence.verdict !== "stale-orphan") {
+	if (evidence.verdict !== "terminal-gone" && evidence.verdict !== "stale-orphan" && !noSupervisor) {
 		return refuse(evidence.verdict === "working"
 			? "the child is still working over there: nothing was settled"
 			: "no liveness evidence: nothing was settled");
@@ -701,9 +732,21 @@ export async function reclaimOrphan(
 	// (cheap, after the wire is done) so a re-attach that adopted this child in the
 	// window is not retired underneath its new session. The mutator checks again
 	// (atomically, under the store lock) at write time (review F8).
+	//
+	// #463: a `no-supervisor` row is EXPECTED to say `working` — that lie is the
+	// whole point — so the state word is not the adoption signal there. The
+	// adoption signal is the `reattached` stamp every adoption writes; and a record
+	// that turned terminal in the window was settled by someone else.
 	try {
 		const fresh = opts.store.findChild(subject.runId, subject.name);
-		if (fresh && (fresh.state === "working" || fresh.reattached !== undefined)) {
+		if (fresh && noSupervisor) {
+			if (fresh.reattached !== undefined) {
+				return refuse("another session adopted this child while it was being inspected; nothing was settled");
+			}
+			if (isTerminalRecordState(fresh.state)) {
+				return refuse(`the record was already settled (state=${fresh.state}) while it was being inspected; nothing was settled`);
+			}
+		} else if (fresh && (fresh.state === "working" || fresh.reattached !== undefined)) {
 			return refuse("another session adopted this child while it was being inspected; nothing was settled");
 		}
 	} catch {
@@ -808,8 +851,16 @@ export async function reclaimOrphan(
 			// If another live session adopted this child in the meantime, its record
 			// now says `working` / carries a `reattached` stamp — do not overwrite a
 			// live adoption with our retirement.
-			if (child.state === "working" || child.reattached !== undefined || child.orphaned === undefined) {
-				recordNote = `run.json changed while reclaiming (state=${child.state}${child.reattached !== undefined ? ", adopted by another session" : ""}); it was not overwritten`;
+			//
+			// #463: for a `no-supervisor` row, `state === "working"` is the LIE being
+			// fixed, so the adoption stamp (`reattached`) is the only signal, and the
+			// `orphaned` marker is not required (a local leftover never has one).
+			const adoptedMeanwhile = child.reattached !== undefined;
+			const changedMeanwhile = noSupervisor
+				? adoptedMeanwhile || isTerminalRecordState(child.state)
+				: child.state === "working" || adoptedMeanwhile || child.orphaned === undefined;
+			if (changedMeanwhile) {
+				recordNote = `run.json changed while reclaiming (state=${child.state}${adoptedMeanwhile ? ", adopted by another session" : ""}); it was not overwritten`;
 				return;
 			}
 			child.state = "retired";
@@ -817,6 +868,8 @@ export async function reclaimOrphan(
 			// (a stale retiredAt from the earlier retirement would be a lie).
 			child.retiredAt = new Date(now).toISOString();
 			delete child.orphaned;
+			// #463: the ghost verdict is spent — `state=retired` now speaks for itself.
+			delete child.unsupervised;
 			child.reclaimed = {
 				at: now,
 				verdict: evidence.verdict,
@@ -842,9 +895,13 @@ export async function reclaimOrphan(
 		extra: `ledger=${ledgerStatus}${grade.execution ? ` execution=${grade.execution.status}` : ""} killed=${String(killed)} record=${recordWritten ? "retired" : "NOT-retired"}${recordNote ? ` note=${JSON.stringify(recordNote)}` : ""}`,
 	});
 	log(logLine);
+	// Only the three actionable verdicts reach this point (#463 added the third).
+	const settledVerdict: OrphanReclaimResult["verdict"] = noSupervisor
+		? "no-supervisor"
+		: evidence.verdict === "terminal-gone" ? "terminal-gone" : "stale-orphan";
 	return {
 		ok: true,
-		verdict: evidence.verdict,
+		verdict: settledVerdict,
 		ledgerStatus,
 		recordWritten,
 		...(recordNote ? { recordNote } : {}),
