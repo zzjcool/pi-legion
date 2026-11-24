@@ -3,6 +3,7 @@
 - issue：https://github.com/zzjcool/pi-legion/issues/463
 - 基线：`origin/master` = `cfc7ce4`（6.2.12，含 #460/#461）；分支
   `pi-subagent/pi-legion-463-ghost-bedbf500`，PR base = `master`，正文 `Fixes #463`。
+- PR：https://github.com/zzjcool/pi-legion/pull/464（base `master`）。
 - 契约：`docs/contracts/ghost-working-row-v1.md`（冻结后实现）。
 - 范围：issue 的四条期望 + 三条验收（含两个变异）。**不动** #445 的接回决策、#456 的
   orphan 回收路径、#460 的 `unreachable` 语义、#209-3 的 dead/unknown 显示词。
