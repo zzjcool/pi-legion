@@ -137,16 +137,15 @@ export function unsupervisedMarkOf(child: Pick<ChildRecord, "unsupervised" | "st
 }
 
 /**
- * Is this record a row nobody can collect? `undefined` means "held, or history" —
- * and every caller must treat that as "leave the existing behaviour alone".
+ * The shared half of both answers: is this record a leftover **nobody here holds**?
  *
- * Total and pure: no fs, no wire, no clock. The caller supplies the facts, so
- * `status`, `stop` and the session-start pass all answer from the SAME rule.
+ * `undefined` means "held, or history" — every caller must treat that as "leave the
+ * existing behaviour alone". Total and pure: no fs, no wire, no clock.
  */
-export function unsupervisedVerdict(
-	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name">,
+function unheld(
+	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "name">,
 	facts: UnsupervisedFacts,
-): UnsupervisedVerdict | undefined {
+): { evidence: string } | undefined {
 	// 1. History is never resurrected (a retired row is not a ghost).
 	if (isTerminalRecordState(child.state)) return undefined;
 	// 2. Somebody here holds it: an in-memory supervisor entry, or a job in the
@@ -156,21 +155,62 @@ export function unsupervisedVerdict(
 	if (isOrphanShape(child)) return undefined;
 	// 4. Only a state that owes work can be a ghost.
 	if (!UNSUPERVISED_RECORD_STATES.includes(child.state)) return undefined;
-	// 5. A converged row keeps its verdict even after its facts move (`stop` must
-	//    accept what `status` showed, even if the pid died in between).
-	const mark = unsupervisedMarkOf(child);
-	if (mark !== undefined) return { reason: mark.reason, evidence: mark.evidence, mark };
-	// 6. Another LIVE session's marker: that session holds the child (#445 §3).
+	// 5. Another LIVE session's marker: that session holds the child (#445 §3).
 	//    A marker written on another HOST cannot be checked from here, so it stays
 	//    "live" and untouched — the same rule `ownerState` and `orphanOwnerGate`
-	//    apply (#456 review F8). Pid reuse only matters when the pid is OURS.
+	//    apply (#456 review F8). A pid that IS this process is not another session:
+	//    it is the marker lying (that is the #463 shape).
 	const pid = facts.pid ?? process.pid;
 	const owner = facts.owner ?? "unknown";
 	const hostname = facts.hostname ?? os.hostname();
 	const foreignHost = facts.ownerHost !== undefined && facts.ownerHost !== "" && facts.ownerHost !== hostname;
 	if (foreignHost) return undefined;
 	if (owner === "live" && facts.ownerPid !== undefined && facts.ownerPid !== pid) return undefined;
-	return { reason: UNSUPERVISED_REASON, evidence: evidenceFor(child, facts, pid) };
+	return { evidence: evidenceFor(child, facts, pid) };
+}
+
+/**
+ * The CONVERGENCE answer — what the session-start scan stamps (#463 §4.3).
+ *
+ * A row nobody here holds is converged to `unreachable (no supervisor)` whatever its
+ * `owner.json` says: dead, absent, or this very process. The scan is the one place
+ * with the budget to look at every store's leftovers, so it is also the place that
+ * turns #209-3's older words (`state=failed` for a dead owner, `state=working` for a
+ * missing marker — both frozen display contracts) into the honest one.
+ */
+export function convergeVerdict(
+	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name">,
+	facts: UnsupervisedFacts,
+): UnsupervisedVerdict | undefined {
+	const base = unheld(child, facts);
+	if (base === undefined) return undefined;
+	const mark = unsupervisedMarkOf(child);
+	return { reason: UNSUPERVISED_REASON, evidence: mark?.evidence ?? base.evidence, ...(mark ? { mark } : {}) };
+}
+
+/**
+ * The DISPLAY / hand-settle answer — what `status` shows and what `stop` settles.
+ *
+ * Only the two cases a reader can PROVE at call time:
+ *
+ *   1. the record carries a `unsupervised` mark (a session-start scan already
+ *      converged it) — the verdict survives even if the facts moved since;
+ *   2. the run dir's own `owner.json` names THIS process: `owner: live` is then the
+ *      marker lying, not a session working, which is the #463 shape exactly.
+ *
+ * An UNMARKED `owner: dead` record keeps #209-3's frozen word (`state=failed`) and an
+ * unmarked `owner: unknown` keeps `state=working`; those rows are converged by the
+ * scan, which is where the evidence for a stronger word actually gets gathered.
+ */
+export function unsupervisedVerdict(
+	child: Pick<ChildRecord, "state" | "host" | "orphaned" | "unsupervised" | "name">,
+	facts: UnsupervisedFacts,
+): UnsupervisedVerdict | undefined {
+	const verdict = convergeVerdict(child, facts);
+	if (verdict === undefined) return undefined;
+	if (verdict.mark !== undefined) return verdict;
+	const pid = facts.pid ?? process.pid;
+	return facts.owner === "live" && facts.ownerPid === pid ? verdict : undefined;
 }
 
 /** The one sentence under the header: what the record says, and why nobody holds it. */
@@ -213,6 +253,12 @@ export function findUnsupervisedRows(
 		name?: string | undefined;
 		runId?: string | undefined;
 		factsFor: (child: ChildRecord, run: Pick<RunRecord, "runId" | "createdAt" | "children">) => UnsupervisedFacts;
+		/**
+		 * `display` (default) = the row `status` shows and `stop` settles by hand;
+		 * `scan` = the wider convergence set the session-start pass stamps. See
+		 * {@link unsupervisedVerdict} / {@link convergeVerdict}.
+		 */
+		mode?: "display" | "scan" | undefined;
 	},
 ): UnsupervisedRow[] {
 	const ordered = [...runs].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
@@ -221,7 +267,8 @@ export function findUnsupervisedRows(
 		if (opts.runId !== undefined && run.runId !== opts.runId) continue;
 		for (const child of run.children) {
 			if (opts.name !== undefined && child.name !== opts.name) continue;
-			const verdict = unsupervisedVerdict(child, opts.factsFor(child, run));
+			const facts = opts.factsFor(child, run);
+			const verdict = opts.mode === "scan" ? convergeVerdict(child, facts) : unsupervisedVerdict(child, facts);
 			if (verdict === undefined) continue;
 			rows.push({ run: run as RunRecord, child, verdict });
 		}

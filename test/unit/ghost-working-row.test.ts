@@ -36,6 +36,7 @@ import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import {
+	convergeVerdict,
 	findUnsupervisedRows,
 	UNSUPERVISED_REASON,
 	unsupervisedMarkOf,
@@ -271,29 +272,45 @@ test("#463 A: another LIVE session's marker holds the row, a foreign-host marker
 	);
 });
 
-test("#463 A: the ghost verdict names its evidence, for all three owner shapes", () => {
+test("#463 A: the scan converges a dead or markerless owner, the hand-settle does not", () => {
 	const child = childRecord("worker-0");
-	const self = unsupervisedVerdict(child, { alive: false, tracked: false, owner: "live", ownerPid: process.pid, pid: process.pid });
-	assert.equal(self?.reason, UNSUPERVISED_REASON);
-	assert.match(self?.evidence ?? "", new RegExp(`pid ${process.pid}`), "the evidence names the pid that lies");
+	const dead = { alive: false, tracked: false, owner: "dead" as const, ownerPid: 2_147_483_000, pid: process.pid };
+	assert.equal(unsupervisedVerdict(child, dead), undefined, "#209-3 keeps `state=failed` for an unmarked dead owner");
+	assert.equal(convergeVerdict(child, dead)?.reason, UNSUPERVISED_REASON, "the session-start scan converges it");
 
-	const dead = unsupervisedVerdict(child, { alive: false, tracked: false, owner: "dead", ownerPid: 2_147_483_000, pid: process.pid });
-	assert.equal(dead?.reason, UNSUPERVISED_REASON);
-	assert.match(dead?.evidence ?? "", /is gone/);
+	const absent = { alive: false, tracked: false, owner: "unknown" as const, pid: process.pid };
+	assert.equal(unsupervisedVerdict(child, absent), undefined, "#209-3 keeps `state=working` for a missing marker");
+	assert.equal(convergeVerdict(child, absent)?.reason, UNSUPERVISED_REASON, "the session-start scan converges it");
 
-	const absent = unsupervisedVerdict(child, { alive: false, tracked: false, owner: "unknown" });
-	assert.equal(absent?.reason, UNSUPERVISED_REASON);
-	assert.match(absent?.evidence ?? "", /no owner marker/);
+	const self = { alive: false, tracked: false, owner: "live" as const, ownerPid: process.pid, pid: process.pid };
+	const verdict = unsupervisedVerdict(child, self);
+	assert.equal(verdict?.reason, UNSUPERVISED_REASON, "the marker naming THIS process is provable at call time");
+	assert.match(verdict?.evidence ?? "", new RegExp(`pid ${process.pid}`), "the evidence names the pid that lies");
+});
+
+test("#463 A: a converged mark is honoured even after the facts moved (what status showed, stop settles)", () => {
+	const mark = { at: 1_000, reason: UNSUPERVISED_REASON as "no supervisor", evidence: "converged at session start", ledger: "running" as const };
+	const child = childRecord("worker-0", { unsupervised: mark });
+	// The owner pid died between the scan and this call: the mark still decides.
+	const facts = { alive: false, tracked: false, owner: "dead" as const, ownerPid: 2_147_483_000, pid: process.pid };
+	const verdict = unsupervisedVerdict(child, facts);
+	assert.equal(verdict?.mark?.evidence, "converged at session start");
+	assert.equal(verdict?.evidence, "converged at session start", "the recorded evidence travels with the verdict");
+	assert.equal(unsupervisedMarkOf({ ...child, state: "retired" }), undefined, "a settled record's mark is history");
 });
 
 test("#463 A: discovery keeps the name/run scope and prefers the newest run", () => {
-	const facts = { alive: false, tracked: false, owner: "dead" as const, ownerPid: 2_147_483_000 };
+	const facts = { alive: false, tracked: false, owner: "live" as const, ownerPid: process.pid, pid: process.pid };
 	const older = { runId: "r-old", createdAt: "2026-01-01T00:00:00.000Z", children: [childRecord("worker-0")] };
 	const newer = { runId: "r-new", createdAt: "2026-02-01T00:00:00.000Z", children: [childRecord("worker-0")] };
 	const found = findUnsupervisedRows([older, newer], { name: "worker-0", factsFor: () => facts });
 	assert.deepEqual(found.map((row) => row.run.runId), ["r-new", "r-old"], "newest run first");
 	assert.equal(findUnsupervisedRows([older, newer], { name: "worker-0", runId: "r-old", factsFor: () => facts }).length, 1, "an explicit run narrows, never widens");
 	assert.equal(findUnsupervisedRows([older], { name: "someone-else", factsFor: () => facts }).length, 0);
+	// The scan mode is the wider set (#209-3's dead-owner rows included).
+	const deadFacts = { alive: false, tracked: false, owner: "dead" as const, ownerPid: 2_147_483_000 };
+	assert.equal(findUnsupervisedRows([older], { factsFor: () => deadFacts }).length, 0, "display mode");
+	assert.equal(findUnsupervisedRows([older], { factsFor: () => deadFacts, mode: "scan" }).length, 1, "scan mode");
 });
 
 // ── B: what the two surfaces render ─────────────────────────────────────────
