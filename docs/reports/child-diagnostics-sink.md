@@ -1,6 +1,6 @@
 # in-process child 的诊断不该出现在用户输入框上方（#468）
 
-状态：**已修复**（2026-11-25；分支 `pi-subagent/pi-legion-468-sink2-62762cd6`，基线 `origin/master` `4eb74b5` = 6.2.13）
+状态：**已修复**（2026-11-25；PR #469，分支 `pi-subagent/pi-legion-468-sink2-62762cd6`，基线 `origin/master` `4eb74b5` = 6.2.13）
 门禁：`npm run typecheck` exit 0；`npm test` 3015 tests / 2980 pass / **14 fail（与基线逐条同名，全是本机 mac 既存红）**；
 `npm run test:integration` 221 / 209 pass / **12 fail（与基线逐条同名同因，见 §7）**。
 
@@ -182,3 +182,4 @@
   汇总从 `child-session.ts` 一路穿到 orchestrator 的 notify 通道 —— 那是另一件事，本 issue 只修「别弹在输入框上方」。
 - `PI_LEGION_PHASES` 解析失败仍走 `console.warn`（§4 已说明理由）。
 - 夹具在 `/tmp/i468/`（与 #466 的 `/tmp/issue466/` 同惯例，未入库）：`accept.mjs` + 变异的 `/tmp/i468-mutant{,2}/`。
+- 边缘：若 spawn 在验收前就失败（例如 model 解析失败），注册失败只落盘、不发 run 结束汇总 —— 那时用户已经拿到 spawn 失败的原因，磁盘记录仍在。
