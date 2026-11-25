@@ -542,3 +542,28 @@ review 之后仍然悬着的那条「只读 scout 可以调用 MCP 写能力」�
 
 **没有做的事**（明确留在「不做」清单里）：per-role / per-server 的 MCP 选择、
 MCP 工具级拦截。要做就等于回到选项 B，需要单独立项。
+
+### r7 — `onError` 的落点从宿主 console 改到 child 作用域 sink（#468）
+
+**问题**：§3.1 的 `onError` 第 2 条把「保持可观测」实现成
+`console.warn("[pi-legion] in-process child <name> extension error: ...")`。in-process 子会话与宿主
+**同进程同 TTY**，所以这句话直接印在用户输入框正上方。`#415` 只修了文义（「hook 被跳过」而不是
+「扩展坏了」），没修「往宿主终端写」这个动作 —— 对用户而言那行字依然是个无法处理的告警。
+
+**决定**：`onError`（以及 `session_shutdown` 发射、armed `dispose`、`defaultSessionFactory` 的
+扩展注册失败）一律改走 **child 作用域 sink**（`src/supervisor/child-diagnostics.ts`）：
+
+- 落盘 `<runDir>/diagnostics.log`：`<时间戳> child=<name> event=<event> real=<bool> reason=<单行>`；
+  诊断不丢，也不依赖宿主终端（`<runDir>` = transcript 所在目录，orchestrator 预建 `<runDir>/<name>.jsonl`）。
+- **默认零宿主输出**（既不走 console，也不是 `ui.notify` —— in-process 子会话没有 UI 上下文）。
+- `PI_LEGION_CHILD_DIAGNOSTICS=1` 才逐条回显（我们自己的排查开关）。已有两条事件与改前**逐字符**相同
+  （`turn_end hook skipped: …` / `extension error: …`）；另外三条（`session_shutdown failed` / `dispose failed` /
+  注册失败）此前是无 child 名的另一种写法，改名不改事实。超长原因会被压成单行并截断（400 字符上限），
+  这一项是刻意的，不承诺字节相等。
+- `real=true`（真扩展失败）在 **run 结束时一行汇总**，`flush()` 幂等：不是每条一弹。
+
+**签名**：`bindChildSessionExtensions(session, name?, sink?)` / `attachChildSessionRelease(session, timeoutMs?, sink?)`
+—— 与 r1 同策略的超集：省略 `sink` 时由 `session.sessionFile` 推导，冻结的调用形状不变。
+
+**不动的部分**：`bindings` 仍是 `{ mode: "print", onError }`；`onError` 依然必传、依然不吞异常
+（真失败仍然可见，只是换信道 + 汇总）；§3.1 其余各条不变。
