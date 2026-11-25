@@ -48,13 +48,33 @@ test("the shutdown cap fires in a process with nothing else pending", () => {
 /**
  * Same process, same question — but proving the module is importable without the
  * SDK, which is what keeps `test/unit` fast and portable.
+ *
+ * #468 narrowed this from "no import statement at all" to "no HOST import", and
+ * the difference matters: the child diagnostic sink has to be reachable from this
+ * module, and the sink (`./child-diagnostics.ts`) uses `node:fs` + `node:path`
+ * only. The invariant being protected is that importing `child-session.ts` never
+ * pulls `@earendil-works/pi-coding-agent` into every unit run — a static "zero
+ * imports" test never protected more than that, and it would now fail for a
+ * sibling module that loads no SDK at all.
  */
-test("child-session has no SDK import", async () => {
+test("child-session imports nothing but node builtins and its own siblings (no SDK)", async () => {
 	const request = fileURLToPath(new URL("../../src/supervisor/child-session.ts", import.meta.url));
 	const source = (await import("node:fs")).readFileSync(request, "utf8");
-	assert.equal(
-		/^\s*import\b/m.test(source),
-		false,
-		"child-session.ts must stay import-free (structural types only): a host import would load the SDK in every unit run",
+	const specifiers = [
+		...source.matchAll(/^\s*import\b[^;]*?from\s*["']([^"']+)["']/gm),
+		...source.matchAll(/^\s*import\s*["']([^"']+)["']/gm),
+	].map((match) => match[1]!);
+	for (const specifier of specifiers) {
+		assert.ok(
+			specifier.startsWith("node:") || specifier.startsWith("./"),
+			`child-session.ts may only import node builtins and siblings, found ${JSON.stringify(specifier)}`,
+		);
+	}
+	// The doc comments legitimately name the host package, so the check is on the
+	// SPECIFIERS only: a bare specifier is what would load it.
+	assert.deepEqual(
+		specifiers.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("./")),
+		[],
+		"child-session.ts must not import the HOST package: that would load the SDK in every unit run",
 	);
 });

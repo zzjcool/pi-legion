@@ -104,13 +104,12 @@ function sinkFor(
 		}
 		return registered;
 	}
+	const derived = childDiagnosticsLogFile(session.sessionFile);
 	const sink =
 		provided ??
 		createChildDiagnosticSink({
 			...(name ? { child: name } : {}),
-			...(childDiagnosticsLogFile(session.sessionFile) !== undefined
-				? { logFile: childDiagnosticsLogFile(session.sessionFile)! }
-				: {}),
+			...(derived === undefined ? {} : { logFile: derived }),
 		});
 	sessionSinks.set(session, sink);
 	return sink;
@@ -325,7 +324,11 @@ export function attachChildSessionRelease(
 	timeoutMs: number = SHUTDOWN_EMIT_TIMEOUT_MS,
 	sink?: ChildDiagnosticSink,
 ): void {
-	const diagnostics = sinkFor(session, undefined, sink);
+	// Resolved LAZILY, at each use: the wrapper is armed before the extensions are
+	// bound, so an eagerly derived sink would be the unnamed one and every record of
+	// a named child would lose its name. By dispose time the bind (if any) has
+	// registered the session's sink, and that one wins.
+	const diagnostics = () => sinkFor(session, undefined, sink);
 	const rawDispose = session.dispose?.bind(session);
 	let disposing = false;
 	session.dispose = async () => {
@@ -338,7 +341,7 @@ export function attachChildSessionRelease(
 			// `dispose()` is called fire-and-forget on some paths, so a throw here
 			// would surface as an unhandled rejection rather than a failed retire.
 			// Report it and let the retire finish.
-			diagnostics.record({
+			diagnostics().record({
 				event: "dispose.failed",
 				reason: describeExtensionError(error),
 				real: true,
@@ -348,7 +351,7 @@ export function attachChildSessionRelease(
 			// failure becomes visible to the host, as a single summary line (and only
 			// when one actually happened). `flush()` is idempotent, so a session with
 			// several dispose paths still reports once.
-			diagnostics.flush();
+			diagnostics().flush();
 		}
 	};
 }
