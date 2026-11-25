@@ -36,6 +36,7 @@ import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./chil
 import {
 	childDiagnosticsLogFile,
 	createChildDiagnosticSink,
+	flushOnFailure,
 } from "./child-diagnostics.ts";
 import { bindChildSessionExtensions, attachChildSessionRelease } from "./child-session.ts";
 import { DECODE_ARCHIVE_MAX, foldDecode, seedDecode, type DecodeClock } from "./decode-clock.ts";
@@ -810,10 +811,14 @@ async function defaultSessionFactory(
 		child: input.name,
 		...(diagnosticsLogFile === undefined ? {} : { logFile: diagnosticsLogFile }),
 	});
-	const modelRuntime = await ModelRuntime.create();
-	for (const diagnostic of await drainExtensionRegistrations(
-		resourceLoader,
-		modelRuntime,
+	// #468: a real failure recorded BEFORE the session exists has no `dispose()` to
+	// flush it — nothing below is armed yet, so if one of these steps throws, the run
+	// dies with the record on disk and the user never hears the one line they are owed
+	// (the pre-#468 code printed it immediately, so silence would be a regression on
+	// the issue's own terms). Every pre-session step goes through `flushOnFailure`.
+	const modelRuntime = await flushOnFailure(childDiagnostics, () => ModelRuntime.create());
+	for (const diagnostic of await flushOnFailure(childDiagnostics, () =>
+		drainExtensionRegistrations(resourceLoader, modelRuntime),
 	)) {
 		if (diagnostic.type === "error") {
 			// Non-fatal by design (same as the SDK): the spawn only fails if the
@@ -858,6 +863,9 @@ async function defaultSessionFactory(
 			modelRuntime,
 		});
 		if (resolved.error || !resolved.model) {
+			// #468: same rule — a recorded registration failure must not die with the spawn
+			// (this branch has no step to wrap, so it flushes directly).
+			childDiagnostics.flush();
 			throw new SubagentError(
 				`inprocess model resolve failed for '${plan.modelRef}'` +
 					(resolved.error ? `: ${resolved.error}` : ""),
@@ -880,7 +888,7 @@ async function defaultSessionFactory(
 		}
 	}
 
-	const { session } = await createAgentSession(createOptions);
+	const { session } = await flushOnFailure(childDiagnostics, () => createAgentSession(createOptions));
 	// `child-mcp-v1` D3 + r2 + r3, the only bind: `createAgentSession` does NOT emit
 	// `session_start` (`bindExtensions` is its sole emitter), so every
 	// `session_start` consumer — most visibly the MCP extension's
@@ -906,7 +914,7 @@ async function defaultSessionFactory(
 	// have reached the extensions (MCP included) and `spawnChild` only records the
 	// session AFTER this factory resolves — so its `rollbackSpawn` would have
 	// nothing to dispose. Dispose here (the armed release still emits) and rethrow.
-	attachChildSessionRelease(session, undefined, childDiagnostics);
+	attachChildSessionRelease(session, childDiagnostics);
 	if (childEnablesMcp(process.env)) {
 		try {
 			await bindChildSessionExtensions(session, input.name, childDiagnostics);

@@ -54,8 +54,16 @@ export type ChildDiagnosticEvent =
 
 /**
  * Host-facing label per event. Kept here (not at the call sites) so the live
- * echo keeps the exact wording the pre-#468 `console.warn` lines had — the text
- * itself was never the bug, the channel was.
+ * echo reads exactly as it did before #468 — the text itself was never the bug,
+ * the channel was.
+ *
+ * "Exactly as before" holds for the two events that existed then:
+ * `turn_end hook skipped: …` and `extension error: …`. The other three are new
+ * labels invented by this module (the pre-#468 lines were unprefixed
+ * `in-process child session_shutdown failed: …` / `dispose failed: …`, and the
+ * registration one was `inprocess child '<name>': …`). Byte equality is only
+ * claimed for the first two, and never for a cause longer than {@link oneLine}'s
+ * cap — that one is flattened and truncated on purpose.
  */
 const EVENT_LABELS: Record<ChildDiagnosticEvent, string> = {
 	"turn_end.skipped": "turn_end hook skipped",
@@ -124,19 +132,47 @@ export function childDiagnosticsLogFile(sessionFile: string | undefined): string
 	return path.join(dir, CHILD_DIAGNOSTICS_FILE);
 }
 
+/** Longest cause kept verbatim; the rest is elided (a host record is one line). */
+const REASON_MAX_CHARS = 400;
+
 /** Collapse a rendered cause to one line (host records are single-line by contract). */
-function oneLine(text: string, limit = 400): string {
+function oneLine(text: string): string {
 	const flat = text.replace(/\s*\r?\n\s*/g, " ").replace(/\s+/g, " ").trim();
-	return flat.length > limit ? `${flat.slice(0, limit - 1)}…` : flat;
+	return flat.length > REASON_MAX_CHARS ? `${flat.slice(0, REASON_MAX_CHARS - 1)}…` : flat;
 }
+
+/**
+ * The log's ceiling. A record can repeat every turn (`turn_end.skipped` does), so the
+ * file must not be able to grow without bound — same policy as the notice log
+ * (`notice-delivery.ts` `NOTICE_LOG_MAX_BYTES`), newer lines win.
+ */
+const DIAGNOSTICS_LOG_MAX_BYTES = 1024 * 1024;
 
 /** Append one line, best effort. A diagnostic must never break the teardown it describes. */
 function appendLine(file: string, line: string): void {
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		fs.appendFileSync(file, `${line}\n`, { encoding: "utf8" });
+		// 0600 like the sibling artifacts in the same run dir (the transcript is 0600
+		// too); a diagnostic is not more public than the run it describes.
+		fs.appendFileSync(file, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+		trimLog(file);
 	} catch {
 		// Losing the record on an unwritable run dir is not worth losing the run.
+	}
+}
+
+/** Keep the newest half once the cap is crossed. Best effort, like everything here. */
+function trimLog(file: string): void {
+	try {
+		if (fs.statSync(file).size <= DIAGNOSTICS_LOG_MAX_BYTES) return;
+		const kept = fs.readFileSync(file, "utf8").slice(-Math.floor(DIAGNOSTICS_LOG_MAX_BYTES / 2));
+		const atLineStart = kept.indexOf("\n");
+		fs.writeFileSync(file, atLineStart === -1 ? kept : kept.slice(atLineStart + 1), {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+	} catch {
+		// A cap that cannot be enforced must not fail the record it just wrote.
 	}
 }
 
@@ -158,7 +194,7 @@ class FileChildDiagnosticSink implements ChildDiagnosticSink {
 		this.clock = options.now ?? (() => new Date());
 	}
 
-	/** `in-process child <name>`, the prefix every host line has carried since #415. */
+	/** ` <name>`, or `""` for an unnamed child — the suffix of the host prefix. */
 	private get label(): string {
 		return this.child ? ` ${this.child}` : "";
 	}
@@ -206,4 +242,25 @@ class FileChildDiagnosticSink implements ChildDiagnosticSink {
 /** Build a sink. The only construction point, so the file layout has one owner. */
 export function createChildDiagnosticSink(options: ChildDiagnosticSinkOptions = {}): ChildDiagnosticSink {
 	return new FileChildDiagnosticSink(options);
+}
+
+/**
+ * Run a step; if it throws, flush the sink's run-end line before rethrowing.
+ *
+ * Why this exists: a real failure recorded BEFORE the child session exists
+ * (extension registration) has no `dispose()` to flush it — the armed release is
+ * installed later, and a spawn that dies in between would leave the one line the
+ * user is owed unwritten. Everything the factory does before it has a session
+ * goes through here, so "the run died" never means "the failure went silent".
+ */
+export async function flushOnFailure<T>(
+	sink: ChildDiagnosticSink,
+	step: () => Promise<T> | T,
+): Promise<T> {
+	try {
+		return await step();
+	} catch (error) {
+		sink.flush();
+		throw error;
+	}
 }

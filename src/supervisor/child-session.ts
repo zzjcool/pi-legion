@@ -63,10 +63,11 @@ export interface ChildSessionBinding {
 	 */
 	dispose?: () => void | Promise<void>;
 	/**
-	 * Public getter on `AgentSession` (`agent-session.d.ts:488`); `undefined` for an
-	 * in-memory session manager. Only used to derive `<runDir>/diagnostics.log`
-	 * (#468) — the transcript's directory IS the run directory, because the
-	 * orchestrator pre-creates `<runDir>/<name>.jsonl`.
+	 * Public getter on `AgentSession` (`agent-session.d.ts:488` in 1.6.0, `:476` in
+	 * 1.5.0 — `package.json` allows both); `undefined` for an in-memory session
+	 * manager. Only used to derive `<runDir>/diagnostics.log` (#468) — the
+	 * transcript's directory IS the run directory, because the orchestrator
+	 * pre-creates `<runDir>/<name>.jsonl`.
 	 */
 	sessionFile?: string | undefined;
 }
@@ -314,15 +315,16 @@ export async function releaseChildSessionExtensions(
  * is decided by {@link releaseChildSessionExtensions}, not by the caller.
  *
  * `timeoutMs` is forwarded to the release so D7.5 can pin the bound without a
- * one-second test (r4 F5); production never passes it.
+ * one-second test (r4 F5); production never passes it. `sink` (#468) comes before
+ * it because every production call passes a sink and none passes a timeout.
  *
  * Exported because `defaultSessionFactory` is not (contract §6 gap 1): without
  * this seam the five D7.5 assertions would have nothing to call.
  */
 export function attachChildSessionRelease(
 	session: ChildSessionBinding,
-	timeoutMs: number = SHUTDOWN_EMIT_TIMEOUT_MS,
 	sink?: ChildDiagnosticSink,
+	timeoutMs: number = SHUTDOWN_EMIT_TIMEOUT_MS,
 ): void {
 	// Resolved LAZILY, at each use: the wrapper is armed before the extensions are
 	// bound, so an eagerly derived sink would be the unnamed one and every record of

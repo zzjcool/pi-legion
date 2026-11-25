@@ -343,7 +343,7 @@ test("D7.5 a throwing shutdown handler still gets disposed, and is reported once
 	const { session, order } = fakeSession({ emitThrows: true });
 	const { sink, host, log } = testSink({ child: "root.scout" });
 	await bindChildSessionExtensions(session, undefined, sink);
-	attachChildSessionRelease(session, undefined, sink);
+	attachChildSessionRelease(session, sink);
 
 	await captureWarnings(async (warnings) => {
 		session.dispose?.();
@@ -356,6 +356,43 @@ test("D7.5 a throwing shutdown handler still gets disposed, and is reported once
 	// The failure is real, so the host gets it — as ONE line, at run end.
 	assert.equal(host.length, 1, "one summary line, not one per event");
 	assert.match(host[0]!, /^\[pi-legion\] in-process child root\.scout: 1 extension error this run — first: session_shutdown failed: Error: shutdown handler exploded/);
+});
+
+test("#468: the sink is resolved at dispose, so a session armed BEFORE the bind still reports its name", async () => {
+	// `defaultSessionFactory` arms the release before it binds the extensions. If the
+	// sink were derived eagerly at arm time it would be the unnamed one, and every
+	// record of a named child would lose its name — the summary line would say
+	// `in-process child: …` instead of `in-process child hygiene-doctor: …`.
+	const { session } = fakeSession({ emitThrows: true });
+	attachChildSessionRelease(session);
+	await bindChildSessionExtensions(session, "hygiene-doctor");
+
+	const host = await captureWarnings(async (warnings) => {
+		session.dispose?.();
+		await settle();
+		assert.equal(warnings.length, 1, "one summary line, and it is the only host output");
+		assert.match(warnings[0]!, /^\[pi-legion\] in-process child hygiene-doctor: 1 extension error this run/);
+	});
+	assert.equal(host.length, 1);
+});
+
+test("#468: a second sink handed to the bind WINS, and the first one is flushed (no lost failure)", async () => {
+	// The production factory passes ONE sink to both calls, so this arm is only
+	// reachable from a caller that mixes them — but silently dropping either sink's
+	// real failures would be the bug this file exists to prevent.
+	const { session } = fakeSession();
+	const armed = testSink({ child: "hygiene-doctor" });
+	const bound = testSink({ child: "hygiene-doctor" });
+	armed.sink.record({ event: "extension.error", reason: "recorded before the bind", real: true });
+
+	attachChildSessionRelease(session, armed.sink);
+	await bindChildSessionExtensions(session, "hygiene-doctor", bound.sink);
+	session.dispose?.();
+	await settle();
+
+	assert.equal(armed.host.length, 1, "the replaced sink is flushed, not dropped");
+	assert.match(armed.host[0]!, /first: extension error: recorded before the bind/);
+	assert.equal(bound.host.length, 0, "the surviving sink had nothing real to report");
 });
 
 test("D7.5 repeated dispose() emits once (idempotent)", async () => {
@@ -450,7 +487,7 @@ test("D7.5 a wedged handler cannot hold the session: dispose still runs (r4 F5)"
 			order.push("dispose");
 		},
 	};
-	attachChildSessionRelease(session, 10);
+	attachChildSessionRelease(session, undefined, 10);
 	await bindChildSessionExtensions(session);
 
 	const startedAt = Date.now();
@@ -471,5 +508,29 @@ test("r3 C1 wiring: the factory arms the release exactly once (format tripwire)"
 		source.split("attachChildSessionRelease(").length - 1,
 		1,
 		"format tripwire: the factory file calls attachChildSessionRelease( once",
+	);
+});
+
+test("#468 wiring: extension registration failures are RECORDED, never printed (format tripwire)", () => {
+	// `defaultSessionFactory` is not exported, so this is the same kind of tripwire as
+	// the two above: it cannot prove the call works, only that the pre-#468
+	// `console.warn("… inprocess child '<name>': …")` did not come back and that the
+	// real failure still reaches the sink (deleting the `record()` leaves every other
+	// test green, which is exactly the hole this closes).
+	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
+	assert.equal(
+		source.split('event: "extension.registration.error"').length - 1,
+		1,
+		"the registration failure is recorded exactly once",
+	);
+	assert.equal(
+		source.includes("inprocess child '"),
+		false,
+		"the per-registration host line must not come back (#468)",
+	);
+	assert.equal(
+		source.split("real: true").length - 1 >= 1,
+		true,
+		"and it is a REAL failure, so the run-end summary carries it",
 	);
 });

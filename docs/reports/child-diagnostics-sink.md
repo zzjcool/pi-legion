@@ -1,7 +1,7 @@
 # in-process child 的诊断不该出现在用户输入框上方（#468）
 
 状态：**已修复**（2026-11-25；PR #469，分支 `pi-subagent/pi-legion-468-sink2-62762cd6`，基线 `origin/master` `4eb74b5` = 6.2.13）
-门禁：`npm run typecheck` exit 0；`npm test` 3015 tests / 2980 pass / **14 fail（与基线逐条同名，全是本机 mac 既存红）**；
+门禁：`npm run typecheck` exit 0；`npm test` 3019 tests / 2984 pass / **14 fail（与基线逐条同名，全是本机 mac 既存红）**；
 `npm run test:integration` 221 / 209 pass / **12 fail（与基线逐条同名同因，见 §7）**。
 
 ---
@@ -42,7 +42,7 @@
 
 | 文件 | 是什么 |
 |---|---|
-| **`src/supervisor/child-diagnostics.ts`（新）** | `createChildDiagnosticSink()` 唯一构造点；`CHILD_DIAGNOSTICS_ENV`、`CHILD_DIAGNOSTICS_FILE`、`childDiagnosticsLogFile()` |
+| **`src/supervisor/child-diagnostics.ts`（新）** | `createChildDiagnosticSink()` 唯一构造点；`CHILD_DIAGNOSTICS_ENV`、`CHILD_DIAGNOSTICS_FILE`、`childDiagnosticsLogFile()`、`flushOnFailure()`（spawn 中途死掉时也把欠宿主的那行写出来） |
 | `src/supervisor/child-session.ts` | `bindChildSessionExtensions(session, name?, sink?)` / `releaseChildSessionExtensions` / `attachChildSessionRelease(session, timeoutMs?, sink?)`；四个 `console.warn` 全部改走 sink；**sink 按 session 存 WeakMap，取用时才解析**（armed dispose 在 bind 之前，提前解析会丢掉 child 名） |
 | `src/supervisor/inprocess-supervisor.ts`（`defaultSessionFactory`） | **一次 child run 一个 sink**，由 `input.sessionFile` 推导 `<runDir>`；扩展**注册**失败记 `real`，与运行期失败汇总到同一行 |
 
@@ -95,6 +95,11 @@
 **对照组（开关打开）**：宿主重新拿到那 **217 字节**、逐字符与修前相同 —— 开关只决定「上不上屏」，不改变文案，
 也不改变落盘。**这条同时证明**：修后默认的 0 字节不是把诊断丢了，而是换了信道。
 
+> 字节相等只对**原本已存在的那两条**事件成立（`turn_end hook skipped: …` / `extension error: …`）。
+> `session_shutdown failed` / `dispose failed` 此前是不带 child 名的另一种写法，注册失败此前是
+> `inprocess child '<name>': …`；它们现在统一成 `in-process child <name> <label>: …`。另外，超过 400 字符的
+> 原因会被压成单行并截断 —— 这是刻意的，不承诺字节相等。
+
 **真扩展错误（默认，不逐条）**，宿主只收到这一行：
 
 ```
@@ -123,16 +128,19 @@
 
 ## 5. 测试
 
-- **`test/unit/child-diagnostics.test.ts`（新，9 条）**：默认零宿主字节 + 落盘格式 / 开关对照组（含开关解析表：
+- **`test/unit/child-diagnostics.test.ts`（新，10 条）**：`flushOnFailure`（成功不发声 / 失败先 flush 再原样抛 / 不重复）/ 默认零宿主字节 + 落盘格式 / 开关对照组（含开关解析表：
   `1|true|on|yes` 才算开）/ 真错误只汇总一次（3 条 → 1 行，且幂等）/ 单数措辞 / 多行原因压成一行 /
   无 logFile 的内存模式 / **写盘失败与宿主写失败的 `doesNotThrow`**（诊断绝不能把 dispose 弄挂）/
   `<runDir>` 推导（`<runDir>/<name>.jsonl` → `<runDir>/diagnostics.log`，`in-memory` 不瞎编路径）。
 - **`test/unit/child-session.test.ts`**：5 条按新契约改写（原来断言 `console.warn` 的那几句正是 bug 本身），
-  现在断言「宿主 0 行 + 磁盘有记录」「真错误 run 结束一行」。
+  现在断言「宿主 0 行 + 磁盘有记录」「真错误 run 结束一行」；另加 3 条：延迟解析仍带 child 名、换 sink 时旧 sink 先 flush、
+  以及「注册失败被记录、旧 warn 文案不许回来」的 format tripwire。
 - **`test/unit/child-session-timer.test.ts`**：`child-session.ts` 的 tripwire 从「**零 import**」收窄为
   「**不许 import 宿主包**（只允许 `node:` 与 `./`）」。**这是被迫的、也是有意的收窄**：sink 必须在
   `child-session.ts` 里可达，而 sink 只依赖 `node:fs` / `node:path`；该 tripwire 保护的是「unit 跑起来不加载
-  SDK」，不是「一条 import 都不许有」。注释里写明了这件事。
+  SDK」，不是「一条 import 都不许有」。收窄后又按 review 补强：**扫 `child-session.ts` 与 `child-diagnostics.ts`
+  两个文件**（真正碰 `node:fs` 的那个就在这条路线上），并覆盖 `import … from` / `export … from` /
+  `await import()` / `require()` 四种 specifier 形式，另有一条自检确保检测器本身看得见这四种。
 
 ### 变异（验收第 6 条：把 sink 改回原样 → 验收 1 红）
 
@@ -182,4 +190,30 @@
   汇总从 `child-session.ts` 一路穿到 orchestrator 的 notify 通道 —— 那是另一件事，本 issue 只修「别弹在输入框上方」。
 - `PI_LEGION_PHASES` 解析失败仍走 `console.warn`（§4 已说明理由）。
 - 夹具在 `/tmp/i468/`（与 #466 的 `/tmp/issue466/` 同惯例，未入库）：`accept.mjs` + 变异的 `/tmp/i468-mutant{,2}/`。
-- 边缘：若 spawn 在验收前就失败（例如 model 解析失败），注册失败只落盘、不发 run 结束汇总 —— 那时用户已经拿到 spawn 失败的原因，磁盘记录仍在。
+- spawn 在验收前就失败（例如 model 解析失败、`createAgentSession` 抛错）：注册失败**仍然**会发出 run 结束那一行 ——
+  pre-session 的每一步都走 `flushOnFailure`，因为没有 `dispose()` 可以兜底（review finding #1）。
+
+---
+
+## 9. fresh-context 对抗式 review（只读 scout，独立会话）
+
+0 blocker / 1 major / 5 minor / 6 nit。逐条处置：
+
+| # | 级别 | 问题 | 处置 |
+|---|---|---|---|
+| 1 | major | spawn 在 `record(注册失败)` 之后、armed release 之前就死掉（`model resolve failed` / `createAgentSession` 抛错）→ 没人 `flush()`，真失败只剩磁盘 | **修**：抽出可测的 `flushOnFailure(sink, step)`（`child-diagnostics.ts`，含单测），pre-session 每一步都走它；model-resolve 的 `throw` 前直接 `flush()`（原来基线是立刻打印的，静默会是回归） |
+| 2 | minor | tripwire 收窄后只认 `import … from`，且只扫 `child-session.ts`：`export … from` / `await import()` / `require()` 都能绕过；真正碰 `node:fs` 的 `child-diagnostics.ts` 反而没被扫 | **修**：扫两个文件 + 覆盖四种 specifier 形式，并自检检测器本身 |
+| 3 | minor | 「文案与修前逐字符相同」只对 2/5 事件成立；超长原因会被截断 | **修**：模块注释、契约 r7、本报告 §3 全部改成限定表述 |
+| 4 | minor | WeakMap 的两个分支（换 sink、延迟解析）没测试覆盖，延迟解析的理由没钉住 | **修**：加两条用例（armed-before-bind 仍带 child 名；换 sink 时旧 sink 先 flush） |
+| 5 | minor | 工厂里 `record(注册失败)` 删掉整套测试仍全绿（`defaultSessionFactory` 不导出） | **修**：加同族 format tripwire（`extension.registration.error` 恰好一次 + 旧 warn 文案不许回来） |
+| 6 | minor | `diagnostics.log` 建成 0644，同目录 transcript 是 0600 | **修**：`mode: 0o600` |
+| 7 | nit | `label` getter 的 JSDoc 写错（写成整个前缀） | 修 |
+| 8 | nit | `agent-session.d.ts:488` 的引用在 1.5.0 上是 476（`package.json` 允许 `^1.5.0`） | 修：两个版本号都写上 |
+| 9 | nit | 与 `notice-delivery.ts` 的 `appendNoticeLog`/`clamp` 重复；且没有上限（`turn_end.skipped` 可以每轮一条） | 部分修：保留 6 行独立写法（跨子系统耦合不划算），但**补 1 MiB 上限**（超过就保留后半段），与 notice log 同策略 |
+| 10 | nit | `attachChildSessionRelease(session, undefined, sink)` 的位置参数占位 | 修：参数改成 `(session, sink?, timeoutMs?)` —— 生产调用全都传 sink、从不传 timeout |
+| 11 | nit | `records` 只有一个测试用；`oneLine` 的 `limit` 参数没人传 | 修 `limit`（改成模块常量）；`records` 保留（无 logFile 时的唯一可读面） |
+| 12 | nit | `docs/inprocess-supervisor.md` 仍写旧签名；README 的 knob 表没有 `PI_LEGION_CHILD_DIAGNOSTICS` | 修：两处都补上 |
+
+reviewer 另外独立复核过：默认零宿主字节确实被 `host.length === 0` 钉住（不只是 `hostWrite` seam）、「一行」是真的
+（三条 real → `host.length === 1`、flush 两次仍 1、汇总里没有 `\n`）、每条有 session 的退休路径都会 flush、
+`/tmp/i468/evidence/*.json` 的字节数与正文一致（217 字节逐字节重算过）、测试数算术 3006 → 3015 对得上。

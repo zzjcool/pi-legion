@@ -556,7 +556,10 @@ MCP 工具级拦截。要做就等于回到选项 B，需要单独立项。
 - 落盘 `<runDir>/diagnostics.log`：`<时间戳> child=<name> event=<event> real=<bool> reason=<单行>`；
   诊断不丢，也不依赖宿主终端（`<runDir>` = transcript 所在目录，orchestrator 预建 `<runDir>/<name>.jsonl`）。
 - **默认零宿主输出**（既不走 console，也不是 `ui.notify` —— in-process 子会话没有 UI 上下文）。
-- `PI_LEGION_CHILD_DIAGNOSTICS=1` 才逐条回显，文案与改前逐字符相同（我们自己的排查开关）。
+- `PI_LEGION_CHILD_DIAGNOSTICS=1` 才逐条回显（我们自己的排查开关）。已有两条事件与改前**逐字符**相同
+  （`turn_end hook skipped: …` / `extension error: …`）；另外三条（`session_shutdown failed` / `dispose failed` /
+  注册失败）此前是无 child 名的另一种写法，改名不改事实。超长原因会被压成单行并截断（400 字符上限），
+  这一项是刻意的，不承诺字节相等。
 - `real=true`（真扩展失败）在 **run 结束时一行汇总**，`flush()` 幂等：不是每条一弹。
 
 **签名**：`bindChildSessionExtensions(session, name?, sink?)` / `attachChildSessionRelease(session, timeoutMs?, sink?)`

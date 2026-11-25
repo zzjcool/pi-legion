@@ -27,6 +27,7 @@ import {
 	childDiagnosticsEnabled,
 	childDiagnosticsLogFile,
 	createChildDiagnosticSink,
+	flushOnFailure,
 } from "../../src/supervisor/child-diagnostics.ts";
 
 /** A throwaway run dir plus a captured host channel. */
@@ -197,4 +198,31 @@ test("#468: <runDir> is the transcript's directory — both transports land in i
 	assert.equal(childDiagnosticsLogFile("   "), undefined);
 	// A bare filename has no run directory to write into.
 	assert.equal(childDiagnosticsLogFile("child.jsonl"), undefined);
+});
+
+test("#468: a spawn that dies before the session exists still owes the host its one line", async () => {
+	// The factory records extension-registration failures BEFORE it has a session, so
+	// there is no armed `dispose()` to flush them. `flushOnFailure` is what keeps
+	// "the spawn died" from meaning "the failure went silent" (review finding #1).
+	const fixture = runDirFixture();
+	const sink = createChildDiagnosticSink({ child: "u2-automation", logFile: fixture.logFile, hostWrite: fixture.hostWrite });
+	sink.record({ event: "extension.registration.error", reason: "provider 'x' did not register", real: true });
+
+	// The step succeeds → the run is still going, so the host hears nothing yet.
+	assert.equal(await flushOnFailure(sink, () => "ok"), "ok");
+	assert.deepEqual(fixture.host, [], "no line while the run is alive");
+
+	const next = createChildDiagnosticSink({ child: "u2-automation", logFile: fixture.logFile, hostWrite: fixture.hostWrite });
+	next.record({ event: "extension.registration.error", reason: "provider 'x' did not register", real: true });
+	await assert.rejects(
+		() => flushOnFailure(next, () => { throw new Error("createAgentSession exploded"); }),
+		/createAgentSession exploded/,
+		"the original failure propagates untouched",
+	);
+	assert.equal(fixture.host.length, 1, "and the owed line is written exactly once before it does");
+	assert.match(fixture.host[0]!, /in-process child u2-automation: 1 extension error this run — first: extension registration error: provider 'x' did not register/);
+
+	// A second flush (e.g. a later dispose) must not double-report.
+	next.flush();
+	assert.equal(fixture.host.length, 1);
 });

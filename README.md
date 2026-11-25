@@ -553,6 +553,7 @@ another process's worth of memory.
 | `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` | Same as `inheritExtensions: false`, for every child. `1` forces inheritance back on. |
 | `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra paths every child loads explicitly. |
 | `PI_LEGION_CHILD_MCP=0` | **No MCP in children.** Neither `builtin:mcp` nor `builtin:tool-search` is loaded, so no child opens an MCP connection. `0`/`false`/`off`/`no`/`none` disable it; anything else (including unset) leaves MCP on. |
+| `PI_LEGION_CHILD_DIAGNOSTICS=1` | **Echo in-process children's diagnostics to the host console.** Off by default: they are written to `<runDir>/diagnostics.log` only, because an in-process child shares the host's TTY and a warn line lands above the user's input box (#468). Real extension failures still surface — as ONE summary line per child run |
 
 The child-guard is appended unconditionally and is not subject to either knob —
 a child without it breaks the prompt/format contract no matter what the card
