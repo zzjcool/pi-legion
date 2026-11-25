@@ -9,6 +9,22 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [6.2.14] — 2026-11-24
+
+**一句话：in-process child 的诊断不再写进你的输入框上方 —— 它落到 `<runDir>/diagnostics.log`，要看时能查，不要看时不打扰。**
+
+- **`#468` PR #469。** 现象：用户输入框上方出现 `[pi-legion] in-process child … turn_end hook skipped: …`。
+  查明不是 UI notify（宿主交互模式不接管 stdout/stderr，`UIProxy.notify` 只服务 rpc child），
+  而是 `console.warn` 与宿主同进程同 TTY，编辑器占屏幕最后一块，于是正好落在输入框上方。
+  - **新增 child 作用域 sink**（`src/supervisor/child-diagnostics.ts`）：`<runDir>/diagnostics.log`，
+    一次 child run 一个文件，带时间戳/事件/原因；`bindChildSessionExtensions` 的 `onError`、
+    `session_shutdown`、armed `dispose`、`inprocess-supervisor` 的扩展注册失败全部改道。
+  - **默认零宿主输出**：实测（真宿主 + 真 pi-async，`dispose()` 落在一轮中）修前宿主 217 字节、
+    修后 0 字节（3/3），同一次运行诊断日志里有 `event=turn_end.skipped real=false`。
+  - **`PI_LEGION_CHILD_DIAGNOSTICS=1`** 才逐条回显（逐字符复现修前那 217 字节，证明只是换了通道、没丢信息）。
+  - **真扩展错误仍然可见**，但改成 run 结束一行汇总（含 `details:` 路径），不再逐条弹。
+  - 已知边界：`PI_LEGION_PHASES` 解析失败仍走 `console.warn`（启动期配置错误，用户必须当场知道）。
+
 ## [6.2.13] — 2026-11-24
 
 **一句话：`status` 与 `stop` 对同一条记录必须给出一致的答案 —— 已经交付完的 in-process child 不再在重启后复活成 `working`，没人持有的行显示为 `unreachable (no supervisor)` 且仍能 stop 结算。**
