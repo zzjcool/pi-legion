@@ -199,6 +199,19 @@ test("previewOutput truncates long text", () => {
 	assert.equal(previewOutput("   "), "(no output)");
 });
 
+test("the preview budget is bytes, so a CJK result cannot ship 3x the promised text", () => {
+	// The budget used to be 4 000 CHARACTERS while the truncation line reported UTF-8
+	// bytes. A Chinese report (3 bytes/char) therefore pushed ~12 KB through a "4 KB"
+	// budget — the same text the parent already had from the collect snapshot.
+	const cjk = "测".repeat(2_000); // 2 000 chars, 6 000 bytes
+	const preview = previewOutput(cjk, 300);
+	const head = preview.slice(0, preview.indexOf("\n…(preview truncated"));
+	assert.equal(Buffer.byteLength(head, "utf8"), 300, "the head is exactly the byte budget");
+	assert.doesNotMatch(head, /\uFFFD/, "a byte cut must not split a code point");
+	// ASCII keeps byte-for-byte the old behaviour (1 byte == 1 char).
+	assert.equal(previewOutput("x".repeat(100), 100), "x".repeat(100));
+});
+
 test("previewOutput names the session file when hinted", () => {
 	const long = "x".repeat(5000);
 	const preview = previewOutput(long, 100, { sessionFile: "/runs/r1/w1.jsonl" });

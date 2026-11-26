@@ -327,8 +327,12 @@ test("#450 C/D: status reads every store, marks foreign rows, and never merges t
 			const blocks = status.text.split("\n\n");
 			assert.equal(blocks[0], "Status · 3 live children");
 			assert.doesNotMatch(blocks[1] ?? "", /^store=/m, "the session store's child grows no line");
-			assert.match(blocks[2] ?? "", /^store=~\/code\/anotify$/m);
-			assert.match(blocks[3] ?? "", /^store=~\/code\/anotify$/m);
+			assert.match(
+				blocks[2] ?? "",
+				/^store=~\/code\/anotify · r-anotify · \d+d old$/m,
+				"a foreign row names the run and its age: a bare label could not tell 'mine' from 'a neighbour's stale row'",
+			);
+			assert.match(blocks[3] ?? "", /^store=~\/code\/anotify · r-anotify · \d+d old$/m);
 			assert.match(blocks[2] ?? "", /agent=centurion/, "the foreign store's own record is what is rendered");
 
 			// `all` keeps the SESSION store's history (a foreign repository's past is not a
@@ -344,6 +348,9 @@ test("#450 C/D: status reads every store, marks foreign rows, and never merges t
 			assert.equal(named.details?.error, undefined, named.text);
 			assert.doesNotMatch(named.text, /Status ·/, "one child, not an overview");
 			assert.match(named.text, /cent-0 — state=working/);
+			// Named status resolves the run itself (`resolved: … from run <runId>`), so its
+			// `store=` line stays the bare label; the run+age belong to the overview, where a
+			// same-named foreign row could otherwise pass for one of this session's own.
 			assert.match(named.text, /^store=~\/code\/anotify$/m);
 			// ...and a name that IS in the session store keeps its unmarked block.
 			const own = await harness.invoke({ action: "status", name: "worker-0" });
@@ -385,7 +392,7 @@ test("#450 E: `status` sweeps every store's live children and marks a foreign ro
 			const overview = (await harness.invoke({ action: "status" })).text;
 			assert.match(overview, /^Status · 2 live children/, "every store's live children are counted");
 			assert.match(overview, /cent-0 — state=working/);
-			assert.match(overview, /^store=~\/code\/anotify$/m, "a foreign row carries its store");
+			assert.match(overview, /^store=~\/code\/anotify · r-anotify · \d+d old$/m, "a foreign row carries its store, its run and its age");
 			assert.doesNotMatch(
 				overview.split("\n\n")[1] ?? "",
 				/^store=/m,

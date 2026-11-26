@@ -1200,10 +1200,11 @@ export const FINISHED_CACHE_MAX_OUTPUT_BYTES = 1024 * 1024;
  */
 export const FINISHED_CACHE_MAX_ENTRY_BYTES = 8 * 1024;
 /**
- * Text a stripped entry keeps. Matches `PREVIEW_CHARS` in notify.ts (duplicated
- * for the same reason as `DEFAULT_ORPHAN_STALE_MS`: the runtime must not import
- * the formatter's internals) so a notice rendered from a cached hit is still
- * whole. 4000 chars is ≤ 8KB even at 2 bytes/char — the entry cap above.
+ * Text a stripped entry keeps. Covers `PREVIEW_BYTES` in notify.ts (4 000 UTF-8
+ * bytes, duplicated for the same reason as `DEFAULT_ORPHAN_STALE_MS`: the runtime
+ * must not import the formatter's internals) so a notice rendered from a cached hit
+ * is still whole: 4 000 bytes is at most 4 000 characters, and the entry cap above
+ * is 8 KB.
  */
 export const FINISHED_OUTPUT_HEAD_CHARS = 4_000;
 

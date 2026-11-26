@@ -247,7 +247,15 @@ export function formatNoticeHeadline(details: CompletionDetails): string {
 	return `${glyph} ${label} · ${bits.join(" · ")}`;
 }
 
-const PREVIEW_CHARS = 4_000;
+/**
+ * The preview budget, in UTF-8 **bytes**.
+ *
+ * It used to be 4 000 *characters* while the truncation line reports bytes, so a CJK
+ * result (3 bytes/char) shipped a ~12 KB preview through a "4 KB" budget — the exact
+ * text the parent had already read in the collect snapshot. A byte budget is the number
+ * the reader is promised, and ASCII behaviour is unchanged (1 byte == 1 char).
+ */
+const PREVIEW_BYTES = 4_000;
 
 /**
  * P5c (`result-ledger-v1` §3 D9): the tool the notice names as the one-step recovery
@@ -358,10 +366,21 @@ export function completionStatusOf(
 
 export function previewOutput(
 	text: string,
-	max = PREVIEW_CHARS,
+	max = PREVIEW_BYTES,
 	hints?: PreviewHints,
 ): string {
 	return buildPreview(text, max, hints).text;
+}
+
+/**
+ * `head` bytes of `text` that never split a code point.
+ *
+ * Buffer#toString replaces a trailing partial sequence with U+FFFD; dropping those
+ * keeps the preview printable and makes `headBytes` agree with the characters shown.
+ */
+function utf8Head(text: string, head: number): string {
+	const buffer = Buffer.from(text, "utf8");
+	return buffer.subarray(0, head).toString("utf8").replace(/\uFFFD+$/u, "");
 }
 
 /**
@@ -379,10 +398,10 @@ function buildPreview(
 ): { text: string; headBytes: number; totalBytes: number } {
 	const trimmed = text.trim() || "(no output)";
 	const totalBytes = Buffer.byteLength(trimmed, "utf8");
-	if (trimmed.length <= max) {
+	if (totalBytes <= max) {
 		return { text: trimmed, headBytes: totalBytes, totalBytes };
 	}
-	const head = trimmed.slice(0, max);
+	const head = utf8Head(trimmed, max);
 	// The preview is a hook, not the payload: name the recovery move so the
 	// parent model does not re-derive it (or, worse, re-launch a search that
 	// already finished — a duplicate child for a result already on disk).
@@ -503,7 +522,7 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 	// stays a path: it is a diagnostic pointer, not an artifact.
 	if (input.artifactId || input.outputFile) previewHints.artifact = true;
 	else if (input.sessionFile) previewHints.sessionFile = input.sessionFile;
-	const previewParts = buildPreview(input.output, PREVIEW_CHARS, previewHints);
+	const previewParts = buildPreview(input.output, PREVIEW_BYTES, previewHints);
 	const preview = previewParts.text;
 	// D9/P5c: state the preview's size beside the preview, in the body itself — the
 	// place that is visible whether the TUI folds the notice to one row or shows the
@@ -622,7 +641,7 @@ export interface GroupedCompletionInput {
  *
  *   Background tasks completed (2 of 3):
  *   - worker-0 (worker): completed — acceptance: accepted (attested)
- *     <previewOutput, per-entry cap max(500, PREVIEW_CHARS/entries.length)>
+ *     <previewOutput, per-entry cap max(500, PREVIEW_BYTES/entries.length)>
  *   - reviewer-1: failed (model error)
  *   Still running: slow-2
  *
@@ -639,7 +658,7 @@ export function formatGroupedNotice(
 	const stillRunning = input.stillRunning ?? [];
 	const perEntryMax = Math.max(
 		500,
-		Math.floor(PREVIEW_CHARS / Math.max(1, entries.length)),
+		Math.floor(PREVIEW_BYTES / Math.max(1, entries.length)),
 	);
 	const header =
 		stillRunning.length > 0

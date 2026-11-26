@@ -167,3 +167,19 @@ test("the scout-guard nag points recon at vexillatio (runtime teaching surface)"
 		`recon must not be described as a bare subagent dispatch: ${reminder}`,
 	);
 });
+
+test("the parentContext convention file carries the four-part task card (D4-plus)", () => {
+	// The shipped convention file is what README tells people to copy into
+	// `subagents.parentContext`, i.e. into a real system prompt. A rewrite dropped the
+	// "paste the settled facts and mark them confirmed" rule while keeping the rest, and
+	// nothing failed: the model then re-derived every fact in a fresh child (measured —
+	// three scouts re-running one probe). Pin the GUIDANCE, not just the call shape, so
+	// deleting it cannot scan green.
+	const file = readFileSync(path.join(REPO_ROOT, "examples/subagents-parent-context.md"), "utf8");
+	assert.match(file, /已确认，禁止重新侦察/, "handed-over facts must be marked settled");
+	assert.match(file, /你的专属取证面/, "a card must own its surface");
+	assert.match(file, /以下命令归别人/, "a card must name the probes another child owns");
+	assert.match(file, /纠错用 steer/, "a wrong conclusion is corrected, not re-dispatched");
+	assert.match(file, /负面结论要举证/, "a negative claim must show its probe matrix");
+	assert.match(file, /待验证/, "an unprobed negative claim degrades to pending");
+});
