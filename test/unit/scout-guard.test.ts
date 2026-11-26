@@ -21,7 +21,9 @@ import {
 	type ScoutToolKind,
 } from "../../src/extension/scout-guard.ts";
 
-const REMINDER_8 = "连续 8 次文件类调用且未派发 subagent——若这是侦察工作，请停下来拆 scout（规则：侦察必须并行）。";
+// `dispatch-boundary-v1` D4: recon dispatch is `vexillatio`'s, so the nag names BOTH tools
+// that clear the streak and points the scout dispatch at `vexillatio`.
+const REMINDER_8 = "连续 8 次文件类调用且未派发子 agent（subagent / vexillatio）——若这是侦察工作，请停下来用 vexillatio 并行拆 scout（规则：侦察必须并行）。";
 
 test("settings: scoutGuard parses, rejects bad values, and project overrides field-wise", () => {
 	assert.equal(parseSubagentSettings({ subagents: {} }, "/s.json").scoutGuard, undefined);

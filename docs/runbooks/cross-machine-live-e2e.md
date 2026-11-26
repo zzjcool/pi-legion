@@ -219,7 +219,12 @@ npm run test:live -- --test-name-pattern='S5\.'
 ```ts
 // 同一台机器、不同项目
 subagent({ host: "vps", cwd: "/srv/app-a", agent: "worker", task: "…" })
-subagent({ host: "vps", cwd: "/srv/app-b", agent: "scout", task: "…" })
+subagent({ host: "vps", cwd: "/srv/app-b", agent: "worker", task: "…" })
+
+// 侦察不要跨机：utility 是 in-process 硬叶子，utilityDispatch + host 会被产品拒掉
+// （`cannot carry a utility dispatch: read-only helpers run in-process`）。
+// 本机侦察就是普通的一枪；那台机器上确实需要 scout，就让在那边跑的 centurion 自己派。
+vexillatio({ task: "…", agent: "scout" })
 ```
 
 `node` / `piCli` / `piLegionRoot` / provider 扩展由一次 `machine.exec` 探测自动发现

@@ -51,7 +51,7 @@ const multiSpawnScript: MockScript = {
 			name: "spawn",
 			then: {
 				type: "tool_call",
-				name: "subagent",
+				name: "vexillatio",
 				arguments: {
 					agent: "scout",
 					task: 'Reply SCOUT_OK. End with {"ok": true, "reason": "SCOUT_OK"}.',
@@ -110,13 +110,15 @@ test("e2e mock-llm: spawn tool call + railway lockstep scroll + shared spawn con
 		assert.equal(models.providers.mock.apiKey, "mock");
 		assert.equal(models.providers.mock.baseUrl, mock.baseUrl);
 
-		// --- mock LLM: parent turn issues subagent, then settles after tool result ---
+		// --- mock LLM: parent turn issues vexillatio, then settles after tool result ---
 		const first = await chat(mock.baseUrl, [
 			{ role: "user", content: "Spawn scouts in parallel to survey the repo." },
 		]);
 		assert.equal(first.choices[0]?.finish_reason, "tool_calls");
 		const tool = first.choices[0]?.message.tool_calls?.[0];
-		assert.equal(tool?.function.name, "subagent");
+		// dispatch-boundary-v1 D1: read-only recon is `vexillatio`'s — a fixture that
+		// still taught `subagent` would be teaching a call the tool now refuses.
+		assert.equal(tool?.function.name, "vexillatio");
 		assert.match(tool?.function.arguments ?? "", /"agent"\s*:\s*"scout"/);
 
 		const second = await chat(mock.baseUrl, [
@@ -207,7 +209,7 @@ test("e2e mock-llm: built-in spawn-scout scenario then settle", async () => {
 	const mock = await startMockLlm({ scenario: "spawn-scout", port: 0 });
 	try {
 		const first = await chat(mock.baseUrl, [{ role: "user", content: "please spawn a scout" }]);
-		assert.equal(first.choices[0]?.message.tool_calls?.[0]?.function.name, "subagent");
+		assert.equal(first.choices[0]?.message.tool_calls?.[0]?.function.name, "vexillatio");
 		const second = await chat(mock.baseUrl, [
 			{ role: "user", content: "please spawn a scout" },
 			{ role: "assistant", content: null, tool_calls: first.choices[0]?.message.tool_calls },

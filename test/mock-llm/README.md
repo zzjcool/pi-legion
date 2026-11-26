@@ -82,7 +82,7 @@ Then `settings.json`: `"defaultProvider": "mock"`, `"defaultModel": "flash"`.
 | --- | --- |
 | `echo` (default) | Reply `MOCK_OK`; after tool results echo tool content |
 | `tool-once` | One tool call (`MOCK_TOOL_NAME` / `MOCK_TOOL_ARGS`), then echo — docker legacy |
-| `spawn-scout` | Call `subagent` with a scout task, then settle |
+| `spawn-scout` | Call `vexillatio` with a scout task, then settle |
 | `child-done` | Role-aware leaf reply (`scout` / `worker` / …) with verdict JSON |
 | `doctor` | Call `subagent({ action: "diagnose" })`, then settle |
 | `stop-all` | Call `subagent({ action: "stop", all: true })`, then settle |

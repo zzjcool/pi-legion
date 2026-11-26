@@ -1649,7 +1649,9 @@ test("a supervisor-injected extension never adopts a legion identity from inheri
 		const tool = tools.find((entry) => entry.name === "subagent") as { execute: (...args: unknown[]) => Promise<unknown> };
 		assert.ok(tool, "subagent tool registered");
 		// Launch through the injected fake: must NOT create legion ledger rows.
-		const result = (await tool.execute("t", { action: "launch", agent: "scout", task: "probe", async: true, worktree: false, cwd: dir }, undefined, undefined, {
+		// A command-chain role on purpose: `dispatch-boundary-v1` D1 refuses a utility
+		// target on `subagent`, and this case is about the IDENTITY credential, not the role.
+		const result = (await tool.execute("t", { action: "launch", agent: "worker", task: "probe", async: true, worktree: false, cwd: dir }, undefined, undefined, {
 			cwd: dir, hasUI: false, ui: { notify() {}, setStatus() {} },
 			// Identity credential: this fake session differs from the scout-x node's
 			// recorded session, so attach must be refused even though env matches.

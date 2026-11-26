@@ -103,14 +103,21 @@ export function initialScoutGuardState(): ScoutGuardState {
 	return { streak: 0, cooldownUntil: null };
 }
 
-/** Exact reminder copy. N is the configured threshold. */
+/**
+ * Exact reminder copy. N is the configured threshold.
+ *
+ * `dispatch-boundary-v1` D4: the nag must not say “未派发 subagent” and then tell the
+ * caller to “拆 scout” — since D1 that names the WRONG TOOL for the very action it asks
+ * for (`subagent` refuses a utility target). It names both tools that clear the streak
+ * and points the recon dispatch at `vexillatio`, which is where it actually goes.
+ */
 export function scoutGuardReminder(threshold: number): string {
-	return `连续 ${threshold} 次文件类调用且未派发 subagent——若这是侦察工作，请停下来拆 scout（规则：侦察必须并行）。`;
+	return `连续 ${threshold} 次文件类调用且未派发子 agent（subagent / vexillatio）——若这是侦察工作，请停下来用 vexillatio 并行拆 scout（规则：侦察必须并行）。`;
 }
 
-/** One-liner while subagents cannot launch (#182). */
+/** One-liner while subagents cannot launch (#182). The switch gates BOTH dispatch tools. */
 export function scoutGuardPausedNotice(): string {
-	return "subagent 已禁用，scout-guard 暂停";
+	return "subagent / vexillatio 已禁用，scout-guard 暂停";
 }
 
 export function resolveScoutGuardConfig(

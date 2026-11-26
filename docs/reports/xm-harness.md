@@ -94,7 +94,7 @@ XM_STEP hc machine ls 含 remote
 XM_UP_OK parent=xm-parent remote=xm-remote host=remote hostCwd=/root/work
 XM_DRIVER mock model=xm/flash scenario=launch
 XM_SETTINGS XM_SETTINGS_MODE path=/root/.pi/agent/settings.json mode=zero-config host=remote hosts=no packages=2
-XM_ASSERT a1 PASS role-policy
+XM_ASSERT a1 PASS utility-cannot-cross
 XM_ASSERT a2 PASS machine-list
 XM_ASSERT b PASS launch
 XM_ASSERT c PASS remote-artifact
@@ -150,15 +150,24 @@ target instead of refusing` 把「远端没有该模型」从硬拒绝改成**�
 
 ## 5. 四个断言（任务要求）各自的证据
 
-### a1 角色策略（Run A / 零配置）
+### a1 侦察不走 subagent（Run A / 零配置）
 
-mock 直接发 `subagent{agent:"scout", host:"remote"}`。断言：工具结果文本同时含
-`allowRoles`、`'centurion'`、`'scout'`，且 `run.json` 没有创建 child，且远端
-`git worktree list` 无新增。产品依据 `src/runs/orchestrator.ts:1490-1503`。
+mock 直接发 `vexillatio{agent:"scout", host:"remote"}`。两条产品规则都会拒它：
+`subagent` 不再接受 utility 目标（`dispatch-boundary-v1` D1），所以这一枪只能走
+`vexillatio`；而 `vexillatio` 带 `host` 时被产品拒——utility 是 in-process 硬叶子
+（`utilityDispatch` + `host`：`cannot carry a utility dispatch: read-only helpers run
+in-process`，`src/runs/orchestrator.ts:1519-1532`）。断言：工具结果文本含
+`cannot carry a utility dispatch` 与 `read-only helpers run in-process`，且 `run.json`
+没有创建 child，且远端 `git worktree list` 无新增。
+
+> 历史：D1 之前这一枪用的是 `subagent` 的 launch（agent 字段填 scout、带 host），断言的是
+> `crossMachine.allowRoles`（`'centurion'` / `'scout'`）。D1 之后 `subagent` 会先以
+> “utility 目标” 拒掉，永远到不了 allowRoles 那道闸，所以断言随之改成上面这条。
 
 > 任务原文要求「错误里含 allowRoles 与可用机器清单」。实测产品把**清单放在准入错误**
 > （`src/runs/remote.ts:1957-1963`），角色错误里没有清单。所以拆成 **a1 + a2 两条**
-> （更严，不是更松），a2 单独断言清单。
+> （更严，不是更松），a2 单独断言清单。（a1 的 allowRoles 半边在 `dispatch-boundary-v1`
+> 之后已被上面那条历史说明取代；a2 不受影响。）
 
 ### a2 可用机器清单（Run A）
 

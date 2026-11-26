@@ -323,7 +323,10 @@ hc machine ls | grep host-workspace
 subagent({ host: "host-workspace", cwd: "/root/code/pi-legion", agent: "worker", task: "…" })
 
 # 第二个项目（同一台机器）
-subagent({ host: "host-workspace", cwd: "/root/code/other-project", agent: "scout", task: "…" })
+subagent({ host: "host-workspace", cwd: "/root/code/other-project", agent: "worker", task: "…" })
+
+# 侦察不跨机（utility 是 in-process 硬叶子）：需要远端 scout 就让那边的
+# centurion 自己派；本机侦察用 vexillatio({ task: "…", agent: "scout" })
 ```
 
 跑 `npm run test:live` 时同样要求 `HC_SESSION=test-*` 且已 `hc machine add --temp`。

@@ -343,7 +343,10 @@ const SubagentParams = Type.Object({
 		),
 	),
 	agent: Type.Optional(
-		Type.String({ description: "Agent name (single launch)" }),
+		Type.String({
+			description:
+				"Command-chain role name (single launch): `worker` or `centurion`. Read-only recon is NOT dispatched here — use `vexillatio({ task, agent: \"scout\" })`. A utility role (`utility: true`) is refused with INVALID_PARAMS (dispatch-boundary-v1 D1).",
+		}),
 	),
 	task: Type.Optional(Type.String({ description: "Task text (single launch)" })),
 	tasks: Type.Optional(
@@ -2540,6 +2543,15 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				: { agents: catalog.agents, team: catalog.team, warnings: catalog.teamWarnings };
 			const agents = selectedTeam.agents;
 			const team = selectedTeam.team;
+			// dispatch-boundary-v1 D1: a utility target is refused HERE — after the catalog
+			// (the only way to know `utility: true`) and before the identity block below,
+			// which is the first persistent side effect of a launch (`createRootLegion`
+			// mints a run directory and a ledger). Control actions never reach it: they
+			// address children that already exist.
+			if (action === "launch") {
+				const refusal = utilityLaunchRefusal(buildPlan(params), agents);
+				if (refusal) return fail(refusal, ErrorCodes.INVALID_PARAMS);
+			}
 			runtime.setJoinConfig({
 				mode: settings.joinMode ?? DEFAULT_JOIN_MODE,
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
@@ -5966,6 +5978,54 @@ export function buildPlan(params: {
 	const named = resolveStepNames(tasks, "tasks[]", params.name);
 	if (!named.ok) return { ok: false, message: named.message };
 	return { ok: true, task: `${tasks.length} parallel tasks`, steps: named.steps };
+}
+
+/**
+ * `dispatch-boundary-v1` D1 — the ONE `subagent` guard that refuses utility targets.
+ *
+ * Two pipelines, one child kind each: `subagent` launches the COMMAND CHAIN
+ * (`worker` / `centurion`), `vexillatio` owns read-only recon (`utility: true`, e.g.
+ * `scout`). Before this guard the same intent had two paths with two semantics —
+ * `subagent({ agent: "scout" })` started a child WITHOUT the two flags that define a
+ * utility dispatch (`utilityDispatch` / `stripLegionIdentity`, set only by
+ * `launchUtilityFamily`), so a "read-only recon" arrived as an ordinary child with
+ * mailboxes, lineage and nested dispatch.
+ *
+ * Deliberately ONE function called from ONE place (`execute`, before
+ * `resolveLegionIdentity` / `createRootLegion` / `reopenSessionRun` / `launch`), not a
+ * copy in `execute` AND `buildPlan`: two copies drift, and the plan-level copy alone
+ * would run after the root run directory already existed.
+ *
+ * Whole-batch refusal is the only safe answer for `tasks[]`: a per-step refusal would
+ * have to start the healthy siblings first, and a launched child cannot be
+ * un-spawned — the caller would learn its typo from a worker already running.
+ *
+ * The message is load-bearing (it is the interface to "keep one tool per child kind"):
+ * it names the offending role, names `vexillatio`, and carries a call the model can
+ * copy verbatim instead of inferring a shape.
+ *
+ * Resolution goes through the SAME catalog the launch path resolves against
+ * (`agents`, the team-selected list), so the guard fires exactly when
+ * `launchStep` would have found a utility agent — and NOT when the team already
+ * filtered the role out (that refusal belongs to `unknownAgentLineForCatalog`,
+ * which `vexillatio` reproduces).
+ */
+function utilityLaunchRefusal(plan: Plan, agents: AgentConfig[]): string | undefined {
+	if (!plan.ok) return undefined;
+	for (let index = 0; index < plan.steps.length; index += 1) {
+		const step = plan.steps[index];
+		if (!step) continue;
+		const agent = findAgent(agents, step.agent);
+		if (!agent?.utility) continue;
+		const role = agent.name;
+		const label = plan.steps.length > 1 ? `tasks[] step ${index + 1}: ` : "";
+		return (
+			`${label}\`${role}\` is a utility agent (utility: true); read-only recon is dispatched by \`vexillatio\`, not \`subagent\`. ` +
+			`Use vexillatio({ task: "…", agent: "${role}" }) — or vexillatio({ tasks: [{ agent: "${role}", task: "…" }] }) ` +
+			"for parallel recon. `subagent` launches the command chain (worker / centurion) only."
+		);
+	}
+	return undefined;
 }
 
 /** One entry of `tasks[]`. */

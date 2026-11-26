@@ -125,3 +125,26 @@ vexillatio({ tasks: [...] }) for parallel recon. `subagent` launches the command
 2. 不让 scout 拥有 `vexillatio`（见 D2）。
 3. 不动 `continue`/`resume` 对**已存在**的 utility 子节点的复活路径（它们不读 `params.agent`）。
 4. 不改 `recover` / `diagnose` / `extend`。
+
+---
+
+## 附录 A — review 后的 D4 范围扩充（FROZEN 后追加）
+
+两路 review 都 `ok:true`，但各抓到“还有地方在教已死形状”的实例。D4 原定只扫
+`README.md` / `SKILL.md` / `docs/design.md` 三处，**不够**。扩充后的 D4 范围：
+
+| 位置 | 为什么算“教学面” |
+| --- | --- |
+| `examples/subagents-parent-context.md:8` | `README.md:494` 把它当 `subagents.parentContext` 约定文件推荐 → **它会进系统提示** |
+| `docs/runbooks/cross-machine-live-e2e.md:222` | 随 npm 包发布（`files: docs/**/*.md`） |
+| `docs/reports/cross-machine-host-discovery.md:326` | 随包发布 |
+| `docs/reports/xm-harness.md:155` | 描述 mock 发出的调用，是 docker 夹具的规格 |
+| `src/extension/scout-guard.ts:108` | **运行时**文案：仍把侦察派发说成 `subagent` 的动作。这是 #303 的形态，比文档更严重 |
+| `test/docker/xm/scenarios/scout.json` + `test/docker/xm/assert.mjs:245-276` | 仍发 `subagent{agent:"scout", host:"remote"}`；D1 后会必红（虽然 `test:docker` 不在 CI） |
+
+**防回潮测试的盲区同时修正**：现在 `test/unit/dispatch-boundary.test.ts` 的
+`WINDOW=6` 太大就会漏多行调用；`OPEN_CALL` 要求 `(` 导致 `subagent{…}` 形态漏网。
+两个都改掉（WINDOW 至少 10 行，`(` 可选）。
+
+`docs/archive/**`、`docs/audits/**`、`CHANGELOG.md`、`docs/contracts/archive/**` 是历史快照，**不改**。
+`docs/contracts/**` 里其它契约描述的是当时的行为，**不改**。

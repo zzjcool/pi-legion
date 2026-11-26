@@ -54,7 +54,7 @@ export function toolOnceScenario(toolName: string, toolArgsJson: string): MockSc
 	};
 }
 
-/** Parent agent spawns a scout, then settles after the tool result. */
+/** Parent agent spawns a scout through `vexillatio`, then settles after the tool result. */
 export const spawnScoutScenario: MockScript = {
 	models: [flashModel],
 	rules: [
@@ -63,15 +63,18 @@ export const spawnScoutScenario: MockScript = {
 			when: { hasToolResult: true },
 			then: {
 				type: "text",
-				content: 'Spawned. {"ok": true, "reason": "subagent returned"}\n',
+				content: 'Spawned. {"ok": true, "reason": "scout returned"}\n',
 			},
 		},
 		{
 			name: "spawn",
-			when: { promptIncludes: "subagent" },
+			// The mock's trigger word, not its tool name: a caller prompt that mentions EITHER
+			// dispatch tool asks for this recon dispatch (`subagent` is what the docs and the QA
+			// scripts have always sent; `vexillatio` is the tool the call actually uses now).
+			when: { promptMatches: "subagent|vexillatio" },
 			then: {
 				type: "tool_call",
-				name: "subagent",
+				name: "vexillatio",
 				arguments: {
 					agent: "scout",
 					task: "Reply with exactly SCOUT_OK. Do not use tools. End with {\"ok\": true, \"reason\": \"SCOUT_OK\"}.",
@@ -82,7 +85,7 @@ export const spawnScoutScenario: MockScript = {
 			name: "default-spawn",
 			then: {
 				type: "tool_call",
-				name: "subagent",
+				name: "vexillatio",
 				arguments: {
 					agent: "scout",
 					task: "Reply with exactly SCOUT_OK. Do not use tools. End with {\"ok\": true, \"reason\": \"SCOUT_OK\"}.",

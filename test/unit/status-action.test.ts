@@ -32,8 +32,18 @@ const ENV_KEYS = [
 	"PI_SUBAGENTS_TEAM",
 ];
 
+// `dispatch-boundary-v1` D1 retired the subagent→utility path this card used to ride:
+// `subagent` now refuses a `utility: true` target, so this fixture is a plain
+// command-chain role. The file is about the status surface (overview / named / live
+// dedup), which never depended on the role being a utility — that boundary has its
+// own cases in `test/integration/vexillatio.test.ts`.
+//
+// NOTE: this `scout` is DELIBERATELY NOT the shipped `agents/scout.md` — the bundled
+// card is `utility: true` (a hard leaf that `subagent` refuses), while this one is an
+// ordinary role so `subagent` can launch it. A fixture that borrowed the real card
+// would only be testable through `vexillatio`, which is not what this file measures.
 const SCOUT_FILE =
-	"---\nname: scout\ndescription: read-only utility role\nutility: true\ntools: read, grep, find, ls\nkind: pi\n---\nscout prompt\n";
+	"---\nname: scout\ndescription: read-only reconnaissance role\ntools: read, grep, find, ls\nkind: pi\n---\nscout prompt\n";
 const WORKER_FILE =
 	"---\nname: worker\ndescription: worker role\n---\nworker prompt\n";
 

@@ -7,16 +7,16 @@
   ],
   "rules": [
     {
-      "name": "a1-turn0-scout-must-be-refused-on-a-remote-host",
+      "name": "a1-turn0-scout-recon-cannot-cross-a-host",
       "when": {
         "turnIndex": 0
       },
       "then": {
         "type": "tool_call",
-        "name": "subagent",
+        "name": "vexillatio",
         "arguments": {
           "agent": "scout",
-          "task": "XM_A1_PROBE — this dispatch must be refused by the role policy",
+          "task": "XM_A1_PROBE — this recon dispatch must be refused: a utility child cannot cross machines",
           "host": "{{HOST}}",
           "hostCwd": "{{HOST_CWD}}"
         }
