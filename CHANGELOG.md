@@ -9,6 +9,55 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [7.0.0] — 2026-11-26
+
+**一句话：模型看到的工具面从 14 个动作收到 11 个 —— `list` / `retire` / `collect` 退场，`subagent` 只派命令链、`vexillatio` 独占只读侦察，无关参数从「静默忽略」改成硬拒。**
+
+**BREAKING：三个动作被移除，且 `subagent` 不再接受 `utility: true` 的角色。** 迁移表在本节末。
+
+### 工具面收水（14 → 11 个动作）
+
+- **删 `list`。** 模型不能执行斜杠命令，但它也不需要一份模型侧角色清单 —— `status` 看树、`/legion agents` 看 roster。`#450` 的跨 store 扫描覆盖随之锚到 `status`（本来就是同一个渲染器）。
+- **删 `retire`。** `stop` + `name` 是它的严格超集。
+- **删 `collect`，由 `wait` 吸收。** 两者输出同一份 `renderCollect` 文本（`wait` 对每个已结算子直接调它），而 `wait` 是超集：支持 `all`、可设 `timeoutMs`、超时给决策清单。`collect` 唯一独占的两条路径 —— `/reload` 后读自己之前的子、`vexillatio` 的 utility 子（返回即 release，runtime 里已无 job）—— 由 `wait` 复用同一个 `resolveScopedChild` 补齐，**不是丢掉**。
+- **保留 `diagnose`。** 模型不能敲 `/legion doctor`，`subagent({action:"diagnose"})` 是它唯一的自查手段；这也正是它没被一起删掉的原因。
+
+### 派发边界：一个工具一种子节点
+
+- `subagent` 只派**命令链**（`worker` / `centurion`）。目标是 `utility: true` 的角色时直接 `InvalidParams`，且在**任何持久副作用之前**拒绝 —— 不建 run 目录、不写账本、不 spawn；`tasks[]` 混批整批拒，不会先起 worker 再报错。
+- 只读侦察一律走 `vexillatio`（它对所有非 utility 会话开放，含不可嵌套的 worker；scout 自己仍是硬叶子）。
+- 拒绝文案给可直接照抄的等价调用；`README` / `SKILL.md` / `examples` / runbook 里的旧写法同批改掉，并加了一条**防回潮测试**盯着 7 个教学面（含 `subagents.parentContext` 那个会进系统提示的文件）。
+- 顺带修了运行时提醒：`scout-guard` 的 steer 文案原本把侦察派发说成 `subagent` 的动作，现在指向 `vexillatio`。
+
+### 无关参数不再静默忽略
+
+- 15 项「本动作根本不读的参数」（例如往 `collect` 里塞 `force`）从静默忽略改成 `InvalidParams`，文案指路正确动作：`` force is only read by action "stop" (got action "collect"). Drop it or call action:"stop". ``
+
+### 单一真源
+
+- 动作清单从**四份会漂移的副本**（注释、`Actions:` 行、schema union、整段枚举）收成一份 `ACTION_NAMES` + 五面漂移探测测试；`PARAM_OWNER_ACTIONS` 改为从 `ACTION_SPECS.params` 求逆推导，不再手写一份会过期的表。
+
+### token 成本
+
+- `subagent` 工具描述 6,236 → 1,352 字符；`action` 字段描述 1,186 → 846；单次请求的工具声明 19,474 → 约 14,300 bytes。
+- 收益来自**去掉跨面的副本**，不是砍信息：每个动作真实读取哪些参数，一条没少。
+
+### 一个容器里的 live 演示暴露、顺带修掉的四处
+
+- **已定裁决不再声称自己会被否决。** `accepted (verified)` 旁边原本写 `unverified criteria — these gate the verdict`，而 `pendingCriteria` 从不影响 `status`。演示里 11 条结果全是这个形状，连演示自己的模型都把它复述成了相反的意思。
+- **`abort` 掉的 turn 不再记 `rejected`。** 父配 `verify` 照跑（保留），但结果记 `unknown`：对没有任何产出的 turn 记 `rejected`，是在描述没人测过的东西。`unknown`（跨机没测到）与 `failed` / `truncated` 的既有判据一律不动。
+- **`verification: STALE` 说清顺序。** 指纹是 `HEAD + git status --porcelain`，所以「先验证、后提交」必然 STALE；文案现在直接建议**先 commit / squash 再进 verifying**，而不是让读者自己从指纹推。
+- **`diagnose` 不再指向不存在的日志。** 没有 `session-errors.jsonl` 时输出 `(in-memory only; no log file on disk)`，不再给一个 `cat` 不到的死指针。
+
+### 迁移表
+
+| 旧写法 | 新写法 |
+| --- | --- |
+| `subagent({action:"collect", name})` | `subagent({action:"wait", name})` |
+| `subagent({action:"list"})` | `subagent({action:"status"})`（或人用 `/legion agents`） |
+| `subagent({action:"retire", name})` | `subagent({action:"stop", name})` |
+| `subagent({agent:"scout", task})` | `vexillatio({task, agent:"scout"})` |
+
 ## [6.2.14] — 2026-11-24
 
 **一句话：in-process child 的诊断不再写进你的输入框上方 —— 它落到 `<runDir>/diagnostics.log`，要看时能查，不要看时不打扰。**
