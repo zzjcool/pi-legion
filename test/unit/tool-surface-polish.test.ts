@@ -422,8 +422,8 @@ test("#5: the collect head names an empty pass, and says nothing when there is n
 	);
 	assert.match(
 		render({ commandCount: 3, outputFile: "/tmp/v.log", checkedAt: 1, stale: true }),
-		/^verification: STALE — the checkout changed after the pass \(3 command\(s\), \/tmp\/v\.log\)$/m,
-		"a stale pass is the other empty shape, and it says why",
+		/^verification: STALE — the checkout changed after the pass \(3 command\(s\), \/tmp\/v\.log\) — commit or squash BEFORE entering verifying, then verify again$/m,
+		"a stale pass is the other empty shape, and it says why (demo-findings D3 adds the order)",
 	);
 	assert.match(render(null), /^verification: never ran \(no contract\)$/m, "a legion child with no row says so");
 	assert.doesNotMatch(render(undefined), /^verification:/m, "a non-legion caller gets no line, not a guess");

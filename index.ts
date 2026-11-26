@@ -8031,7 +8031,7 @@ export function renderCollect(
 			lines.push("verification: 0 commands — by contract, nothing ran");
 		} else if (verification.stale) {
 			lines.push(
-				`verification: STALE — the checkout changed after the pass (${verification.commandCount} command(s)${verification.outputFile ? `, ${verification.outputFile}` : ""})`,
+				`verification: STALE — the checkout changed after the pass (${verification.commandCount} command(s)${verification.outputFile ? `, ${verification.outputFile}` : ""}) — commit or squash BEFORE entering verifying, then verify again`,
 			);
 		} else {
 			lines.push(`verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"}`);
@@ -8096,11 +8096,22 @@ export function renderCollect(
 		// gates the verdict (`acceptance.ts` skips `severity === "optional"` when it
 		// decides what must pass); an optional one never did, so asking the caller to
 		// confirm it "before trusting the result" demanded work the verdict never
-		// needed. Two banners, one per shape, and the per-line `(optional)` tag stays.
+		// needed. One banner per shape (demo-findings F1 / D1 splits the required one
+		// by whether a verdict is still open), and the per-line `(optional)` tag stays.
 		const gating = pending.some((c) => c.severity !== "optional");
+		// demo-findings F1 / D1: a required criterion does NOT gate a verdict that is
+		// already decided. `pendingCriteria` is carried through this module and never
+		// touches `status` (`acceptance.ts`), so `accepted`/`rejected` — e.g. the
+		// `accepted (verified)` shape a parent-supplied `verify` produces — used to sit
+		// next to "these gate the verdict", which is false and reads as a contradiction.
+		// The status decides the banner; `unknown` keeps the original wording because
+		// there the checklist really is the only thing left before a verdict.
+		const settled = collected.acceptance.status === "accepted" || collected.acceptance.status === "rejected";
 		lines.push(
 			gating
-				? "unverified criteria — these gate the verdict:"
+				? settled
+					? "unverified criteria — the verdict is already settled; confirm them from the pasted output:"
+					: "unverified criteria — these gate the verdict:"
 				: "optional criteria — fix them if cheap, but they do not gate the verdict:",
 		);
 		for (const c of pending) {

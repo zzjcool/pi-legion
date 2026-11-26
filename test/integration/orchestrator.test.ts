@@ -420,6 +420,61 @@ test("required verification command promotes an attested RPC verdict to verified
 	}
 });
 
+/**
+ * demo-findings F2 / D2, through the real collect path: the demo's exact shape.
+ *
+ * A turn is aborted mid-flight (`(no output)`), the parent's configured `verify`
+ * still runs — the user ruling keeps that — and the answer must not be `rejected`:
+ * nothing about that turn's work was measured. The same red command on a COMPLETED
+ * turn stays `rejected`, which is the other direction of the same branch.
+ */
+test("demo-findings D2: an interrupted turn keeps the verify but is never `rejected`", async () => {
+	const h = harness();
+	const calls: string[] = [];
+	const orchestrator = new Orchestrator({
+		supervisor: h.supervisor,
+		runDir: h.runDir,
+		cwd: "/tmp/project",
+		now: () => 0,
+		sleep: async () => {},
+		verifyRunner: async (command) => {
+			calls.push(command);
+			return { code: 1, stdout: "", stderr: "1 failing" };
+		},
+	});
+	const agentWithVerify = agent({
+		acceptance: {
+			level: "attested",
+			criteria: [{ id: "tests", must: "tests pass", evidence: ["verification-output"], severity: "required", command: "npm test" }],
+		},
+	});
+	try {
+		// The aborted turn: pi ends the turn with `stopReason: error` and an abort
+		// message, which `deriveOutcome` classifies as `aborted` — never `success`.
+		const aborted = await orchestrator.launch({ agent: agentWithVerify, task: "sleep, then write the file", worktree: false });
+		h.supervisor.settle(aborted.name, { text: "", stopReason: "error", errorMessage: "Operation aborted" });
+		const interrupted = await orchestrator.collect(aborted.name);
+		assert.equal(interrupted.execution.status, "aborted", "premise: this collect's turn did not complete");
+		assert.deepEqual(calls, ["npm test"], "the parent's verify still RUNS — it is never skipped");
+		assert.equal(interrupted.acceptance.status, "unknown", "a turn with no output cannot be `rejected` for its work");
+		assert.equal(interrupted.acceptance.level, "attested");
+		assert.match(interrupted.acceptance.reason ?? "", /not assessed/);
+		assert.match(interrupted.acceptance.reason ?? "", /still ran and failed/);
+
+		// The other direction: the same red command, on a turn that DID complete.
+		calls.length = 0;
+		const done = await orchestrator.launch({ agent: agentWithVerify, task: "finish normally", worktree: false });
+		h.supervisor.settle(done.name, { text: '{"ok":true,"reason":"finished"}' });
+		const completed = await orchestrator.collect(done.name);
+		assert.equal(completed.execution.status, "success", "premise: this turn completed");
+		assert.deepEqual(calls, ["npm test"]);
+		assert.equal(completed.acceptance.status, "rejected", "a completed turn is still judged by the verify");
+		assert.match(completed.acceptance.reason ?? "", /^verification failed/);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("#393 review D393-5: a live timeout snapshot is not a result, so no verify command runs", async () => {
 	const h = harness();
 	const calls: Array<{ command: string; cwd: string }> = [];

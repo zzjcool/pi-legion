@@ -975,6 +975,10 @@ export class LegionPostman {
 			if (this.staleVerificationNudges.has(nudgeKey)) return;
 			this.sendSelfMessage(
 				"The checkout changed after legion-verify passed, so that pass no longer covers what would be delivered. "
+				// demo-findings F3 / D3: the fingerprint is HEAD + `git status --porcelain`,
+				// so verifying BEFORE committing is stale by construction. Say the order
+				// instead of letting the reader derive it from the digest.
+				+ "Commit or squash BEFORE entering verifying, then verify again. "
 				+ 'Request legion_phase { to: "done" } — it re-measures the contract in this phase and completes the team only when it is green.',
 			);
 			// Recorded only after the send: a delivery seam that throws must not silence
