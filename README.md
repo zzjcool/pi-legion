@@ -212,7 +212,9 @@ turn ends, or launch with `async: false`. To stop children explicitly, use
 sequence for each selected child. Pass `force: true` to escalate to hard retire
 when a child ignores soft steer / graceful close.
 
-The `action` union is closed; every literal is listed here.
+The `action` union is closed; every literal is listed here, and
+`test/unit/action-surface-drift.test.ts` fails when this table, the schema union,
+the model-facing `Actions:` line and `docs/design.md` §9.3 stop agreeing.
 
 | `action` | What it does |
 | --- | --- |
@@ -229,6 +231,7 @@ The `action` union is closed; every literal is listed here.
 | `stop` | Graceful stop of one child or of every live child; `force: true` hard-retires. |
 | `diagnose` | The `/legion doctor` self-check returned as tool output, with an optional `section`. |
 | `extend` | Defer the "may be looping" reminder for one direct child by `ms`. It never restarts or revives the child. |
+| `recover` | Collect a cross-machine child a PREVIOUS session launched: read its transcript from that machine, grade it with the collect rules, settle the ledger row and return the collect text. A still-live child is only reported. |
 
 ### Stopping async subagents yourself
 

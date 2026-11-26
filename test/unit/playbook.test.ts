@@ -89,12 +89,14 @@ test("legacy herdr commands remain available for manual v0.16.x workflows", () =
 
 test("playbook keeps the explicit wait action available", () => {
 	assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true` when you need blocking results/);
-	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire/);
+	// The enumeration is derived from `ACTION_NAMES` (D1), so its ORDER is the
+	// surface's order, not a hand-written one: assert membership, not adjacency.
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\bwait\b/);
 });
 
 test("playbook describes event-driven waits and graceful stop", () => {
 	assert.match(PARENT_PLAYBOOK, /use `stop` to gracefully retire one child or all tracked children/);
-	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire, stop/);
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\bstop\b/);
 	assert.match(TOOL_DESCRIPTION, /it is event-driven/);
 	assert.match(TOOL_DESCRIPTION, /Esc does not retire children/);
 });
@@ -133,10 +135,14 @@ test("playbook says steer queues at a turn boundary and stop is the interrupt (#
 	// …and that `stop` is what actually interrupts.
 	assert.match(PARENT_PLAYBOOK, /To actually stop a child, use `stop`/);
 	assert.match(PARENT_PLAYBOOK, /`force: true` is the hard variant/);
-	// TOOL_DESCRIPTION embeds PARENT_PLAYBOOK, so it inherits the paragraph —
-	// asserting it here pins the embedding (no second copy to drift).
-	assert.match(TOOL_DESCRIPTION, /`steer` is a queue, not an interrupt/);
-	assert.match(TOOL_DESCRIPTION, /To actually stop a child, use `stop`/);
+	// tool-surface-dedup-v1 D2 reverses the old pin: the text has ONE source but
+	// only ONE model-visible injection point (the systemPrompt, from
+	// `before_agent_start`). The description answers HOW to call, never WHEN or
+	// WHETHER — so these sentences are asserted on the playbook alone, and the
+	// description is asserted NOT to embed it (see the dedicated D2 test below).
+	assert.match(PARENT_PLAYBOOK, /`steer` is a queue, not an interrupt/);
+	assert.match(PARENT_PLAYBOOK, /To actually stop a child, use `stop`/);
+	assert.equal(TOOL_DESCRIPTION.includes(PARENT_PLAYBOOK), false);
 	// Numbering stays contiguous and item 8 sits before the unnumbered
 	// "Utility agents …" paragraph (D7: append, never renumber items 1-7).
 	const item7 = PARENT_PLAYBOOK.indexOf("\n7. ");
@@ -175,9 +181,10 @@ test("playbook draws the abort-vs-stop boundary and names abort where steer cann
 	assert.match(PARENT_PLAYBOOK, /queued steering\/follow-up messages are dropped first/);
 	assert.match(PARENT_PLAYBOOK, /`clearQueued: false` keeps them/);
 	assert.match(PARENT_PLAYBOOK, /A timeout receipt is not a failure/);
-	// TOOL_DESCRIPTION carries the action and the same boundary as one sentence
-	// (it embeds PARENT_PLAYBOOK, so this also pins the embedding).
-	assert.match(TOOL_DESCRIPTION, /stop, abort, diagnose/);
+	// TOOL_DESCRIPTION carries the action (derived from ACTION_NAMES, D1) and the
+	// same boundary as one sentence of its own.
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\babort\b/);
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\bdiagnose\b/);
 	assert.match(
 		TOOL_DESCRIPTION,
 		/`abort` stops the child's current turn but keeps its context and session \(child stays alive and continuable; queued messages are dropped first\); `stop` is the one that takes the process down\./,
@@ -188,4 +195,33 @@ test("playbook draws the abort-vs-stop boundary and names abort where steer cann
 		PARENT_PLAYBOOK + TOOL_DESCRIPTION,
 		/headless RPC|via RPC|RPC child|RPC launch/i,
 	);
+});
+
+// ---------------------------------------------------------------------------
+// tool-surface-dedup-v1 D2 — the description no longer carries the playbook
+// ---------------------------------------------------------------------------
+
+test("D2: the tool description does not embed the playbook — one text, one injection point", () => {
+	// What the description is FOR: how to call — the derived Actions line, the
+	// param contract, the abort/stop boundary.
+	assert.match(TOOL_DESCRIPTION, /^Roles: /);
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\blaunch \(default\)/);
+	assert.match(TOOL_DESCRIPTION, /`abort` stops the child's current turn/);
+	assert.match(TOOL_DESCRIPTION, /`stop` is the one that takes the process down/);
+	// What it must NOT do: repeat WHEN/WHETHER. Each playbook paragraph is checked
+	// on its own, because "drop the big copy and paraphrase one item" is the failure
+	// mode this guards — two copies would be bad, two VARIANTS of the same rule are
+	// worse, since nothing can compare them.
+	assert.equal(TOOL_DESCRIPTION.includes(PARENT_PLAYBOOK), false);
+	assert.doesNotMatch(TOOL_DESCRIPTION, /Pi Legion playbook/);
+	for (const paragraph of PARENT_PLAYBOOK.split("\n")) {
+		assert.equal(
+			TOOL_DESCRIPTION.includes(paragraph),
+			false,
+			`the description must not carry a playbook paragraph: ${paragraph.slice(0, 60)}…`,
+		);
+	}
+	// The playbook text itself is unchanged by the move — it is injected once, from
+	// `before_agent_start` (`legion-session-continuity.test.ts` pins that gate).
+	assert.match(PARENT_PLAYBOOK, /^Pi Legion playbook/);
 });
