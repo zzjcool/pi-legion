@@ -24,7 +24,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,7 +34,7 @@ import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { renderLegionStatus } from "../../src/extension/legion-status.ts";
 import { hcCliClient } from "../../src/hc/client.ts";
 import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
-import { readEventsAfter } from "../../src/legion/events.ts";
+import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import {
 	getNode,
 	getSubtree,
@@ -43,7 +43,11 @@ import {
 	type LegionNode,
 } from "../../src/legion/nodes.ts";
 import { createRemoteTerminalProbe } from "../../src/runs/remote-artifact.ts";
+import { orphanMarkFor } from "../../src/legion/orphan.ts";
 import { recoveryCallFor } from "../../src/runs/remote-recover.ts";
+import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
+import { runStartupHygiene } from "../../src/runs/hygiene.ts";
+import { RunStore } from "../../src/runs/store.ts";
 import type { CrossMachineSettings } from "../../src/shared/types.ts";
 import { assistantMsg, modelChange, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -68,6 +72,8 @@ interface Harness {
 	/** The same file on THIS filesystem (the fake core's `FAKE_HC_REMOTE_ROOT`). */
 	localSessionPath: string;
 	settings: CrossMachineSettings;
+	/** The fake core's request log: "no second fetch" is asserted against the wire. */
+	coreLog: string;
 	cleanup: () => void;
 }
 
@@ -81,11 +87,13 @@ function harness(prefix = "recover-xm-"): Harness {
 	const wrapper = path.join(binDir, "hc");
 	writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CORE)} "$@"\n`, { mode: 0o755 });
 	chmodSync(wrapper, 0o755);
+	const coreLog = path.join(root, "core.jsonl");
 	const previous = { ...process.env };
 	Object.assign(process.env, {
 		HC_BIN: wrapper,
 		FAKE_HC_REMOTE_ROOT: remoteRoot,
 		FAKE_HC_MACHINES: HOST,
+		FAKE_HC_LOG: coreLog,
 	});
 	const remoteDir = path.posix.join(remoteRoot, ".pi-subagents-mirror", "run-1", NODE_NAME);
 	const remoteSessionPath = path.posix.join(remoteDir, "session.jsonl");
@@ -98,8 +106,9 @@ function harness(prefix = "recover-xm-"): Harness {
 		remoteSessionPath,
 		localSessionPath: path.join(remoteRoot, ".pi-subagents-mirror", "run-1", NODE_NAME, "session.jsonl"),
 		settings: { enabled: true, hosts: { [HOST]: { cwd: remoteCwd } } },
+		coreLog,
 		cleanup: () => {
-			for (const key of ["HC_BIN", "FAKE_HC_REMOTE_ROOT", "FAKE_HC_MACHINES"]) {
+			for (const key of ["HC_BIN", "FAKE_HC_REMOTE_ROOT", "FAKE_HC_MACHINES", "FAKE_HC_LOG"]) {
 				if (previous[key] === undefined) delete process.env[key];
 				else process.env[key] = previous[key];
 			}
@@ -136,7 +145,7 @@ function writeRemoteSession(h: Harness, text: string): number {
  * normal writer) whose process is gone. `now - 12m` is the age `/legion status`
  * must render.
  */
-function seedLeftover(h: Harness, overrides: { status?: "running" | "settled" } = {}): void {
+function seedLeftover(h: Harness, overrides: { status?: "running" | "settled" | "retired" | "failed" } = {}): void {
 	const now = Date.now();
 	const db = openLegionDb(h.dbPath);
 	try {
@@ -176,6 +185,13 @@ function seedLeftover(h: Harness, overrides: { status?: "running" | "settled" } 
 /** This session's connection to the same ledger: no state shared with the seeder. */
 function newSessionDb(h: Harness): DatabaseSync {
 	return openLegionDb(h.dbPath);
+}
+
+/** How many hc requests the fake core has answered so far. */
+function coreRequests(h: Harness): number {
+	return existsSync(h.coreLog)
+		? readFileSync(h.coreLog, "utf8").split("\n").filter((line) => line.trim().length > 0).length
+		: 0;
 }
 
 function textOf(result: Awaited<ReturnType<typeof recoverAction>>): string {
@@ -223,9 +239,17 @@ test("(a–d) a leftover is discovered by a NEW session, recovered, settled, and
 	assert.match(status, /Recoverable cross-machine children \(this session never launched them\):/);
 	assert.match(
 		status,
-		new RegExp(`- ${NODE_NAME} · worker · host ${HOST} · running · terminal ${escapeRegExp(REMOTE_TERMINAL)} · 12m(\\d+s)? old`),
-		"name · role · host · status · terminal · age",
+		new RegExp(`- ${NODE_NAME} · ${NODE_ID} · host ${HOST} · running · terminal ${escapeRegExp(REMOTE_TERMINAL)}$`, "m"),
+		"name · node id · host · state · terminal",
 	);
+	// 6.2.5 / D1+D4: the age is on the launch line (createdAt), the heartbeat is
+	// its own fact, and the run/cwd/session ownership line sits between them.
+	assert.match(
+		status,
+		/^ {2}launched \d{4}-\d{2}-\d{2}T[\d:.]+Z \([0-9hms]+ old\) {2}· run /m,
+		"launched (createdAt) carries the age",
+	);
+	assert.match(status, /^ {2}heartbeat \d{4}-\d{2}-\d{2}T[\d:.]+Z \(/m, "updatedAt is the heartbeat");
 	assert.match(status, new RegExp(escapeRegExp(recoveryCallFor(NODE_NAME))), "the exact recovery call");
 
 	// A live child of THIS session is already on screen: it must not be repeated.
@@ -239,7 +263,7 @@ test("(a–d) a leftover is discovered by a NEW session, recovered, settled, and
 		crossMachine: h.settings,
 	});
 	const text = textOf(recovered);
-	assert.match(text, new RegExp(`^recover: '${NODE_NAME}' is over on '${HOST}'`), text);
+	assert.match(text, new RegExp(`^recover: '${NODE_NAME}' is over on '${HOST}'`, "m"), text);
 	assert.match(text, new RegExp(`── ${NODE_NAME} ──`), "the collect-shaped block");
 	assert.match(text, /^execution: success$/m);
 	assert.match(text, /^acceptance: accepted \(attested\)$/m, "graded by collect's own acceptance ladder");
@@ -270,7 +294,7 @@ test("(a–d) a leftover is discovered by a NEW session, recovered, settled, and
 	const again = textOf(
 		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
 	);
-	assert.match(again, new RegExp(`^recover: '${NODE_NAME}' is already settled \\(settled\\)`), again);
+	assert.match(again, new RegExp(`^recover: '${NODE_NAME}' is already settled \\(settled\\)`, "m"), again);
 	assert.match(again, /^execution: success$/m, "the RECORDED outcome, not a fresh guess");
 	assert.match(again, /shipped the fix/, "the child's text is still reachable");
 	assert.equal(settleEvents(db, NODE_ID).length, 1, "idempotent: no second settle event");
@@ -301,22 +325,42 @@ test("a transcript that is not on that machine is `unknown` with the fetch comma
 	assert.deepEqual(listUnsettledRemoteNodes(db).map((node) => node.name), [NODE_NAME]);
 });
 
-test("a row that is already terminal answers `already settled` and writes nothing", async (t) => {
+/**
+ * D3: `already settled` is answered from the LEDGER — no fetch, no probe, no write.
+ *
+ * The recorded settle event is the verdict (that is what a settled row means), and
+ * the child's prose comes from the mirror this machine already holds. A second
+ * `recover` used to re-read the transcript and re-probe the machine even though the
+ * answer could not change; the fake core's request log is what makes "no fetch"
+ * assertable rather than implied.
+ */
+test("a row that is already terminal answers `already settled` with the RECORDED verdict, and fetches nothing", async (t) => {
 	const h = harness("recover-xm-terminal-");
 	t.after(() => h.cleanup());
 	writeRemoteSession(h, finishedTranscript("finished before the restart"));
 	seedLeftover(h, { status: "settled" });
 	const db = newSessionDb(h);
 	t.after(() => db.close());
+	// The settle event a previous recovery wrote: `emitStored`'s shape.
+	appendEvent(db, NODE_ID, "node_settled", { execution: "success", reason: "recovered earlier" }, { now: () => Date.now() - 60_000 });
+	// The mirror that earlier read-back left behind (`<ledger dir>/remote/<name>.jsonl`),
+	// so the child's own prose is available from THIS machine's disk.
+	const mirrorDir = path.join(h.root, "run", "remote");
+	mkdirSync(mirrorDir, { recursive: true });
+	writeFileSync(path.join(mirrorDir, `${NODE_NAME}.jsonl`), finishedTranscript("finished before the restart"));
 
-	const before = eventsFor(db, NODE_ID).length;
+	const beforeEvents = eventsFor(db, NODE_ID).length;
+	const beforeRequests = coreRequests(h);
 	const text = textOf(
 		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
 	);
-	assert.match(text, new RegExp(`^recover: '${NODE_NAME}' is already settled \\(settled\\)`), text);
-	assert.match(text, /^execution: success$/m);
-	assert.match(text, /finished before the restart/);
-	assert.equal(eventsFor(db, NODE_ID).length, before, "no event was appended");
+	assert.match(text, new RegExp(`^recover: '${NODE_NAME}' is already settled \\(settled\\)`, "m"), text);
+	assert.match(text, /nothing was fetched/, "the idempotent answer says it did not go to the wire");
+	assert.match(text, /^execution: success \(recovered earlier\)$/m, "the verdict and its reason are the RECORDED ones");
+	assert.match(text, /recovered earlier/, "and its recorded reason");
+	assert.match(text, /finished before the restart/, "the prose comes from the local mirror");
+	assert.equal(coreRequests(h), beforeRequests, "a settled row must not fetch or probe the machine");
+	assert.equal(eventsFor(db, NODE_ID).length, beforeEvents, "no event was appended");
 	assert.equal(getNode(db, NODE_ID)?.status, "settled");
 });
 
@@ -368,7 +412,8 @@ test("an unknown name lists what WAS recoverable instead of a bare NOT_FOUND", a
 	const text = textOf(result);
 	assert.equal((result.details as { error?: string } | undefined)?.error !== undefined, true, "an unknown name is a failure");
 	assert.match(text, /unknown cross-machine child "nobody"/);
-	assert.match(text, new RegExp(`Waiting for recovery: ${NODE_NAME}`), "the miss names what would work");
+	assert.match(text, /Waiting for recovery:/, "the miss lists what would work");
+	assert.match(text, new RegExp(`^- ${NODE_NAME} · ${NODE_ID} · host ${HOST} · running · terminal ${escapeRegExp(REMOTE_TERMINAL)}$`, "m"), "as the same ownership block");
 });
 
 // ── the WRITE side: a cross-machine launch records what recovery needs ────────
@@ -460,4 +505,320 @@ test("a cross-machine launch persists remote_dir/remote_terminal on the node row
 	assert.equal(node?.remoteTerminal, remoteTerminal, "the address the core holds");
 	// And the row is what discovery finds: the write side feeds the read side.
 	assert.deepEqual(listUnsettledRemoteNodes(db).map((entry) => entry.id), [NODE_ID]);
+});
+
+// ── 6.2.4 / D2: the exit's three-way fate, and recovery for orphaned/unfetched ─
+
+/**
+ * A launched cross-machine child, ready to be retired by an "exit".
+ *
+ * Reuses the launch-persist scaffolding above: a REAL `Orchestrator.launch` whose
+ * backend handle reports `remoteDir`/`remoteTerminal`, so the node row and the child
+ * record carry exactly what a real cross-machine launch writes.
+ */
+async function launchCrossMachine(prefix: string): Promise<{
+	root: string;
+	db: DatabaseSync;
+	supervisor: FakeSupervisor;
+	orchestrator: Orchestrator;
+	remoteDir: string;
+	remoteTerminal: string;
+	cleanup: () => void;
+}> {
+	const root = mkdtempSync(path.join(tmpdir(), prefix));
+	const runDir = path.join(root, "run");
+	mkdirSync(runDir, { recursive: true });
+	const dbPath = path.join(runDir, "legion.db");
+	const db = openLegionDb(dbPath);
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: "r-xm-1", status: "running" });
+	const remoteDir = `/srv/.pi-subagents-mirror/r-xm-1/${NODE_NAME}`;
+	const remoteTerminal = `${HOST}/lgl-rxm1-${NODE_NAME}`;
+	class RemoteHandleSupervisor extends FakeSupervisor {
+		override async spawnChild(input: Parameters<FakeSupervisor["spawnChild"]>[0]) {
+			const handle = await super.spawnChild(input);
+			return { ...handle, remoteDir, remoteTerminal };
+		}
+	}
+	const supervisor = new RemoteHandleSupervisor();
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir,
+		cwd: root,
+		legion: { db, dbPath, nodeId: "root", runId: "r-xm-1" },
+	});
+	const socket = process.env.HC_TERMINAL_SOCKET;
+	const id = process.env.HC_TERMINAL_ID;
+	process.env.HC_TERMINAL_SOCKET = "/tmp/hc-recover/default.sock";
+	process.env.HC_TERMINAL_ID = "t1k";
+	try {
+		await orchestrator.launch({
+			agent: {
+				name: "worker",
+				description: "exit-fate role",
+				systemPromptMode: "append",
+				inheritProjectContext: false,
+				inheritSkills: false,
+				kind: "pi",
+				systemPrompt: "You are a test worker.",
+				source: "user",
+				filePath: "/fake/worker.md",
+				worktree: false,
+			},
+			task: "fix the flaky test",
+			name: NODE_NAME,
+			host: HOST,
+			hostTarget: {
+				host: HOST,
+				cwd: "/srv/app",
+				node: "node",
+				piCli: "pi",
+				pathMap: [],
+				piLegionRoot: "/srv/pi-legion",
+				piExtensions: [],
+				mirrorRoot: "/srv/.pi-subagents-mirror",
+				worktreeRoot: "/srv/.pi-worktrees",
+				allowRoles: ["centurion", "worker"],
+			},
+		});
+	} finally {
+		if (socket === undefined) delete process.env.HC_TERMINAL_SOCKET;
+		else process.env.HC_TERMINAL_SOCKET = socket;
+		if (id === undefined) delete process.env.HC_TERMINAL_ID;
+		else process.env.HC_TERMINAL_ID = id;
+	}
+	return {
+		root,
+		db,
+		supervisor,
+		orchestrator,
+		remoteDir,
+		remoteTerminal,
+		cleanup: () => {
+			db.close();
+			rmSync(root, { recursive: true, force: true });
+		},
+	};
+}
+
+function orphanMarks(db: DatabaseSync, nodeId: string) {
+	return eventsFor(db, nodeId).filter((event) => event.type === "orphan_detected");
+}
+
+test("6.2.4 D2: a session exit leaves a cross-machine child OPEN as `orphaned` and does NOT kill it", async (t) => {
+	const h = await launchCrossMachine("orphan-exit-");
+	t.after(() => h.cleanup());
+
+	await h.orchestrator.retire(NODE_NAME, { cause: "session-shutdown" });
+
+	// The 6.2.3 behaviour this replaces: `supervisor.retire` (a real `terminal.kill`)
+	// and a terminal `retired` row stamped `aborted (session-shutdown)`.
+	assert.equal(
+		h.supervisor.calls.filter((call) => call.method === "retire").length,
+		0,
+		"the exit must not kill a child whose result it cannot fetch",
+	);
+	assert.equal(h.supervisor.isAlive(NODE_NAME), true, "still running over there");
+
+	// The row stays OPEN: this is what `listUnsettledRemoteNodes` (and therefore the
+	// `/legion status` block) and `recover` read.
+	assert.equal(getNode(h.db, NODE_ID)?.status, "running", "not retired — recover must still reach it");
+	assert.deepEqual(listUnsettledRemoteNodes(h.db).map((node) => node.name), [NODE_NAME]);
+	assert.equal(
+		eventsFor(h.db, NODE_ID).filter((event) => event.type === "node_retired").length,
+		0,
+		"no pause marker: the child did not stop",
+	);
+
+	const marks = orphanMarks(h.db, NODE_ID);
+	assert.equal(marks.length, 1, "exactly one exit marker");
+	const data = marks[0]!.data as Record<string, unknown>;
+	assert.equal(data.reason, "session-shutdown");
+	assert.equal(data.fate, "orphaned");
+	assert.equal(data.host, HOST);
+	assert.equal(data.remoteDir, h.remoteDir, "where on that machine");
+	assert.equal(data.remoteTerminal, h.remoteTerminal, "the address the core holds");
+	assert.equal(
+		data.remoteSessionPath,
+		path.posix.join(h.remoteDir, "session.jsonl"),
+		"the transcript path a later session needs",
+	);
+
+	const record = h.orchestrator.childrenSnapshot().find((child) => child.name === NODE_NAME)!;
+	assert.equal(record.state, "orphaned", "the record says what happened, not `retired`");
+	assert.equal(record.orphaned?.fate, "orphaned");
+	assert.equal(record.orphaned?.host, HOST);
+	assert.equal(record.orphaned?.remoteSessionPath, path.posix.join(h.remoteDir, "session.jsonl"));
+
+	// Idempotent: a re-entrant shutdown cannot double-stamp the same child.
+	const before = eventsFor(h.db, NODE_ID).length;
+	h.orchestrator.orphanOnShutdown(NODE_NAME);
+	assert.equal(eventsFor(h.db, NODE_ID).length, before);
+});
+
+test("6.2.4 D2: a cross-machine child whose turn already ended is `unfetched`, not `aborted`", async (t) => {
+	const h = await launchCrossMachine("orphan-unfetched-");
+	t.after(() => h.cleanup());
+	// A graded execution on the record is local evidence that the work over there is
+	// over; the exit cannot reach the wire, so this is the strongest fact it has.
+	const record = h.orchestrator.childrenSnapshot().find((child) => child.name === NODE_NAME)!;
+	record.execution = { status: "success", turns: 1 };
+
+	await h.orchestrator.retire(NODE_NAME, { cause: "session-shutdown" });
+
+	assert.equal(record.state, "unfetched");
+	assert.equal(record.orphaned?.fate, "unfetched");
+	assert.equal((orphanMarks(h.db, NODE_ID)[0]?.data as { fate?: string } | null)?.fate, "unfetched");
+	assert.equal(getNode(h.db, NODE_ID)?.status, "running", "still open — the result is owed, not written off");
+	assert.equal(h.supervisor.calls.filter((call) => call.method === "retire").length, 0);
+});
+
+test("6.2.4 D2: `recover` FETCHES an `orphaned` row, and the second call is the usual zero-fetch idempotent answer", async (t) => {
+	const h = harness("recover-xm-orphan-");
+	t.after(() => h.cleanup());
+	const lines = writeRemoteSession(h, finishedTranscript("finished after the parent left"));
+	seedLeftover(h);
+	const db = newSessionDb(h);
+	t.after(() => db.close());
+	// Exactly what the exit writes (see the orchestrator test above): the row stays
+	// `running`, the marker records the fate and where the transcript lives.
+	appendEvent(db, NODE_ID, "orphan_detected", {
+		parentId: "root",
+		reason: "session-shutdown",
+		fate: "orphaned",
+		host: HOST,
+		remoteDir: h.remoteDir,
+		remoteTerminal: REMOTE_TERMINAL,
+		remoteSessionPath: h.remoteSessionPath,
+	});
+
+	const beforeFetch = coreRequests(h);
+	const text = textOf(
+		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
+	);
+	assert.match(text, new RegExp(`^recover: '${NODE_NAME}' is over on '${HOST}'`, "m"), text);
+	assert.match(text, /^execution: success$/m, "the real result, not the launch-time snapshot");
+	assert.match(text, new RegExp(`read-back from host '${HOST}': ${lines} of ${lines} lines \\(complete\\)`));
+	assert.ok(coreRequests(h) > beforeFetch, "recovery really went to the wire (6.2.3 fetched nothing)");
+	assert.equal(getNode(db, NODE_ID)?.status, "settled", "and it settled the row");
+
+	// The marker is history now (the settle event is newer), so the repeat is
+	// 6.2.3's idempotency: recorded verdict, no second fetch.
+	assert.equal(orphanMarkFor(db, NODE_ID), undefined);
+	const beforeSecond = coreRequests(h);
+	const second = textOf(
+		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
+	);
+	assert.match(second, new RegExp(`^recover: '${NODE_NAME}' is already settled \\(settled\\)`, "m"), second);
+	assert.match(second, /nothing was fetched/);
+	assert.equal(coreRequests(h), beforeSecond, "a settled row must not fetch again");
+});
+
+test("6.2.4 D2: a row 6.2.3 stamped `aborted (session-shutdown)` — terminal, no recorded verdict — is fetched, not refused", async (t) => {
+	const h = harness("recover-xm-623-leftover-");
+	t.after(() => h.cleanup());
+	const lines = writeRemoteSession(h, finishedTranscript("produced after the 6.2.3 exit buried it"));
+	seedLeftover(h, { status: "retired" });
+	const db = newSessionDb(h);
+	t.after(() => db.close());
+	// The exact 6.2.3 shutdown write: a terminal row whose retire event carries a
+	// REASON but no execution — nothing was ever graded.
+	appendEvent(db, NODE_ID, "node_retired", { parentId: "root", reason: "session-shutdown" }, { now: () => Date.now() - 60_000 });
+
+	const beforeFetch = coreRequests(h);
+	const text = textOf(
+		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
+	);
+	assert.doesNotMatch(text, /already settled/, "a retire without a verdict is not an answer");
+	assert.match(text, /^execution: success$/m, "the transcript on that machine is the answer");
+	assert.match(text, new RegExp(`read-back from host '${HOST}': ${lines} of ${lines} lines \\(complete\\)`));
+	assert.ok(coreRequests(h) > beforeFetch, "it fetched");
+	assert.equal(getNode(db, NODE_ID)?.status, "settled");
+});
+
+test("6.2.4 D2: hygiene converged an orphaned row to `failed` — the result is STILL fetched, not written off", async (t) => {
+	const h = harness("recover-xm-orphan-converged-");
+	t.after(() => h.cleanup());
+	const lines = writeRemoteSession(h, finishedTranscript("hygiene buried the row, not the work"));
+	seedLeftover(h, { status: "failed" });
+	const db = newSessionDb(h);
+	t.after(() => db.close());
+	// `scanOrphans` (D7 display-liveness) converges a stale open row: `failed` +
+	// `node_abandoned` with no execution. The exit marker says the result is still
+	// owed, so recovery must go to the wire instead of trusting the row.
+	appendEvent(db, NODE_ID, "node_abandoned", { reason: "no_active_supervisor", staleMs: 90_000 }, { now: () => Date.now() - 60_000 });
+	appendEvent(db, NODE_ID, "orphan_detected", {
+		parentId: "root",
+		reason: "session-shutdown",
+		fate: "orphaned",
+		host: HOST,
+		remoteDir: h.remoteDir,
+		remoteTerminal: REMOTE_TERMINAL,
+		remoteSessionPath: h.remoteSessionPath,
+	});
+
+	const beforeFetch = coreRequests(h);
+	const text = textOf(
+		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
+	);
+	assert.doesNotMatch(text, /already settled/, "a converged row is not a verdict about this child's work");
+	assert.match(text, /^execution: success$/m);
+	assert.match(text, new RegExp(`read-back from host '${HOST}': ${lines} of ${lines} lines \\(complete\\)`));
+	assert.ok(coreRequests(h) > beforeFetch, "it fetched");
+	assert.equal(getNode(db, NODE_ID)?.status, "settled", "and the recovered verdict replaced the abandoned guess");
+});
+
+/**
+ * #407: the 72h sweep and the recovery list must tell the same story.
+ *
+ * `runStartupHygiene` walks dead-owner run dirs and marks stale live rows
+ * `failed`. For a CROSS-MACHINE row that verdict was a guess about a process it
+ * cannot see: the owner dying here does not end the work over there. It also made
+ * the row vanish from `/legion status` (which lists live statuses only) while
+ * `recover` — which reads by name, status-blind — kept collecting it. The fix
+ * keeps such rows OPEN through the sweep, so both surfaces agree. The mutation
+ * that reverts it (drop the `host` predicate in `markAbandoned`) turns the two
+ * assertions below red: `report.abandonedNodes` gains the row, the status block
+ * disappears, and the row reads `failed`.
+ */
+test("#407 a 4-day-old cross-machine leftover survives the sweep: it stays in `/legion status` and `recover` still collects it", async (t) => {
+	const h = harness("recover-xm-swept-");
+	t.after(() => h.cleanup());
+	writeRemoteSession(h, finishedTranscript("the work outlived the sweep"));
+	const dead = 2 ** 22 + 12345;
+
+	// The run dir a previous session left behind: owner dead HERE, row 4 days old.
+	const store = new RunStore({ rootDir: h.root });
+	const run = store.createRun({ task: "leftover", cwd: h.remoteCwd });
+	const runDir = store.runDir(run.runId);
+	writeOwnerFile(path.join(runDir, RUN_OWNER_FILE), dead);
+	const dbPath = path.join(runDir, "legion.db");
+	const stale = Date.now() - 4 * 24 * 60 * 60 * 1000;
+	const seeded = openLegionDb(dbPath);
+	try {
+		insertNode(seeded, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: run.runId, status: "running", createdAt: stale, updatedAt: stale });
+		insertNode(seeded, { parentId: "root", name: NODE_NAME, role: "worker", kind: "pi", status: "running", host: HOST, remoteDir: h.remoteDir, remoteTerminal: REMOTE_TERMINAL, createdAt: stale, updatedAt: stale });
+	} finally {
+		seeded.close();
+	}
+
+	const sweep = runStartupHygiene({ storeRoot: h.root, isAlive: (pid) => pid === process.pid });
+	assert.deepEqual(sweep.abandonedNodes, [], "the only child here runs on another machine; there is no dead LOCAL owner to converge");
+
+	const db = openLegionDb(dbPath);
+	t.after(() => db.close());
+	assert.equal(getNode(db, NODE_ID)?.status, "running", "the sweep must not fail a row it cannot judge");
+
+	// ── visibility: the exact block `/legion status` renders ───────────────────
+	const status = statusText(db);
+	assert.match(status, /Recoverable cross-machine children \(this session never launched them\):/, "the leftover is still listed");
+	assert.match(status, new RegExp(`^- ${NODE_NAME} · ${NODE_ID} · host ${HOST} · running · `, "m"), "with the state the ledger actually holds");
+	assert.match(status, new RegExp(escapeRegExp(recoveryCallFor(NODE_NAME))), "and the call that collects it");
+
+	// ── recover: still effective on the row status just advertised ─────────────
+	const text = textOf(
+		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath }, crossMachine: h.settings }),
+	);
+	assert.match(text, /^execution: success$/m, "the transcript on that machine is the answer");
+	assert.match(text, /the work outlived the sweep/, "the child's own words travel back");
+	assert.equal(getNode(db, NODE_ID)?.status, "settled", "and recovery settles the row it advertised");
 });

@@ -9,6 +9,348 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [6.2.14] — 2026-11-24
+
+**一句话：in-process child 的诊断不再写进你的输入框上方 —— 它落到 `<runDir>/diagnostics.log`，要看时能查，不要看时不打扰。**
+
+- **`#468` PR #469。** 现象：用户输入框上方出现 `[pi-legion] in-process child … turn_end hook skipped: …`。
+  查明不是 UI notify（宿主交互模式不接管 stdout/stderr，`UIProxy.notify` 只服务 rpc child），
+  而是 `console.warn` 与宿主同进程同 TTY，编辑器占屏幕最后一块，于是正好落在输入框上方。
+  - **新增 child 作用域 sink**（`src/supervisor/child-diagnostics.ts`）：`<runDir>/diagnostics.log`，
+    一次 child run 一个文件，带时间戳/事件/原因；`bindChildSessionExtensions` 的 `onError`、
+    `session_shutdown`、armed `dispose`、`inprocess-supervisor` 的扩展注册失败全部改道。
+  - **默认零宿主输出**：实测（真宿主 + 真 pi-async，`dispose()` 落在一轮中）修前宿主 217 字节、
+    修后 0 字节（3/3），同一次运行诊断日志里有 `event=turn_end.skipped real=false`。
+  - **`PI_LEGION_CHILD_DIAGNOSTICS=1`** 才逐条回显（逐字符复现修前那 217 字节，证明只是换了通道、没丢信息）。
+  - **真扩展错误仍然可见**，但改成 run 结束一行汇总（含 `details:` 路径），不再逐条弹。
+  - 已知边界：`PI_LEGION_PHASES` 解析失败仍走 `console.warn`（启动期配置错误，用户必须当场知道）。
+
+## [6.2.13] — 2026-11-24
+
+**一句话：`status` 与 `stop` 对同一条记录必须给出一致的答案 —— 已经交付完的 in-process child 不再在重启后复活成 `working`，没人持有的行显示为 `unreachable (no supervisor)` 且仍能 stop 结算。**
+
+- **`#463` PR #464 幽灵 working 行。** 真实事故：一条 11/23 就交付完并退休的 in-process child，重启后在 `status` 里永远显示 `working`（`owner.json` 的 pid 是宿主自己，所以"活着"），而 `stop` 回 `unknown child (not tracked by this session)` —— 能列出、清不掉。三处落地：
+  - **一个判据**：新增 `src/runs/unsupervised-row.ts`，`status` 与 `stop` 共用（启动扫描用同一来源的更宽版本）；"有人持有"的判据包含 `sessionFile` 比对 —— 指向**本会话**才算持有，上一个会话的戳仍算幽灵。
+  - **重启收敛**：`reattach.ts` 的 `convergeLeftovers` 只打标记不写账本；账本已终态的行**原样保留**（#445 冻结的语义：既不收养也不公告）。
+  - **静默两侧边界**：#450 的"换 cwd 重启仍要重挂并显示 `store=`"与 #445 的"账本终态行不公告"都有回归测试钉住；`reclaimOrphan` 的收养竞态守卫收窄成同一口径，避免退化成"列得出停不掉"。
+  - 已知边缘（报告 §7）：会话标识 ≠ 进程标识的两种情形保守不收敛。
+
+## [6.2.12] — 2026-11-23
+
+**一句话：监督读失败不再等于 child 死亡 —— transport 断掉时保留终端地址与 run 记录，`unreachable` 状态可见、可 stop、恢复后自动续跟；顺带堵住「远端还在干活却判 failed，然后被重派」这一类重复劳动。**
+
+- **`#460` PR #461 监督失联与进程死亡分开。** 真实事故：一次跨机派发中宿主侧的 `terminal.get` 读失败（`hc connect exited (code 0)`），被当成 child 已结束 → run 判 `failed`、地址丢失；而远端子进程一直在跑，把同一颗 issue 又实现了一遍并开出重复 PR。四条落地：
+  - **`unreachable` 状态**：`live | unreachable | finished | retired`。失联时保留地址与 run 记录、`isAlive` 视为存活；首轮 3 次失败后转 30s 慢轮询，成功读取一次即折回 `live`。
+  - **`collect`/`wait` 不再误报失败**：回 `running` + `SUPERVISION_UNREACHABLE_REASON`（"监督失联，child 可能在跑"），不 retire、不结算。
+  - **只有确证死亡才结算**：`terminal.get` 回 `not_found`、`finished`、或真进程退出。`finished`/`retired` 不会被失联路径复活。
+  - **`stop` 仍可到达**：失联地址照样发 `terminal.kill`；投递失败时保留 `host`/`remoteTerminal` 供 #456 的孤儿回收。
+
+## [6.2.11] — 2026-11-21
+
+**一句话：重启 pi 之后不会再留下一批"干完了但退不掉"的远端进程 —— orphaned 行按它记下的终端地址自己结算；顺带让每条 hold 记录都带链上投票，事后可诊断。**
+
+- **`#456` PR #457 orphaned 行按终端地址回收。** 重启/会话替换后，上一个会话留下的 `orphaned` 行**既不能 stop、也不会自己结算**：`stop` 只查本会话/本 store，于是回 `unknown child (not tracked by this session)`；`status` 又按过期的 `owner.json` pid 把它算成 live → 远端终端把已经干完活的进程一直挂着（实测两条 centurion 干完活后挂了一天多，只能人工 `hc kill`）。四条落地：
+  - **按记录下来的终端地址结算**：`finished`/`killed`/`exited`/`missing` ⇒ `terminal-gone`，账本结算 + `run.json` retired；`missing` 只在地址是**记录下来的**时才算证据（推断地址的 miss 不算，沿用 `reattach.ts` 的既有守卫）。
+  - **idle-orphan**：终端 alive 但程序已结束 / 停在提示符 ⇒ 必须**两次 transcript 采样相等**才判 `stale-orphan` 并 kill+结算；增长 ⇒ `working`；取不到或变小 ⇒ `unknown`（两种都零写入）。
+  - **`stop` 接受 orphaned 句柄**：先本 store，再走 `candidateStoreRoots` 的有界跨 store 面；沿用 #445 的 owner 闸（别人活着的会话持有的行不碰），跨 store 同名**拒绝歧义**而不是猜。
+  - **导轨诚实**：`state=orphaned (terminal gone, work done)` / `(idle, transcript quiet)` / `(still working)` / `(liveness unknown)`；orphaned 行不再计入 live。每次清理写 `<storeRoot>/orphan-reclaim.log`（谁/何时/host+terminal/哪条证据/ledger 结果）。
+  - 验收 A1–A8 全用真 `hc` JSON-RPC + 真 `run.json`/ledger；**三条反向变异**实跑红后恢复：去掉「finished ⇒ 死行」→ A1 红；去掉两次采样/增长判据 → A2 红（反向用例：transcript 还在长 ⇒ 拒绝清理）；去掉 inferred-miss 守卫 → A7 红。
+- **`#439` PR #458 每条 hold 记录都带链上投票。** 前置 handler 明确返回 `continue:false` 时，hold 的投递出口原本无条件写回 `continue:true`，把别人的判断吞掉；而 pi 1.5.2 的 `emitBoundary` 里「前置 veto」与「还没人说话」是**同一个字节**（`false`），扩展侧没有传感器。6.2.10 的 `#440` 已落 `chainVote` 四态与 `peer-continue-false` 让路；本版补齐仍缺的三处：`HoldRecord.chainVote` 由可选改**必填**并覆盖 `hold:release`/`hold:commit`（1.5.2 用户唯一能看到的就是 `PI_LEGION_HOLD_TRACE` 这两行）、让路判决提到 `degraded`/`idle` 之前（投票是 boundary 的事实，不是本地 child 列表的事实；零行为差异，只让 outcome 如实）、四态矩阵 + 逐记录 + 1.5.2 整条 trace 的 `deepEqual`。
+  - 变异 4 条全红、恢复后 35/35 绿：恢复无条件 `continue:true` → 红×3；删「宿主可表达缺席」的学习 → 红×3；`false` 一律当否决（= 回滚 #417，红线）→ 红×2；只把 `chainVote` 从 release/commit 拿掉 → 红×2。
+  - 上游诉求不变：`BoundaryState.continue` 三态（`boolean | undefined`）或 `prior: BoundaryResult[]`；宿主不改，这一条在 1.5.2 上永远惰性。
+- **`#453` PR #453 并行写隔离配方以新用户身份实跑**：`#451` §3 的配方成立，审计面在 6.2.9 上不存在（文档变更，无代码）。
+
+**测试**：单测 2969（6.2.10 为 2907），集成 221（6.2.10 为 206），`npm run typecheck` exit 0。报告：`docs/reports/orphaned-reclaim.md`、`docs/reports/hold-439-peer-veto.md`、`docs/reports/2026-11-20-doc451-parallel-write-recipe.md`。
+
+## [6.2.7] — 2026-11-20
+
+**一句话：通知不再因为"会话被替换/重载"而静默丢失，也不会再把整条正文刷进 transcript。**
+
+- **`#442` PR #443 通知投递改用活 ctx。** `notice()` 此前用**扩展加载期捕获的 `pi`** 投递；
+  `ctx.newSession()`（会话替换/重载）之后宿主把它判为 stale，于是**那之后的每一条通知都静默丢失**，
+  只在 stderr 留一行 `notice not delivered`。现在按 **scope** 在调用时解析「活通道」：
+  `root` 常量 / 子节点 `(dbPath,nodeId)`（与 `resolveLegionIdentity` 同一信道，in-process child 走 ALS
+  而非 `PI_LEGION_*`），状态挂 `globalThis[Symbol.for(...)]` 以跨宿主 `moduleCache:false` 重载；
+  每次扩展加载 `rememberNoticeScope` + `installNoticeChannel`，`session_shutdown` 带 owner 校验地卸载；
+  捕获的 `pi` 只作最后兜底。自证：**真扩展加载两次 + 用旧 `pi` 调 `notice()`** → 新 `pi` 收到正文、
+  旧 `pi` 零调用、`console.error` 零行；把 `notice()` 回退成只用 `pi` → 3 条测试红。
+- **`#442` 失败路径不再刷屏。** 投递失败只出一行摘要（`reason` + `kind` + `bytes` + 去向），
+  正文写 `<run store>/notice-delivery.log`；同类失败 1s 内最多一行、其余计数。
+  自证：注入总抛错的 sender → 连续 10 次失败在 transcript 里只留**一行**，日志 10 条、末条 `deduped=9`。
+- **`#442` 同一次检测不再重复投递。** 同一 stall 检测 **60s 内只投递一次**并合并计数，
+  键 = `child + kind + tier + windowBase`（从冻结正文解析，归一掉 `[legion mail #N]` 与 `Detected at …`）。
+  自证：30ms 内三次同档检测 → 投递 1 次、日志 `deduped=2`；跨档（3h）照常投递。
+
+**测试**：单测 2866（trunk 2855，+11，全部为新增能力），集成 193/193，typecheck 绿。
+报告：`docs/reports/notice-delivery.md`。
+
+## [6.2.10] — 2026-11-20
+
+**一句话：自动接回不再只看当前目录（跨仓库派出的 child 也能找回来），并且 `worktree` 可以在派遣时显式关掉 —— `worktreePath` 记 `NULL` 而不是静默退化成 cwd。**
+
+- **`#450` PR #452 接回的扫描面扩到本机多个 store。** 6.2.9 的自动接回只看当前 cwd 的 run store，于是
+  "在 `~/code/anotify` 派出去、在 `~/agents` 重启"这种跨仓库场景**完全看不见**（`recover` 回 `searched ../code/pi-legion/.pi-subagents/runs`）。
+  现在：每条候选带**逐条 launch-cwd**（复用 `run.json.cwd`，缺省回落 `dirname(storeRoot)`，无新增持久字段）；
+  扫描面 = cwd + callerCwd + （cwd 在 `$HOME` 内时）其祖先与向下两层，realpath 去重、跳过 hidden/node_modules，
+  上界 32 store / 240 目录 / 深度 2，超界报 `truncated` + reason；`status` / `list all:true` / `recover` 跨 store 可见并标 `store=<label>`，
+  跨 store 同名**拒绝歧义**（列出 store+run 候选），`recover` 写回账本所属 store；摘要仍一行，同 store 时与 6.2.9 逐字一致。
+  验收含**真 `pi --print` 进程换 cwd 接回**、三 store 一次采纳 429ms、同名不串味、四个变异实跑均红。
+- **`#451` PR #454 `worktree` 可显式覆盖。** 此前编排层硬编码 `worktree: true`（`src/runs/orchestrator.ts:1940`），
+  派遣参数无法关掉，只能降级成"多个 worker + 预建 worktree"。现在 launch 级 `worktree:false` 覆盖角色卡：
+  在该 `cwd` 就地工作、**不建树**、`worktree_path` 严格记 **SQL NULL**（此前缺失会让 `node.worktreePath ?? options.cwd`
+  静默退回 cwd，resume/collect 可能跑在错的树上），并新增 `worktreeSource: role|request` 让 `status` 看得出这个 worktree 是谁要的。
+  `#214` 反向不变（非 centurion 仍拿不到 worktree）。契约新增 `docs/contracts/worktree-override-v1.md`：
+  **预建 N 棵树、一树一 launch call + call-level 绝对 `cwd`、一个 centurion = 一个交付单元**，并用真 centurion 按文档跑通两棵树并行写。
+
+**测试**：单测 2907（trunk 2907），集成 206（trunk 201，+5），typecheck 绿。
+报告：`docs/reports/reattach-cross-store.md`、`docs/reports/worktree-override.md`。
+
+## [6.2.9] — 2026-11-20
+
+**一句话：重启 pi 之后，上一个会话派出去的跨机 child 会被自动接回来（状态、通知、结算全部恢复），不再需要人工 `recover`；顺带修掉一个会让 legion 进程崩掉的 EPIPE。**
+
+- **`#445` PR #447 session 启动时自动接回活着的跨机 child。** 此前重启/会话替换后，远端仍在跑的 child 对新会话完全不可见 ——
+  `status` 看不到、完成通知不会来，只能人工 `subagent({action:"recover"})` 一个个捡，用户体感是"任务全没了"。
+  现在 session start 后会跑一趟**有界**（每 child 3s、最多 20 个、整趟 ≤5s、`void async` 不阻塞 session_start）的接管：
+  候选 = run store 里 `launching/working/orphaned/unfetched` 且 owner 不是当前会话的行；活性 = 远端 terminal 程序在跑 ∨
+  无 terminal 地址时 transcript 两次采样在增长（`unreachable`/`unknown` 一律不接管，`unknown ≠ live`）；
+  **硬闸**：另一个仍活着的会话持有的行不接管（`owned by <session>`），账本行已 settled/retired 的不接管不通知。
+  `notifiedAt` 闩锁在**送达后**才写，未送达的下次启动补发。session start 只打一行摘要（细节进 `reattach-live-children.log`）。
+  `subagents.reattachLiveChildren: false` 可关。端到端（真 hc）：A 死 → B 启动 → `status` 显示 `state=working host=…` →
+  对端结束后**自动一条完成通知**、账本 settled、再启动不采纳不重报，**全程未调用 `recover`**。
+- **`#447` `hc` 子进程中途退出不再打死 legion（EPIPE）。** `HcCliClient` 只 catch 了同步 `write()`，没给 `child.stdin` 挂
+  `error` 监听：假 `hc` 先退出时 EPIPE 从 stdin 的 `error` 事件冒出来 → `uncaughtException` **打死整个进程**。
+  现在 `stdin.on("error")` 记录 `exitReason`、拒绝全部 pending、reap 子进程 —— EPIPE 从"崩溃"变成"连接已死"的业务事实。
+  变异：去掉监听 → 端到端用例稳定红 `uncaughtException: write EPIPE`，两条新单测也红。
+
+**测试**：单测 2891（trunk 2866，+25），集成 201（trunk 193，+8），typecheck 绿。
+报告：`docs/reports/reattach-live-children.md`、`docs/reports/stall-candidates.md`。
+
+## [6.2.8] — 2026-11-20
+
+**`#441`：stall 告警不再给已退休的 child 发「跑了 1h45m」，也不再跨机恒真。** 今天 10+ 封误报的两个根因：
+(a) 候选集只看 ledger 行，而 `run.json` 早已 `state=retired`（行要等父 collect 才动），于是退役 1h23m 后还在
+报、还会被 `extend` 续命；(b) 跨机/终端后端的 child 本地看不到任何工具事件，`inFlightTool === undefined`
+**恒真**，"异常"于是退化成"跑得久"，而跑得久在大任务上必然成立。现在：
+
+- **候选集**加一条硬闸：ledger 终态 **或** `run.json` 终态（`state`/`execution.status`）⇒ 永不出 stall
+  通知、`extend` 直接拒绝（`child-ended`）。来源二选一即可，缺证据不算终态。
+- **L2 改成组合判据**：`越过阈值 ∧ 没有工具在飞 ∧（跨机/终端后端时）transcript 在窗口内无增长`。
+  拿不到增长证据 ⇒ `unknown ≠ stalled`，不告警；`working` 的容器（正在编译/正在 `gh pr checks --watch`）
+  一律算 working。本地 inprocess/rpc child 的 in-flight 栈是 sharper fact，不额外要求增长证据。
+- 新增 supervisor 只读成员 `observesToolEvents` / `programState`（`terminal.get` 的 7501 状态词，按需一次，
+  仅在阈值已越过时问），`TerminalSupervisor` 实现前者为 `false`、后者读真终端。
+- 报告：`docs/reports/stall-candidates.md`；合同：`docs/contracts/stall-candidate-filters-v1.md`。
+
+## [Unreleased] — 6.2.5（patch）
+
+**`#411`：跨机 child 的 transcript 不再实时镜像。** 跨机 child 的 `sessionFile` 是本机预先创建的
+**空占位文件**，远端写的是另一台机器上的 `<remoteDir>/session.jsonl`，两者之间没有字节搬运 ——
+于是面板永远 `No displayable messages`、`quiet` 恒增长（它 stat 的就是那个空文件）、
+run.json 的 `state` 永远停在 `launching`（`persistParentReservation` 写了 `launching`，
+spawn 成功后没有任何人写回 `working`）。现在 spawn 成功后启动 per-child **镜像泵**：
+按 byte offset 增量追加远端新增字节（`wc -c` + `tail -c +N`），默认 5 s、本地只留末尾 4 MiB、
+远端变小重置 offset 并 warning、单行超窗时窗口增长而不冻死、稳态是 `O_APPEND` 追加（inode 不变，
+既有增量解析缓存不失效）；`collect` 在 `settled` 时做**最终同步**再停泵（带 5 s deadline），
+泵失败只 warn 一次、绝不影响 child；`retire`/`retireAll` 停泵。`quiet` 因此自动变成
+「最后一次真实增量」，并且在第一个增长 tick 把 run.json 的 `launching` 推成 `working`。
+`subagent status` 新增一行 `mirror=ok(<n> bytes)` / `mirror=stale(<n> bytes)` / `mirror=off`。
+`PI_LEGION_LIVE_MIRROR=off` 可关（关闭时不装定时器）。
+报告：`docs/reports/live-mirror.md`。
+
+- **D1：泵写 `child.sessionFile`，不写 `remote/<name>.jsonl`。** 后者是 `sessionFileOf()`
+  优先读的读回镜像，由 `createRemoteSessionReadback` 在 collect 时整段覆盖写；两个文件
+  不同名、不同写者。写 `sessionFile` 让面板、`lastJsonlEventAgeMs`、`progressFromSessionFile`
+  全都不改就能工作。
+- **D2：`index.ts` 的 5 个 `new Orchestrator(...)` 站点各加 `...liveMirrorFrom()`**（与既有
+  `...rpcApproveFrom(settings)` 同型）—— seam 缺席仍然是「没有泵」，但生产必须有人提供它，
+  否则 #411 在真实运行里一个字都不会变（对抗式审查把这点列为 critical）。
+- **D3：变异可红。** 删掉追加 → 7 红；删掉 settle 最终同步 → 2 红；`tail -c` 丢 1-based
+  → 1 红；删掉缩小重置 → 2 红；no-op tick 也重写 → 3 红。
+
+**`#423`：跨机 launch 不再静默变成本地空壳。** launch 现在**必须拿到启动证据**才成功：拿不到远端 terminal
+地址、或窗口内看不到远端 `session.jsonl`（`REMOTE_STARTUP_CONFIRM_MS` 8s → 20s），就是 `START_FAILED`，
+回执带机器名 / cwd / 终端地址 / `hc` 错误原文 / **该终端最后 6 行原文**；失败的 launch 不留下任何 `working`
+或 `launching` 记录，并会 kill + rm 自己建的空终端（同名重派不再撞 `NAME_TAKEN`）。
+同时：`run.json` 落 `host`/`remoteDir`/`remoteTerminal`；`subagent status` 对「无 terminal 且无 session」
+打 `liveness=unknown (…)` 而不是 `working`；无执行证据的退役不再是 `execution: success`；空壳不进 stall 候选集。
+真机还发现 `terminal.get` 的 `screen` 字段回的是模式词（hc 0.1.21 实测 `"exact"`），屏幕文本改为读
+`terminal.read`（纯读方法，新加入 `HC_METHODS`）。报告：`docs/reports/launch-verification.md`。
+
+**`#413`：L2 stall notice 的重复投递。** 去重键从「上一封的发出时刻」改成**越过的阈值线**
+（`(child, kind, windowBase, thresholdMs, tier)`，`tier = floor(elapsed / thresholdMs)`）：
+同一条阈值线无论检查多少次都只 1 封，越过下一条线才再发一封；`extend` 把基准前移到
+`now` 并清空 L2 的已通知阶梯，下一封在 `now + loopRadiusMs`（整条阈值重新起算）。
+报告：`docs/reports/stall-notice-dedupe.md`。本轮**只做第 1 层**；第 2 层（跨机 child 的
+quiet 判据）已由 #411 补齐输入，第 3 层不在本 PR。
+
+`status` 的归属事实：遗留行不再猜 age，也不再只说「有个叫 X 的东西在远端」。
+报告：`docs/reports/status-attribution.md`。本轮范围**只含 D1/D4/D5-rendering**，
+其余项已拆分为 issue：#407（72h sweep 抹掉跨机遗留，本版已修，见
+`docs/reports/leftover-visibility.md`）、#408（14 天 retention 删归属证据，本版已修，见
+`docs/reports/retention-keeps-attribution.md`）、
+#409（anchor / where 归属）、#410（spawn cwd 误报成程序不存在）、
+#411（跨机 transcript 实时镜像，本版已修，见 `docs/reports/live-mirror.md`）。
+
+- **D1：`<N> old` 改用 `createdAt`。** `updatedAt` 会被 hygiene 的 `markAbandoned`
+  每次 sweep 改写，于是搁置一周的遗留显示「2m old」—— age 是假的。现在 age 取
+  不可变的 launch 时刻（`nodes.created_at`），`updatedAt` 作为「最后心跳」单独打印。
+- **D4：一套归属行，三处共用。** `/legion status` 的遗留块、`recover` 的首行、
+  `recover` 的 miss 现在都打印同一个 `renderRemoteOwnershipBlock()`：
+  `- <name> · <node.id> · host <h> · <orphaned|unfetched|running|abandoned> · terminal <h>/<addr>`
+  + `launched <ISO> (<human>)  · run <runId> · cwd <cwd> · session <basename>`
+  + `owner pid <pid> (<alive|gone since <ISO>>)` + `heartbeat <ISO> (<human>)` +
+  `collect: …`。`cwd`/`sessionFile` 本来就在 run.json 里，是 `runsNewestFirst`
+  把它们丢了 —— 现在带出来，零迁移。owner pid 读 run dir 的 `owner.json`。
+- **D5（只做渲染）：live 跨机 child 一定打印 `host=` / `terminal=`。** 之前只有
+  记录里恰好有值才有这两行，「本地」与「字段没送到渲染器」在输出里长得一模一样。
+  现在每个 live child 都写 `host=<机器>` / `terminal=<machine>/<addr>`，拿不到时
+  显式写 `host=local` / `terminal=-`；跨机行再加一行
+  `see: hc read <machine>/<terminal>   (cross-machine children have no Herdr pane)`。
+  数据来源：run store 的 `child.host`/`child.remoteTerminal` 优先，缺了读 ledger 的
+  `nodes.host`/`nodes.remote_terminal`；`/legion status` 与 `subagent status` 同源。
+- **#407：72h sweep 不再改判跨机遗留。** hygiene 的 `markAbandoned` 只处理 `host`
+  为空的本地行：owner 在本机死掉不等于远端的工作结束，而这一行是 `recover` 唯一
+  还能收的证据。之前它被改成 `failed`，于是 `/legion status` 的遗留块（只筛 live
+  状态）把它藏起来，`recover` 却仍按名字收得到 —— status 说「没了」，recover 说
+  「还能收」。现在行保持 open（`orphaned`/`unfetched` 依赖的同一不变量），年龄仍由
+  归属块的 `launched`/`heartbeat` 如实显示。报告：`docs/reports/leftover-visibility.md`。
+- **#408：14 天 retention 不再删掉唯一的归属证据。** prune 之前先读 run 的 ledger，
+  只要其中还有 **unsettled 跨机行**（`host` 非空且 status ∈ `starting/running/blocked`，
+  与 `listUnsettledRemoteNodes` / `/legion status` / `recover` 同一谓词）就跳过这个
+  run dir：它的 `nodes.remote_dir` / `nodes.remote_terminal`（schema v5）是本机唯一能回答
+  「远端那个目录/终端是谁的」的记录，删掉之后远端目录与终端还在、本地查无此人。
+  **只保护这一类行**：没有跨机行、或跨机行已经结算（`settled`/`failed`/`retired`）的
+  空闲 run dir 照旧删（不是「永不删除」）；ledger 读不出来时保留并记进 sweep 的 `errors`
+  （不盲删）。`/legion doctor` 的 storage 段把它们列出来，带 `remote_dir=` /
+  `remote_terminal=` 与 `hc terminal ls --on <host>` 的查法，`.hygiene-last.json` 多一个
+  `keptRemoteRuns` 计数。`markAbandoned` 的本地行谓词（#407）一行未动。
+  报告：`docs/reports/retention-keeps-attribution.md`。
+
+## [6.2.6] — 2026-11-19
+
+**一句话：跨机 child 从"派出去就看不见"变成"边跑边看得见"；任务在回合内就能被处理完，而不是回合结束才发现。**
+
+- **`#411` PR #429 跨机实时镜像泵（三层）。** ①泵：`hc` `wc -c` + `tail -c`(1-based) + BASE64 直解，按 **byte offset 增量**追加，默认 5s，本地留末尾 4 MiB（按行边界裁）；远端变小 → 重置 + 一条 warning；稳态用 `O_APPEND`（**inode 不变**，既有增量解析缓存不失效），只有 cap 裁剪/重置才走 temp+rename；tick 串行化，`stop()` 后在飞 tick 不再落盘。②settle 最终同步：`collect()` settled 时 `finalSyncLiveMirror({stop:true})`，**带 5s deadline + race**（不能把"child 结束了"变成"还在 collect"）；泵失败只 warn 一次，绝不影响 child。③状态机：`onGrowth` 推动 run.json `launching → working` 并推账本 `starting → running` —— 此前 `persistParentReservation` 写 `launching` 后**全仓无人写回 `working`**，这就是"永远 launching"的机制。`status` 新增 `mirror=off` / `mirror=ok(<n> bytes)` / `mirror=stale(<n> bytes)`，本地 child 输出**逐字节不变**。真机：`0 → 31162 → 32926 → 33232`（5 次采样）→ settle 后 `38094`，与远端 `wc -c` 逐字节相等。变异 5/5 红。
+- **`#417` PR #436 settle hold。** 有 subagent 时父回合在 settle 前停留，让"任务完成"在同一回合内被处理：`agent_before_settle` **唯一 owner**（无 `turn_end`）、**永不 `continue:false`**、必须 `entries: [...event.entries, ...drafts]`、预算 `legionHoldMaxMs=600000` 到期不续跑、退出**先 release 再 return** + 持久 `notified_at` 闩锁（重启不重发）、正常与取消分词且 **abort 后不发通知**、用户消息路径不阻塞。真机：正常 settle `heldMs 7619`，通知在 `hold:end+1ms` 落盘并被同轮续跑读到；Esc abort **13ms 释放**（盲等写法 5689ms），`entriesOut 0`、**0 条通知 + 0 条孤儿 draft**。附带修 `join.ts`：被阻塞兄弟的 join 窗口不再藏住另一个已完成的兄弟通知。变异 9/9 红。已知边界（报告 §7）：`SETTLE_FALLBACK_MS` 在 hold 后未重新武装；`continue:true` 会覆盖前一个 handler 的 `continue:false`；亚毫秒 abort 窗口不可观测。
+- **`#414` PR #435 runId 透传（零迁移）。** 发起方 run id 进三个面：spawn 上下文（终端名 `lgl-<runId8>-<handle>`、远端目录 `<mirrorRoot>/<runId>/<name>`、`legion.run` 标签）、`run.json`/ledger（`parentRunId` + `initiatorRunIdOf` 子→父反查、产物 id `<runId>/<name>/r<round>`）、完成通知（`Run: <id>` 行 + `details.runId`）。**缺 runId 时旧形状逐字不变**（`lgl-<name>`/`no-run`/无标签/通知字节相同/老 run.json 仍可读），变异删兜底 → 20+ 条旧形状断言红。**不做 psid 身份层**（#405 以 not planned 关闭）。
+- **`#432` PR #434 本地 launch 的 cwd 预检。** 此前只有跨机侧有 preflight：本地 cwd 缺失时 Node 报 `ENOENT` 并把**程序名**写进 message，于是显示成 `cannot start "<node>": No such file or directory`，让人去查一个根本没问题的 node。现在本地分支在 `terminal.run` **之前**做 `path.resolve` 绝对化 + `isDirectoryOnDisk`（`worktree:true` 只建树的父链），拒绝时明确报 `cwd does not exist: <abs>` 并把程序标为 "is not the problem, and was never tried"；cwd 真存在时保留核心原文 `cannot start "<program>"`。变异：去掉预检 3 红、去掉 `resolve` 1 红。
+
+**测试**：单测 2830（6.2.5 为 2749，+81，全部为新增能力），集成 193/193，typecheck 绿。
+
+## [6.2.5] — 2026-11-19
+
+**一句话：派出去的 agent「到底有没有在跑」这件事，从这一版起有机制保证，而不是靠人肉 `find session.jsonl` 猜。**
+
+- **`#428` 新 worktree 不再卡在 pi 的 `Trust project folder?`。** 终端 child 的 argv 现在强制带
+  pi 的单次运行信任 `--approve`（本地与跨机两条路径都带）。**只影响 legion 自己创建的 worktree**：
+  不写 trust store、不改用户配置、不选 `Trust parent folder`，RPC/in-process 路径不动。此前跨机
+  launch 会返回成功、终端 `state=live`、父机记 `working`，而子进程永远停在那个交互提示上（0 字节
+  session，实测白等 30 分钟）。真机对照：同一路径去掉 `--approve` 就复现提示且无 session。
+- **`#430` launch 拿不到启动证据就 `START_FAILED`（不再留 `working` 空壳）。** 判据是「远端终端
+  地址可得 **且** session 文件出现」；失败回执带机器名、尝试的 cwd、终端地址、hc 原始错误、**该终端
+  最后 6 行**与可复现命令，并 kill+rm 自己建的空终端、回滚远端 worktree/镜像（名字释放，重派不再
+  `NAME_TAKEN`）。判词收敛在 `src/runs/launch-evidence.ts` 一处，status / stall / retire / stop 四面
+  共用：**没有执行证据的 child 退役不再报 `success`**。
+- **`#431` 每个终端 launch 都带 parent，祖先链可查。** 本地取 `HC_TERMINAL_ID`，跨机取目标机上
+  `lgl-anchor` 的**目标机本地地址**（用调用方 id 会被真 core 答 `no terminal`，用 `host/id` 这种
+  限定形式会被发送方 core 答 `unknown machine`）。`run.json` 记 `remoteTerminal → parentTerminal →
+  parentRunId`；解析不到父时**不静默**：回执与 `status` 打 `parent=absent(<原因>)`。
+- **`#426` spawn 的 cwd 缺失不再冤枉 node。** 父目录按需创建；真坏时报
+  `spawn_failed: cwd does not exist: <path>`，程序路径只作附注（此前会报 `cannot start "<node>":
+  No such file or directory`，让人去查一个根本没问题的 node）。
+- **`#425` `turn_end` 记录不再把健康的扩展点成故障源。** 宿主在「本轮 assistant 条目没有落盘 id」时
+  产生的 `<boundary>` 伪扩展记录（来自被继承扩展注册的 `turn_end` handler，不是扩展本身出错），
+  现在按三字段全等识别并降级为 `turn_end hook skipped: …`：不抛错、不静默、不再指着健康的扩展。
+
+**已知边界（本版不含，已在 issue 跟踪）**
+- 镜像泵（`#411` / PR #429）不在本版：跨机 child 的本地 mirror 仍是「settle 时才有内容」。
+- 本地（非跨机）launch 还没有 cwd preflight，报错仍可能归因到 node（`#432`）；跨机侧已修。
+
+## [6.2.4] — 2026-11-19
+
+6.2.3 真机验证（`docs/reports/release-6.2.3-verification.md` §3.2 / §3.3）暴露的两个遗留。
+报告：`docs/reports/orphan-on-natural-exit.md`。
+
+- **D2：父进程「自然退出」不再把仍在远端跑的 child 记成 `aborted`。** 6.2.3 的 shutdown 给
+  **每一个** live child 写 `retired` + `node_retired{reason:"session-shutdown"}`，跨机 child 也被
+  盖上 `aborted (session-shutdown)`。它既没有杀掉远端进程（实测：父进程退出后远端 `pi` 又跑了
+  75s 并写出了真实结果），也没有取回那个结果 —— `recover` 把 terminal 行当「already settled」，
+  零 fetch、只回 launch 时的 5 行快照，真实结果**永久不可取**。现在退出按三态判定（判定函数
+  `shutdownFate`，`src/legion/orphan.ts`）：
+  - 本地 child → **`aborted`**（进程随父退出而死，6.2.3 的行为逐字保留）；
+  - 跨机 child 仍在跑 / 状态未知 → **`orphaned`**；
+  - 跨机 child 的轮次已经结束（已有判词，或本机已有完整 mirror）而结果没取回 → **`unfetched`**；
+  - 收到 abort 且**确认**停止 → 仍记 `aborted`（`stop`/`abort` 路径不变）。
+  `orphaned`/`unfetched` 是 `TaskState` 与 run.json 的 `child.orphaned`（含 host / remoteDir /
+  remoteTerminal / **remoteSessionPath**），ledger 里是 `orphan_detected{reason:"session-shutdown",
+  fate}`（事件类型本来就在闭集 16 条内，契约不动），**节点行故意保持 open**：`hasEnded` 为假，
+  `listUnsettledRemoteNodes`（`/legion status` 的 recoverable 块）照旧列得出来。
+- **D2：退出不再杀、不再等跨机 child。** 一个还要在远端跑 30–60s 的 child，原来的 shutdown 会
+  `terminal.kill` 它，并且在 `--print` 的 `drainBeforeShutdown` 里**等它**（ref 住的轮询定时器
+  ⇒ `pi --print` 迟迟不退出）。现在 `releaseCrossMachineChildren()`（`src/extension/runtime.ts`）
+  在 drain 之前做三件事，顺序承重：先落定 fate（此时事实还在）、再 abort 这条 in-flight collect
+  （`job.collectAbort` 的 signal 合进 `ensureCollect`，因此定时器被清掉）、最后把 job 从表里摘掉
+  （drain 与 retire 循环都看不见它）。实测：父进程 **7.96s / 11.81s 自然退出（EXIT=0）**，远端
+  `sleep 30` 仍在跑。
+- **D2：`recover` 对 `orphaned`/`unfetched` 允许 fetch。** 判定阶梯里「already settled」收紧为
+  **`hasEnded` 且没有更新过的 orphan 标记、且 ledger 真的记过判词（`execution`）**。于是：
+  6.2.3 留下的 `aborted (session-shutdown)` 行（有 reason、无 execution）、被 hygiene 收敛成
+  `failed` 的遗留行、`orphan_detected` 标记行都会**真的去读远端转录**；读回并 settle 之后，
+  第二次调用仍是原来的 `already settled` + **零 fetch**（实测镜像 mtime 不变）。
+  `recover` 成功时还会 best-effort 把 run.json 记录同步成 `retired`（两本账不再互相打脸）。
+- **D3：`subagent({action:"status"})` 的 dead 块补上 host / 远端终端。** 之前只有 `recover` 的首行
+  才有这两个事实；现在 `host=remote` / `terminal=remote/lgl-<name>` 与 `supervisor=` / `session=`
+  并列（本地 child 不产生这两行）。
+- **回归**：SIGKILL 路径（ledger 留 `working` → 新进程 recover 16/16 → 二次 `already settled`）
+  未改；本地 child 的 shutdown 仍是 `retired` + `aborted (session-shutdown)`；有 assistant 回复
+  即不得 `aborted` 的规则（`attributeParentSessionShutdown`）未动。
+
+## [6.2.3] — 2026-11-19
+
+6.2.2 真机复跑暴露的 D / E 两个缺陷，外加自测台 `make xm` 钉住的两条真 bug（d0 / d1）。
+报告：`docs/reports/recover-and-false-failed.md`。
+
+- **D：新会话真的能恢复上一个进程的跨机 child**。`recover` 之前只认**本进程内存里的** ledger
+  identity（`ownLegionIdentity()`），而 identity 只在「本进程 launch 过一次」时存在 —— 于是
+  「上一个进程已经退出」这个 action 唯一的用途恰好不可用，一律回
+  `No legion ledger in this session`，`/legion status` 的 recoverable 块也永远空。
+  现在没有内存 identity 时**从磁盘**找（`<cwd>/.pi-subagents` 的 run store）：
+  `run.json` 的 `sessionFile` 命中本会话优先，否则 store 内最新、含该 node 名的 run；找到的句柄由
+  这次调用自己开关。`/legion status` 与 `recover` 用同一个发现函数，两个界面不会各说一套。
+- **D：settle 真的写回，第二次调用零 fetch**。判定阶梯重排为「已 terminal 的行第一，且不碰网络」——
+  只读**本机已存在的 mirror**，没有 mirror 就如实说「没有 fetch」+ 远端路径 + 取回命令。
+  之前 `already-settled` 排在 liveness 之后，而 `hc` 的终端在程序退出后仍保留
+  （`state` 恒为 `live`），所以第二次 `recover` 永远答「still live」、行永远不 settle。
+  同时把「终端还活着」与「程序已结束」拆开（`terminalProgramEnd`：`exit_code` /
+  `finished_ms` / `reason` / `state === "finished"` / program `done|error`），不再让保留终端冒充活进程。
+- **E：成功的跨机 child 不再被判 `failed`**。`assertLocalWorktree(child)` 站在 collect 的验收路径上，
+  而跨机 child 拥有自己的树（`worktreeHost`）—— 于是在任何 verdict 被评出之前整条记录就被拒，
+  2/2 复现。D13 守卫按它真正保护的东西收窄：远端树上的**本机** fs/git（删除、复用）仍拒，
+  远端 verify 走 `machine.exec{on}`，没有 remote-verify 时一条命令都不跑（attestation 照旧）。
+- **E：清理失败只做补充，绝不顶替真因**。launch 的 rollback 之前裸调 `removeChildWorktree`，
+  它自己再抛就把原始原因覆盖掉；现在逐步 try/catch 聚合成 `secondary: …`（原错误在前，
+  `code`/`details`/`stack` 保留）。collect 侧同一原则：有 assistant 回复的一轮就**是**交付，
+  管道抛错降级成 `<verdict> (delivered with cleanup warning: <原因>)`，输出 / artifact / ledger
+  的二次写入全部 best-effort。
+- **E：`pi -p` 自己退出**。终端后端持有一个会话级 `hc connect` 子进程，但没有任何地方关闭它；
+  `pi --print` 是「turn 结束让事件循环排空」（从不 `process.exit`），一个 ref 住的子进程就是一次
+  永不返回的 headless run（6.2.2 真机是手动 kill 的）。新增 `LegionSupervisor.shutdown?()`，
+  `session_shutdown` 在 retire 之后无条件关闭它（幂等、不抛），retire 等待本身也加了 5s 上限。
+  真机实测：父进程 `natural_exit=true, killed=false`，13s / 6s。
+- **d0：零配置 `collect` 真的会拉 transcript**。read-back 用的是 **launch** 解析器
+  （`resolveHostTarget` 要求 `hosts.<h>.cwd`），而零配置启动按调用发现目录、`hosts` 本来就空 ——
+  于是在第一次 fetch 之前就失败，还被上层吞掉，调用者只看到随后 D13 那句。新增
+  `resolveReadTarget`：读只需要 host，`mirrorRoot` 仅作 fallback；read-back 与终端探针都改用它。
+- **d1：远端 child 的 `collect` 能出 verdict**（同 E 的收窄）。另外
+  `verificationSummary` 之前用同一守卫读**本机**文件系统，而它的调用者正是 collect head，
+  跨机 child 因此丢一整行 `verification:`；现在远端树报记录值并标 `staleUnknown`
+  （`staleness not checked here (the tree is on another machine)`）。
+- **自测台**：`test/docker/xm/assert.mjs` 的 d0 / d1 从「钉住现状」翻成**正向断言**（mirror 行数、
+  远端最后一条 assistant 文本、read-back 行、verdict，且不得出现任何 ownership 句子）；
+  新增 `x0`：父 `pi --print` 必须**自己退出**（`killed` 即失败）——harness 之前把这个缺陷写成注释
+  并绕过了它。`xm-up.sh` 修一个只在「宿主 HOME 恰好是 `/root`」时才工作的挂载假设。
+
 ## [6.2.2] — 2026-11-19
 
 6.2.1 真机复跑暴露的三个问题 + 两个产品要求，都是「第一次就能跑通」这一目标的收尾。
@@ -35,6 +377,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   checkout/origin/git）以前都写「改派 worker —— `subagent({ agent: "worker", host, task })`」，
   而 `allowRoles` 默认只允许 `centurion`，照着做必然再撞一次。现在统一成「改派 centurion，让它在那台
   机器上创建 worker/scout」，并点明 `allowRoles` 的默认值，不再打印一个必然被拒的调用。
+- **in-process child 的 `turn_end` 诊断不再冒充扩展故障 (#415)**：`pi` 宿主在「这一轮的 assistant
+  条目没有落盘」时会往 `onError` 报一条 `extensionPath: "<boundary>"` 的记录（`<boundary>` 是宿主自己
+  的伪扩展名）。现场 `hygiene-doctor` 的 `turn_end` handler 来自被继承的 `pi-async`，所以 #383 的
+  「不注册」挡不住它。现在 child 侧这个 sink 按三字段全等识别该记录，改印 `turn_end hook skipped: …`
+  并说明「宿主一个 handler 都没跑」——不抛错、不静默、也不再指着健康的扩展。复现步骤与归属分析见
+  `docs/reports/turn-end-entry-id.md`。
 
 ### 已知限制
 
@@ -2522,7 +2870,9 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.2.2...HEAD
+[6.2.3]: https://github.com/zzjcool/pi-legion/compare/v6.2.2...v6.2.3
+[6.2.4]: https://github.com/zzjcool/pi-legion/compare/v6.2.3...v6.2.4
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.2.4...HEAD
 [6.2.2]: https://github.com/zzjcool/pi-legion/compare/v6.2.1...v6.2.2
 [6.2.1]: https://github.com/zzjcool/pi-legion/compare/v6.2.0...v6.2.1
 [6.0.1]: https://github.com/zzjcool/pi-legion/compare/v6.0.0...v6.0.1

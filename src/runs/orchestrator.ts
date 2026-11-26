@@ -19,7 +19,10 @@ import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
 import { wasFailedBySupervisor, wasSessionInterrupted } from "../legion/interrupt.ts";
+import { isCrossMachineHost, remoteSessionPathFor, shutdownFate } from "../legion/orphan.ts";
 import { obsoleteStaleStallNotices } from "../legion/mail-release.ts";
+import { crossMachineHost, isUnstartedShell, shellReason, transcriptBytesOf } from "./launch-evidence.ts";
+import { parentNoticeLines } from "./parent-anchor.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
@@ -66,7 +69,9 @@ import {
 	type RunRecord,
 	type SpawnMode,
 	SubagentError,
+	withSecondaryFailures,
 	type Usage,
+	type WorktreeSource,
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import { terminalHostAvailable } from "../supervisor/terminal-supervisor.ts";
@@ -102,7 +107,23 @@ import {
 	type RemoteReadbackResult,
 	type RemoteSessionRequest,
 } from "./remote-artifact.ts";
-import { assertLocalWorktree, normalizeHost, type HostTarget } from "./remote.ts";
+import { assertLocalWorktree, localWorktreePath, normalizeHost, type HostTarget } from "./remote.ts";
+import {
+	createLiveMirrorRemote,
+	LiveMirror,
+	resolveLiveMirrorConfig,
+	type LiveMirrorConfig,
+	type LiveMirrorFacts,
+} from "./live-mirror.ts";
+
+/**
+ * How long `collect`'s final mirror sync may spend before it is abandoned (#411).
+ *
+ * A settle is on the parent's critical path. The mirror is a convenience; a machine
+ * that answers in 30 s per round trip must not be able to turn "the child finished"
+ * into "the child is still collecting".
+ */
+export const LIVE_MIRROR_FINAL_SYNC_MS = 5_000;
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -136,6 +157,51 @@ export interface OrchestratorLegionContext {
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
 
+/**
+ * #411: the pump this layer holds for one child, as a plain shape.
+ *
+ * Structurally what `LiveMirror` is (`syncNow` is covariant, so the real class is
+ * assignable), but written out so the test seam can return any object of the same
+ * shape — including one made of counters.
+ */
+export interface LiveMirrorHandle {
+	start(): void;
+	stop(): void;
+	/** `deadlineMs` bounds the round trips a final sync may spend. */
+	syncNow(opts?: { deadlineMs?: number }): Promise<unknown>;
+	facts(): LiveMirrorFacts;
+}
+
+/** One `startLiveMirror` call's arguments, handed to the test seam. */
+export interface LiveMirrorRequest {
+	child: ChildRecord;
+	localPath: string;
+	/** Fired by the pump for every tick that GREW the mirror (never for a no-op). */
+	onGrowth: () => void;
+}
+
+/**
+ * The cross-machine live mirror seam (#411, contract §3).
+ *
+ * Every field is optional: `OrchestratorDeps.liveMirror` absent means "no pump is
+ * ever started", i.e. today's behaviour byte for byte.
+ */
+export interface LiveMirrorSeam {
+	/** Operator overrides; `resolveLiveMirrorConfig` gives env the last word. */
+	config?: Partial<LiveMirrorConfig>;
+	/** The env the config is resolved against (absent = `process.env`). */
+	env?: Record<string, string | undefined>;
+	/**
+	 * Test seam; production is `new LiveMirror({...})` over a `createLiveMirrorRemote`.
+	 *
+	 * ONE name for this seam: an alias would make two spellings of the same
+	 * freedom, and a caller that passed both would have to guess which one won.
+	 */
+	create?: (request: LiveMirrorRequest) => LiveMirrorHandle | undefined;
+	/** One warning sink; absent = one `[pi-legion]` line on stderr. Never throws. */
+	warn?: (message: string) => void;
+}
+
 export interface OrchestratorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
@@ -161,6 +227,25 @@ export interface OrchestratorDeps {
 	 * keeps today's behaviour (no remote text), which is what the local path is.
 	 */
 	remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
+	/**
+	 * #411: the cross-machine live mirror. Absent = no pump is ever started.
+	 *
+	 * A remote child writes `session.jsonl` on ITS machine while the record's
+	 * `sessionFile` here is an empty placeholder this machine pre-created, so the
+	 * panel, `lastJsonlEventAgeMs` and `progressFromSessionFile` all read zero bytes
+	 * forever. The pump copies the remote bytes into exactly that file, which is why
+	 * none of those readers had to change.
+	 */
+	liveMirror?: LiveMirrorSeam;
+	/**
+	 * Test seam for the launch ROLLBACK's worktree removal (defect E).
+	 *
+	 * The aggregation the launch path performs (`withSecondaryFailures`) is about
+	 * what happens when a cleanup step throws, and a step that cannot be made to
+	 * throw on purpose is a rule with no test. Production passes nothing and gets
+	 * the real {@link removeChildWorktree}.
+	 */
+	removeWorktree?: (opts: { repoCwd: string; dest: string; worktreeHost?: string }) => void;
 	/** Post-create bootstrap for child worktrees (legion.worktreeBootstrap). */
 	worktreeBootstrap?: string;
 	worktreeBootstrapTimeoutMs?: number;
@@ -179,6 +264,11 @@ export interface OrchestratorDeps {
 	launchQueue?: { maxPending?: number; timeoutMs?: number };
 	/** D9: one user-visible line per queued / admitted / expired / stopped launch. */
 	onLaunchQueueNotice?: (line: string) => void;
+}
+
+/** One failure as text — the form every rollback/diagnostic line uses (defect E). */
+function messageOf(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -226,7 +316,26 @@ export interface LaunchInput {
 	/** Provider id pinning `--provider` for an ambiguous bare model id (#123). */
 	modelProvider?: string;
 	thinking?: string | false;
+	/**
+	 * Worktree isolation for THIS launch (#451): when present, the value wins over
+	 * the role card (`agent.worktree`) — `false` means "work in the checkout this
+	 * launch already selected (`worktreePath`/this.cwd), create no tree".
+	 *
+	 * Absent = the card decides, which is the pre-#451 behaviour byte for byte
+	 * (a centurion in a Legion tree still resolves to `true`). Still subject to
+	 * #214: a non-centurion asking for `true` is demoted with a one-time warning.
+	 */
 	worktree?: boolean;
+	/**
+	 * #451: WHO decided {@link worktree}.
+	 *
+	 * When supplied (the tool layer), `worktree` is already the arbitrated value
+	 * and only `request` marks an explicit caller argument; the Legion branch
+	 * then ignores a `role`-sourced value exactly as it did before #451. Absent
+	 * (programmatic callers, resumes): a present `worktree` is the caller's
+	 * request. Recorded as `ChildRecord.worktreeSource`.
+	 */
+	worktreeSource?: WorktreeSource;
 	/**
 	 * Target machine for this launch; absent = this host (contract
 	 * `cross-machine-spawn-v1` D4). Normalized once by `normalizeHost` below and
@@ -410,9 +519,11 @@ export interface CollectResult {
  *
  * `"timeout"` is the only value that means "the wait budget ran out"; `"gone"`
  * means the process died, `"blocked"` that a child dialog is waiting on the
- * user and `"aborted"` that the parent turn was interrupted.
+ * user and `"aborted"` that the parent turn was interrupted. `"unreachable"`
+ * (#460) means the supervisor could not READ the child: the channel is down, so
+ * nothing is known — in particular, nothing says the child ended.
  */
-export type CollectWait = "settled" | "timeout" | "blocked" | "gone" | "aborted";
+export type CollectWait = "settled" | "timeout" | "blocked" | "gone" | "aborted" | "unreachable";
 
 export const COLLECT_GRACE_EXTENSIONS = 2;
 /**
@@ -429,6 +540,19 @@ export const COLLECT_GRACE_EXTENSIONS = 2;
 export const COLLECT_DEADLINE_REASON = "collect deadline (per collect attempt) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
+/**
+ * Shown when the supervisor's own read channel failed (#460).
+ *
+ * The run that produced this issue: `terminal.get` threw `hc connect exited (code
+ * 0)`, the wait threw, the collect became `execution: failed`, and the parent
+ * re-dispatched a child that was still working on the other machine — two
+ * implementations, two PRs. A failed READ is not a failed CHILD, so this says the
+ * narrow thing instead: supervision is lost, the child may be running, and both
+ * the run and its terminal address are kept so `collect`/`wait` (retry) and
+ * `stop` (kill) can still reach it.
+ */
+export const SUPERVISION_UNREACHABLE_REASON =
+	"supervision unreachable: this host cannot read the child's terminal (the hc channel failed), so the child may STILL be running — the run and its terminal address are kept; retry collect/wait, or stop to kill it";
 /**
  * Shown when a cross-machine transcript could not be read (xm-dispatch D3.3).
  *
@@ -459,6 +583,17 @@ export function settledStatusFor(execution: Pick<Execution, "status">): "settled
 }
 
 /**
+ * 6.2.4 / D2: did the work over there already end?
+ *
+ * Only the three graded outcomes count. `aborted`/`running`/`unknown` all answer
+ * `false` on purpose: an aborted collect snapshot says "aborted by parent", which
+ * is this side's exit talking, not the child's turn having finished.
+ */
+function executionIsTerminal(status: string | undefined): boolean {
+	return status === "success" || status === "failed" || status === "truncated";
+}
+
+/**
  * The `  ⚠ <name>: <text>` lines one launch owes its caller.
  *
  * One definition for BOTH render paths — the immediate `▶` line in `launchStep`
@@ -466,18 +601,43 @@ export function settledStatusFor(execution: Pick<Execution, "status">): "settled
  * renders no `▶` line at all, and a warning that only exists on the immediate path
  * is exactly the silent degradation D2 forbids. `warning` (model resolution) and
  * `warnings` (cross-machine extension skips) are different lists and both render.
+ *
+ * #409 adds the launch's PARENT to the same channel: a cross-machine child says
+ * which target-local address it hangs from (the proof the ancestry is connected
+ * on the other machine), and a launch that could not name one prints
+ * `parent=absent(<reason>)` instead of omitting the fact (`parent-anchor.ts`
+ * owns both sentences). Never fatal: a missing parent does not refuse a child.
  */
 export function launchNoticeLines(
 	name: string,
-	handle: { warning?: string; warnings?: string[] },
+	handle: {
+		warning?: string;
+		warnings?: string[];
+		parentTerminal?: string;
+		parentAbsent?: string;
+		host?: string;
+	},
 ): string[] {
 	const notices = [handle.warning, ...(handle.warnings ?? [])]
 		.filter((line): line is string => typeof line === "string" && line.length > 0);
-	return notices.map((line) => `  ⚠ ${name}: ${line}`);
+	return [
+		...notices.map((line) => `  ⚠ ${name}: ${line}`),
+		...parentNoticeLines(name, handle),
+	];
 }
 
 /** The warning lines of this launch's notice, or the bare notice when there are none. */
-export function noticeWithWarnings(line: string, name: string, handle: { warning?: string; warnings?: string[] }): string {
+export function noticeWithWarnings(
+	line: string,
+	name: string,
+	handle: {
+		warning?: string;
+		warnings?: string[];
+		parentTerminal?: string;
+		parentAbsent?: string;
+		host?: string;
+	},
+): string {
 	const warnings = launchNoticeLines(name, handle);
 	return warnings.length > 0 ? `${line}\n${warnings.join("\n")}` : line;
 }
@@ -659,6 +819,7 @@ export class Orchestrator {
 	private readonly maxSpawns: number | null;
 	private readonly verifyRunner?: VerifyRunner;
 	private readonly remoteVerify?: RemoteVerifyRunner;
+	private readonly removeWorktree: (opts: { repoCwd: string; dest: string; worktreeHost?: string }) => void;
 	private readonly remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
 	/**
 	 * This collect's remote transcripts, keyed by child name. Filled at the top of
@@ -668,6 +829,30 @@ export class Orchestrator {
 	 * ever being mutated.
 	 */
 	private readonly remoteSessions = new Map<string, RemoteReadbackResult>();
+	/**
+	 * #411: one transcript pump per child, keyed by name.
+	 *
+	 * Only ever filled for a child that runs ELSEWHERE (`normalizeHost(child.host)`
+	 * is defined) and only when `OrchestratorDeps.liveMirror` is present, so a local
+	 * run's map stays empty and every method below is a no-op.
+	 */
+	private readonly liveMirrors = new Map<string, LiveMirrorHandle>();
+	/**
+	 * #411: children whose pump already promoted their record.
+	 *
+	 * A cross-machine child has no local settle signal at launch time, so the FIRST
+	 * byte that arrives is the only evidence that the launch produced a working
+	 * turn. Promoting more than once per pump would rewrite `run.json` on every
+	 * growth tick for nothing.
+	 */
+	private readonly liveMirrorPromoted = new Set<string>();
+	/** Distinct warning texts already emitted by the mirror seam (no retry storm). */
+	private readonly liveMirrorWarned = new Set<string>();
+	private readonly liveMirrorDeps?: LiveMirrorSeam;
+	/** Operator overrides for the pump (`liveMirror.config`). */
+	private readonly liveMirrorConfig?: Partial<LiveMirrorConfig>;
+	/** The env the pump's config is resolved against (`liveMirror.env`). */
+	private readonly liveMirrorEnv?: Record<string, string | undefined>;
 	private readonly worktreeBootstrap?: string;
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
@@ -746,7 +931,11 @@ export class Orchestrator {
 		this.maxSpawns = deps.maxSpawns ?? null;
 		this.verifyRunner = deps.verifyRunner;
 		this.remoteVerify = deps.remoteVerify;
+		this.removeWorktree = deps.removeWorktree ?? removeChildWorktree;
 		this.remoteReadback = deps.remoteReadback;
+		this.liveMirrorDeps = deps.liveMirror;
+		this.liveMirrorConfig = deps.liveMirror?.config;
+		this.liveMirrorEnv = deps.liveMirror?.env;
 		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
 		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
@@ -850,6 +1039,26 @@ export class Orchestrator {
 	}
 
 	/** The failed read-back for this child, when its words never arrived here. */
+	/**
+	 * #423: the launch facts of one child, read the same way everywhere.
+	 *
+	 * `transcriptBytes` is measured on the file that actually holds the child's
+	 * words (`sessionFileOf`, i.e. the mirror for a cross-machine child) — a
+	 * placeholder with no bytes and a missing file answer the same question: the
+	 * child wrote nothing.
+	 */
+	private launchEvidenceFor(child: ChildRecord, transcriptFile = this.sessionFileOf(child)): {
+		host?: string;
+		remoteTerminal?: string;
+		transcriptBytes: number;
+	} {
+		return {
+			...(child.host !== undefined ? { host: child.host } : {}),
+			...(child.remoteTerminal !== undefined ? { remoteTerminal: child.remoteTerminal } : {}),
+			transcriptBytes: transcriptBytesOf(transcriptFile),
+		};
+	}
+
 	private transcriptUnavailable(child: ChildRecord): RemoteReadbackFailure | undefined {
 		const remote = this.remoteSessions.get(child.name);
 		return remote !== undefined && !remote.ok ? remote : undefined;
@@ -884,6 +1093,208 @@ export class Orchestrator {
 			localPath: remote.localPath,
 			remotePath: remote.remotePath,
 		};
+	}
+
+	// ── #411: the cross-machine live mirror ──────────────────────────────
+
+	/**
+	 * One warning through the seam's sink, once per distinct text.
+	 *
+	 * Everything the mirror can go wrong with is DIAGNOSTICS: a launch, a collect or
+	 * a retire must never fail because a transcript could not be copied.
+	 */
+	private warnLiveMirror(message: string): void {
+		const line = message.trim();
+		if (line.length === 0) return;
+		if (this.liveMirrorWarned.has(line)) return;
+		this.liveMirrorWarned.add(line);
+		try {
+			const sink = this.liveMirrorDeps?.warn;
+			if (sink) sink(line);
+			else process.stderr.write(`[pi-legion] ${line}\n`);
+		} catch {
+			/* an unruly log sink is not a mirror failure */
+		}
+	}
+
+	/**
+	 * Start the transcript pump for a freshly spawned child (#411, contract §3).
+	 *
+	 * Called right after `recordLegionLaunch` in `launch`, i.e. only once the child
+	 * really exists. A LOCAL child has its transcript on this machine already, so
+	 * the pump is not created for it at all — `create` is not even called.
+	 *
+	 * Never throws: an exception here would turn a readable child into a failed
+	 * launch, which is the one outcome this feature must not produce.
+	 */
+	private startLiveMirror(child: ChildRecord): void {
+		const deps = this.liveMirrorDeps;
+		if (deps === undefined) return;
+		try {
+			const host = normalizeHost(child.host);
+			if (host === undefined) return; // this host's own child: nothing to mirror
+			const localPath = typeof child.sessionFile === "string" ? child.sessionFile.trim() : "";
+			if (localPath.length === 0) return; // no destination, no pump
+			// A relaunch/resume replaces the pump instead of running two of them on one
+			// file, and the promotion fires again for the NEW turn.
+			this.stopLiveMirror(child.name);
+			this.liveMirrorPromoted.delete(child.name);
+			const entry = this.buildLiveMirror(deps, child, localPath, host);
+			if (entry === undefined) return;
+			this.liveMirrors.set(child.name, entry);
+			entry.start();
+		} catch (error) {
+			this.warnLiveMirror(`live mirror for '${child.name}' was not started: ${messageOf(error)}`);
+		}
+	}
+
+	/**
+	 * The production pump for one child, or the seam's replacement.
+	 *
+	 * `undefined` means "do not start a pump": either the seam declined, or this
+	 * build cannot know where that child writes (no `remoteDir`, i.e.
+	 * `createLiveMirrorRemote` has no path to read). A configured-OFF pump is still
+	 * created: it persists the one `mode:"off"` facts row `status` renders, and it
+	 * opens no connection at all.
+	 */
+	private buildLiveMirror(
+		deps: LiveMirrorSeam,
+		child: ChildRecord,
+		localPath: string,
+		host: string,
+	): LiveMirrorHandle | undefined {
+		const onGrowth = (): void => {
+			// Growth happens on the pump's own tick; the promotion is bookkeeping and must
+			// never be able to reject back into the pump.
+			void this.promoteLiveChild(child.name).catch(() => undefined);
+		};
+		const request: LiveMirrorRequest = { child, localPath, onGrowth };
+		const seam = deps.create;
+		if (seam) return seam(request);
+		const config = resolveLiveMirrorConfig({ env: this.liveMirrorEnv, overrides: this.liveMirrorConfig });
+		const warn = (message: string): void => this.warnLiveMirror(message);
+		const common = { localPath, intervalMs: config.intervalMs, maxBytes: config.maxBytes, onGrowth, warn };
+		if (!config.enabled) {
+			// Contract §3: a disabled pump still writes its facts row, so `status` can say
+			// `mirror=off` instead of an unexplained silence.
+			return new LiveMirror({ ...common, remote: undefined });
+		}
+		const remote = createLiveMirrorRemote({
+			host,
+			name: child.name,
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+		});
+		// `remoteDir` unknowable: guessing it would turn "we do not know where that
+		// child writes" into a permanent error row on every tick.
+		if (remote === undefined) return undefined;
+		return new LiveMirror({ ...common, remote });
+	}
+
+	/**
+	 * #411 (contract §3, "growth promotes the record"): the first byte that reaches
+	 * the mirror is the only local evidence that a cross-machine launch produced a
+	 * working turn.
+	 *
+	 * `persistParentReservation` writes `state:"launching"` into `run.json` and, for a
+	 * remote child, nobody ever wrote `working` back — that is the record that stuck
+	 * at `launching` forever. The ledger row gets the same treatment
+	 * (`starting` → `running`); `recordLegionLaunch` usually already did it, so this
+	 * is a guarded no-op in the common case and the correction in the other one.
+	 *
+	 * Runs ONCE per pump (see {@link liveMirrorPromoted}) and never throws.
+	 */
+	private async promoteLiveChild(childName: string): Promise<void> {
+		if (this.liveMirrorPromoted.has(childName)) return;
+		this.liveMirrorPromoted.add(childName);
+		try {
+			const memory = this.children.get(childName);
+			if (memory?.state === "launching") memory.state = "working";
+			const runStore = this.legion?.runStore;
+			const runId = this.legion?.runId;
+			if (runStore && runId) {
+				// Read first: `updateChild` throws `not found` for a name this run.json does
+				// not hold, and a pump must not spend its one promotion on a "not found".
+				const persisted = runStore.readRun(runId)?.children.find((entry) => entry.name === childName);
+				if (persisted?.state === "launching") {
+					await runStore.updateChild(runId, childName, (recorded) => {
+						recorded.state = "working";
+					});
+				}
+			}
+			const nodeId = memory?.nodeId;
+			const legion = this.legion;
+			if (legion && nodeId) {
+				const node = getNode(legion.db, nodeId);
+				if (node?.status === "starting") updateNode(legion.db, nodeId, { status: "running" }, this.now);
+			}
+		} catch (error) {
+			this.warnLiveMirror(`live mirror could not promote '${childName}': ${messageOf(error)}`);
+		}
+	}
+
+	/**
+	 * #411 (contract §3, "final sync + stop on settle"): one last fetch, then the
+	 * pump is retired.
+	 *
+	 * `collect` reaches this at the point its wait is known `settled`, immediately
+	 * before the read-back refresh — the transcript cannot grow once the turn is
+	 * over, so this is the last chance to have the child's words on this machine.
+	 *
+	 * Never throws: a failing final sync is a warning, never a failed collect.
+	 */
+	private async finalSyncLiveMirror(child: ChildRecord, opts?: { stop?: boolean }): Promise<void> {
+		const entry = this.liveMirrors.get(child.name);
+		if (entry === undefined) return;
+		// BOUNDED, and bounded twice. `deadlineMs` stops the read loop at a wall clock,
+		// and the race stops the AWAIT even when one `hc` round trip hangs — a settle is
+		// on `collect`'s critical path, and "the mirror is behind" must never present
+		// itself to the parent as "the child is still collecting". The abandoned tick is
+		// harmless: `stop()` flips the pump's `stopped` flag, so it writes nothing more.
+		const deadlineMs = LIVE_MIRROR_FINAL_SYNC_MS;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.resolve(entry.syncNow({ deadlineMs })).then(() => undefined),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, deadlineMs * 2);
+					const unrefable = timer as unknown as { unref?: () => void };
+					if (typeof unrefable.unref === "function") unrefable.unref();
+				}),
+			]);
+		} catch (error) {
+			this.warnLiveMirror(`live mirror final sync for '${child.name}' failed: ${messageOf(error)}`);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+		if (opts?.stop === true) this.stopLiveMirror(child.name);
+	}
+
+	/** Stop and forget one child's pump. Idempotent, never throws. */
+	private stopLiveMirror(name: string): void {
+		const entry = this.liveMirrors.get(name);
+		if (entry === undefined) return;
+		this.liveMirrors.delete(name);
+		try {
+			entry.stop();
+		} catch (error) {
+			this.warnLiveMirror(`live mirror for '${name}' did not stop cleanly: ${messageOf(error)}`);
+		}
+	}
+
+	/**
+	 * #411: the pump's own facts for one child (`undefined` when it never had one).
+	 *
+	 * The seam `status` reads through, and the assertion target for the wiring tests:
+	 * "was a pump created, and is it on or off" is not derivable from the record.
+	 */
+	liveMirrorFacts(name: string): LiveMirrorFacts | undefined {
+		const entry = this.liveMirrors.get(name);
+		if (entry === undefined) return undefined;
+		try {
+			return entry.facts();
+		} catch {
+			return undefined;
+		}
 	}
 
 	sessionFileFor(name: string): string {
@@ -936,7 +1347,7 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}), ...(node.worktreeHost ? { worktreeHost: node.worktreeHost } : {}), ...(node.host ? { host: node.host } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; worktreeHost?: string; host?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string | null; worktreeHost?: string | null; host?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -998,7 +1409,7 @@ export class Orchestrator {
 				// ledger says why a stint restarted without a transition — the event set
 				// stays closed (no new type, no new mail subject).
 				const revivedAt = this.now();
-				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, worktreeHost: input.worktreeHost ?? previous.worktreeHost, host: input.host ?? previous.host, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
+				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath === null ? null : input.worktreePath ?? previous.worktreePath, worktreeHost: input.worktreeHost === null ? null : input.worktreeHost ?? previous.worktreeHost, host: input.host ?? previous.host, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
 				if (previous.phase !== null) {
 					this.emitStored(input.nodeId, "phase_change", { from: previous.phase, to: previous.phase, reworkCount: previous.reworkCount, reason: "revived" });
 				}
@@ -1047,7 +1458,7 @@ export class Orchestrator {
 		return gate.value;
 	}
 
-	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; worktreeBranch?: string; worktreeHost?: string; host?: string }): Promise<boolean> {
+	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; worktreeBranch?: string; worktreeHost?: string; host?: string; worktreeSource?: WorktreeSource; worktreeOptOut?: boolean }): Promise<boolean> {
 		const legion = this.legion;
 		const parentRunId = legion?.runId;
 		if (!legion?.runStore || !parentRunId) return false;
@@ -1067,7 +1478,19 @@ export class Orchestrator {
 				if (input.worktreePath) child.worktreePath = input.worktreePath;
 				if (input.worktreeBranch) child.worktreeBranch = input.worktreeBranch;
 				if (input.worktreeHost) child.worktreeHost = input.worktreeHost;
+				// #451: the audit fact lands with the reservation, and an explicit opt-out
+				// CLEARS the previous launch's tree instead of leaving it to look current.
+				if (input.worktreeSource) child.worktreeSource = input.worktreeSource;
+				if (input.worktreeOptOut) {
+					delete child.worktreePath;
+					delete child.worktreeBranch;
+					delete child.worktreeHost;
+				}
 				if (input.host) child.host = input.host;
+				// #414: the dispatching run, written from the reservation moment on, so
+				// even a record left behind by a launch killed later still answers
+				// "whose child is this". Same value `recordChild` persists.
+				child.parentRunId = parentRunId;
 			});
 			return false;
 		}
@@ -1084,9 +1507,61 @@ export class Orchestrator {
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
+			...(input.worktreeSource ? { worktreeSource: input.worktreeSource } : {}),
 			...(input.host ? { host: input.host } : {}),
+			// #414: the reverse-lookup key, present from the first write (see above).
+			parentRunId,
 		});
 		return true;
+	}
+
+	/**
+	 * #423 req 3: write `host` / `remoteDir` / `remoteTerminal` onto the run.json
+	 * child the moment the backend reports them.
+	 *
+	 * Before this, the three fields existed on the in-memory record and on the
+	 * ledger row (`updateNode` in {@link recordLegionLaunch}) but reached `run.json`
+	 * only if a later control call happened to persist the whole object — so the
+	 * record a fresh process reads first (and the one the issue was debugged from)
+	 * had `cwd=<this host>` and NO machine at all. A reader cannot then answer
+	 * "where does this child run" or "which terminal do I look at", which is the
+	 * whole point of persisting them.
+	 *
+	 * Best effort by construction: the launch already succeeded, and a store write
+	 * that fails must not turn a running child into a failed launch.
+	 */
+	private async persistChildRemoteFacts(child: ChildRecord): Promise<void> {
+		const legion = this.legion;
+		const runId = legion?.runId;
+		const host = crossMachineHost(child.host);
+		if (!legion?.runStore || !runId || !child.nodeId) return;
+		if (
+			host === undefined &&
+			child.remoteDir === undefined &&
+			child.remoteTerminal === undefined &&
+			child.parentTerminal === undefined &&
+			child.parentAbsent === undefined
+		) return;
+		try {
+			const recorded = legion.runStore.findChild(runId, child.name);
+			if (!recorded) return;
+			if (recorded.nodeId !== child.nodeId) return;
+			await legion.runStore.updateChild(runId, child.name, (current) => {
+				if (host !== undefined) current.host = host;
+				if (child.remoteDir !== undefined) current.remoteDir = child.remoteDir;
+				if (child.remoteTerminal !== undefined) current.remoteTerminal = child.remoteTerminal;
+				// #409: the ancestry chain lands with the other launch facts, for the same
+				// reason: a later control call may never come, and a record without it can
+				// only show a terminal whose parent nobody can name.
+				if (child.parentRunId !== undefined) current.parentRunId = child.parentRunId;
+				if (child.parentTerminal !== undefined) current.parentTerminal = child.parentTerminal;
+				if (child.parentAbsent !== undefined) current.parentAbsent = child.parentAbsent;
+			});
+		} catch (error) {
+			process.stderr.write(
+				`[pi-legion] could not record the machine facts of '${child.name}' in ${runId}/run.json (${messageOf(error)}); the child itself is unaffected.\n`,
+			);
+		}
 	}
 
 	private recordLegionLaunch(child: ChildRecord, agent: AgentConfig, task: string, teamOverride: string | undefined, resumed: boolean): void {
@@ -1455,9 +1930,18 @@ export class Orchestrator {
 		}
 		// #371 G2/G3/G4 live BELOW the cross-machine guards on purpose — see the
 		// "why the preflight runs before the phases validation" note there.
-		// #214 D4: only centurion may hold worktree. Legion path still forces
-		// centurion→true and centurion-parent→member false; non-centurion
-		// requests from any source are demoted below (D1: warn, never throw).
+		// #214 D4: only centurion may hold worktree. A Legion path still forces a
+		// centurion's role-pinned `true` when the caller said NOTHING, and still
+		// forces a centurion-parent's member to `false`; non-centurion requests from
+		// any source are demoted below (D1: warn, never throw).
+		//
+		// #451: an EXPLICIT launch value wins over the role card on BOTH paths. Before
+		// this, the Legion branch was hardcoded `true`, so
+		// `subagent({agent:"centurion", worktree:false})` could not be expressed at
+		// all: the only way to work inside an existing checkout was to give up the
+		// role. `worktreeSource` is the audit split — the launch argument
+		// (`request`) or the card (`role`) — and it is recorded on the child
+		// (`ChildRecord.worktreeSource`) so `status` can say who asked.
 		//
 		// #345: the nested-worktree probe is a REAL subprocess — one synchronous
 		// `git rev-parse` at 5–7ms, 60% of a worker launch — and it used to be an
@@ -1465,10 +1949,17 @@ export class Orchestrator {
 		// and its answer was then thrown away: the demotion below forces every
 		// non-centurion to `false` no matter what the probe said (18/18
 		// combinations of roleDefault × launch × parentInWorktree). It is asked only
-		// on the centurion branch, which is the only one it can change.
+		// on the LIB centurion branch, which is the only one it can change; the
+		// Legion branch never probed and still does not (`!this.legion &&
+		// isInsideChildWorktree(...)` short-circuits before the git call).
+		const worktreeSource: WorktreeSource = input.worktreeSource ?? (input.worktree !== undefined ? "request" : "role");
 		let worktree = isCenturion
 			? (this.legion
-				? true
+				? resolveLaunchWorktree({
+					// Frozen #214 rule: a centurion with no caller decision holds a tree.
+					roleDefault: true,
+					launch: worktreeSource === "request" ? input.worktree : undefined,
+				})
 				: resolveLaunchWorktree({
 					roleDefault: input.agent.worktree,
 					launch: input.worktree,
@@ -1488,6 +1979,13 @@ export class Orchestrator {
 			this.warnWorktreeDenied(input.agent.name);
 			worktree = false;
 		}
+		// #451: a caller who explicitly said `false` wants THIS checkout, so an
+		// earlier launch's tree must never be resurrected (a plain resume seeds
+		// `worktreePath` from the previous record, and `resume` re-derives its
+		// worktree flag from `saved.worktreePath` — keeping it would make the
+		// opt-out silently fail on the second launch). Raw `input.worktree`, not
+		// the arbitrated value: a demoted non-centurion is not an opt-out.
+		const explicitWorktreeOptOut = isCenturion && worktreeSource === "request" && input.worktree === false;
 		// ── Cross-machine (contract `cross-machine-spawn-v1` D1) ──
 		//
 		// A host is honored by the terminal backend only. Everything here fails
@@ -1734,8 +2232,8 @@ export class Orchestrator {
 				});
 			}
 		}
-		let worktreePath = previous?.worktreePath;
-		let worktreeBranch = previous?.worktreeBranch;
+		let worktreePath = explicitWorktreeOptOut ? undefined : previous?.worktreePath;
+		let worktreeBranch = explicitWorktreeOptOut ? undefined : previous?.worktreeBranch;
 		let createdWorktree = false;
 		let spawned = false;
 		let reservedNode: LegionNode | null = null;
@@ -1783,9 +2281,9 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}), model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath: explicitWorktreeOptOut ? null : worktreePath, worktreeHost: explicitWorktreeOptOut ? null : undefined, ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}), model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
 				reserved = true;
-				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(worktreeBranch ? { worktreeBranch } : {}), ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}) });
+				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, worktreeSource, worktreeOptOut: explicitWorktreeOptOut, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(worktreeBranch ? { worktreeBranch } : {}), ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}) });
 			}
 			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId, machine);
 			if (input.stripLegionIdentity) {
@@ -1807,6 +2305,12 @@ export class Orchestrator {
 					agent,
 					sessionFile,
 					tempDir,
+					// #414: the run that dispatched this child travels with the spawn, so
+					// the terminal backend can name the remote dir/terminal after it
+					// instead of falling back to the machine-wide `no-run`/`lgl-<name>`
+					// shape (two same-named children of different runs used to collide).
+					// The same expression `recordChild` persists as `parentRunId`.
+					runId: this.artifactRunId(),
 					// A remote launch starts from THIS machine's checkout: `cwd` is what the
 					// argv path map (`mapRemoteArgPath`) re-roots onto the other machine, and
 					// the backend replaces it with the remote directory before spawning. Using
@@ -1934,6 +2438,19 @@ export class Orchestrator {
 				else if (!sameModel) delete previous.modelProvider;
 				// A resume re-arbitrates the backend; keep the record truthful (#209).
 				previous.spawnMode = mode;
+				// #451: an explicit opt-out is DURABLE. `resume` re-derives its worktree
+				// flag from `saved.worktreePath`, so a stale tree left on the record would
+				// make the next resume quietly re-create the isolation this caller
+				// refused. The handle below only ever re-adds what the backend reports.
+				if (explicitWorktreeOptOut) {
+					delete previous.worktreePath;
+					delete previous.worktreeBranch;
+					delete previous.worktreeHost;
+				}
+				// #451: a CALLER's decision is the auditable fact; a resume that said
+				// nothing keeps the source already on the record (never relabels a
+				// role-pinned tree as "request").
+				if (worktreeSource === "request") previous.worktreeSource = "request";
 				// A resumed REMOTE child learns its tree from the handle too (the local
 				// branch already had it). Only set what the handle actually reported, so a
 				// local resume keeps its stored pair untouched.
@@ -1946,6 +2463,14 @@ export class Orchestrator {
 				// `remote-child-fate-v1` §3: same reason, one hop further — the address the
 				// core really holds, so a later process asks about that very terminal.
 				if (result.remoteTerminal) previous.remoteTerminal = result.remoteTerminal;
+				// #409: a relaunch re-resolves the parent (the anchor may have been
+				// recreated, and a headless relaunch may have none), so the pair is
+				// rewritten together — never one half kept beside the other's absence.
+				previous.parentRunId = path.basename(this.runDir);
+				if (result.parentTerminal) previous.parentTerminal = result.parentTerminal;
+				if (result.parentAbsent) previous.parentAbsent = result.parentAbsent;
+				if (result.parentTerminal && !result.parentAbsent) delete previous.parentAbsent;
+				if (result.parentAbsent && !result.parentTerminal) delete previous.parentTerminal;
 				this.children.set(name, previous);
 			}
 			const child = previous ?? this.recordChild({
@@ -1954,6 +2479,9 @@ export class Orchestrator {
 				agent: input.agent,
 				sessionFile: result.sessionFile,
 				spawnMode: mode,
+				// #451: who decided the worktree — recorded on the child (run.json), not
+				// on a `nodes` column, so the ledger schema stays v5.
+				worktreeSource,
 				// #374 §4: snapshot the declaration this team actually RUNS under, so a
 				// resume in a later process can replay it. Gated exactly like
 				// `lineageEnv` — only `centurion` is ever sent `PI_LEGION_PHASES`, and a
@@ -1980,9 +2508,26 @@ export class Orchestrator {
 				...(appliedWorktreeHost ? { worktreeHost: appliedWorktreeHost } : {}),
 				...(result.remoteDir ? { remoteDir: result.remoteDir } : {}),
 				...(result.remoteTerminal ? { remoteTerminal: result.remoteTerminal } : {}),
+				// #409: the ancestry chain (child terminal → parent terminal → run). The run
+				// id is this run's own: the parent terminal is the one that dispatched, which
+				// is this record's owner.
+				parentRunId: path.basename(this.runDir),
+				...(result.parentTerminal ? { parentTerminal: result.parentTerminal } : {}),
+				...(result.parentAbsent ? { parentAbsent: result.parentAbsent } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
+			// #423 req 3: land the machine facts on the run.json record NOW, not when
+			// some later control call happens to persist the object. A launch whose
+			// record says `cwd=<this host>` without `host`/`remoteTerminal` is exactly
+			// the shell the issue measured: nothing downstream can tell a cross-machine
+			// child from a local one, and there is no terminal address to ask about.
+			await this.persistChildRemoteFacts(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
+			// #411: a child that runs ELSEWHERE writes its transcript on that machine.
+			// The pump is what puts those bytes where every local reader already looks
+			// (`child.sessionFile`), and it is also the only "this launch works" signal
+			// such a child can give. Local children never get one.
+			this.startLiveMirror(child);
 			this.emitProcess("node_launched", nodeId ?? name, { name, agent: input.agent.name, pid: result.pid });
 			return {
 				name: result.name,
@@ -2015,19 +2560,60 @@ export class Orchestrator {
 					);
 				});
 			}
+			// E: every cleanup step below is ADDITIONAL information. A rollback that
+			// throws its own error used to replace the reason the launch died (`throw
+			// error` was reached with the cleanup's message — the 6.2.2 run reported a
+			// worktree-ownership guard as the reason a successful child "failed"), so each
+			// one is caught and attached as a `secondary:` line instead.
+			const secondary: string[] = [];
+			const cleanup = (what: string, step: () => void): void => {
+				try {
+					step();
+				} catch (cleanupError) {
+					const detail = `${what}: ${messageOf(cleanupError)}`;
+					secondary.push(detail);
+					process.stderr.write(`[pi-legion] rollback of '${name}' did not complete — ${detail}. The launch failed for the reason above; this is what could not be undone.\n`);
+				}
+			};
 			// #371 (m8): unconditional — `rollbackReservation` only runs once the launch
 			// reached `reserveNode`, but worktree creation and provisioning fail before
 			// that and still need the entry gone.
 			if (nodeId) this.declaredPhases.delete(nodeId);
-			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
+			if (reserved && nodeId) cleanup("ledger reservation rollback failed", () => this.rollbackReservation(nodeId, reservedNode));
 			if (parentReservationCreated && this.legion?.runStore) {
 				try { await this.legion.runStore.removeChild(this.legion.runId!, name, nodeId); } catch { /* rollback is best effort */ }
+			} else if (this.legion?.runStore && this.legion.runId) {
+				// #423 req 1: a launch that THREW must not leave a `launching` record
+				// behind. Before this branch the reservation made by
+				// `persistParentReservation` survived a failed spawn untouched, so the
+				// record said `launching` forever — the "empty shell" of the issue, with
+				// `subagent status` reading it as work in progress. The verdict is
+				// `unknown` on purpose: nothing was measured, so nothing is graded.
+				try {
+					await this.legion.runStore.updateChild(this.legion.runId, name, (current) => {
+						if (nodeId !== undefined && current.nodeId !== nodeId) return;
+						current.state = "retired";
+						current.retiredAt = new Date(this.now()).toISOString();
+						current.execution = {
+							status: "unknown",
+							reason: `launch failed: ${messageOf(error).slice(0, 300)}`,
+							turns: 0,
+							toolErrors: 0,
+						};
+					});
+				} catch { /* rollback is best effort */ }
 			}
 			if (createdRunId && this.legion?.runStore) {
 				try { fs.rmSync(this.legion.runStore.runDir(createdRunId), { recursive: true, force: true }); } catch { /* rollback is best effort */ }
 			}
-			if (createdWorktree && worktreePath) removeChildWorktree({ repoCwd: this.cwd, dest: worktreePath });
-			throw error;
+			// D13 keeps its power here — `removeChildWorktree` still refuses a tree that
+			// belongs to another machine. What changed is only WHAT that refusal may do:
+			// it becomes a `secondary:` line, never the launch's verdict.
+			const rollbackTree = createdWorktree ? worktreePath : undefined;
+			if (rollbackTree !== undefined) {
+				cleanup(`worktree rollback for '${rollbackTree}' failed`, () => this.removeWorktree({ repoCwd: this.cwd, dest: rollbackTree }));
+			}
+			throw withSecondaryFailures(error, secondary);
 		}
 	}
 
@@ -2929,12 +3515,20 @@ export class Orchestrator {
 		worktreeBranch?: string;
 		/** Machine that OWNS `worktreePath`; absent = this host (contract D13). */
 		worktreeHost?: string;
+		/** #451: who decided the worktree — `role` (the card) or `request` (the launch). */
+		worktreeSource?: WorktreeSource;
 		/** Machine this child runs on; absent = this host (contract D5). */
 		host?: string;
 		/** Mirrored-argv dir on that machine (`remote-child-fate-v1` §3). */
 		remoteDir?: string;
 		/** The address the core really holds for this child's terminal. */
 		remoteTerminal?: string;
+		/** #409: the run that dispatched this child (this run's own id). */
+		parentRunId?: string;
+		/** #409: the address this launch used as the terminal's parent, target-local. */
+		parentTerminal?: string;
+		/** #409: why no parent address could be named. */
+		parentAbsent?: string;
 	}): ChildRecord {
 		const child: ChildRecord = {
 			name: input.name,
@@ -2956,9 +3550,13 @@ export class Orchestrator {
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
+			...(input.worktreeSource ? { worktreeSource: input.worktreeSource } : {}),
 			...(input.host ? { host: input.host } : {}),
 			...(input.remoteDir ? { remoteDir: input.remoteDir } : {}),
 			...(input.remoteTerminal ? { remoteTerminal: input.remoteTerminal } : {}),
+			...(input.parentRunId ? { parentRunId: input.parentRunId } : {}),
+			...(input.parentTerminal ? { parentTerminal: input.parentTerminal } : {}),
+			...(input.parentAbsent ? { parentAbsent: input.parentAbsent } : {}),
 		};
 		this.children.set(input.name, child);
 		this.spawned += 1;
@@ -3121,6 +3719,11 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
+		// #411: the turn is over, so the remote transcript will never grow again. One
+		// last fetch into `child.sessionFile`, then the pump is retired. The deadline
+		// keeps a half-dead machine from holding this collect open (see
+		// `finalSyncLiveMirror`).
+		if (wait === "settled") await this.finalSyncLiveMirror(child, { stop: true });
 		// xm-dispatch D3.1: the verdict about to be derived must describe the transcript
 		// as it is NOW. Everything above only ever read the launch-time snapshot, which
 		// is how a finished 11-line transcript was judged from its first 5 lines.
@@ -3187,6 +3790,11 @@ export class Orchestrator {
 	 * first-turn path holds as `running` forever.
 	 *
 	 * Order matters and is deliberate:
+	 *   0. `"unreachable"` (#460) short-circuits EVERYTHING: the supervisor never read
+	 *      the child, so no transcript-derived verdict is a fact about this turn —
+	 *      and the absence of a reading is not a death certificate either. `running`
+	 *      + the supervision reason is the only honest answer, and it keeps the child
+	 *      out of `shouldRecycleAfterCollect`'s retirement set;
 	 *   1. a live child whose latest message is a connection blip is `running`
 	 *      (and keeps waiting), whatever the wait said;
 	 *   2. `"timeout"` on a live child is `running` — the wait budget ran out while
@@ -3213,7 +3821,15 @@ export class Orchestrator {
 		const name = child.name;
 		let parsed = input;
 		let execution = deriveOutcome(parsed);
-		if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
+		if (wait === "unreachable") {
+			// #460: the supervisor never read the child, so no transcript-derived verdict
+			// below is trustworthy as "this turn is over" — but the transcript is not a
+			// death certificate either. Report the one honest thing: still `running`,
+			// with the reason naming the lost channel. `running` is what makes the watch
+			// re-arm and `shouldRecycleAfterCollect` refuse to retire a child that may be
+			// working, instead of a `failed` verdict the parent would re-dispatch.
+			execution = { ...execution, status: "running", reason: SUPERVISION_UNREACHABLE_REASON };
+		} else if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
 			// Same non-terminal signal as the deadline path: watch() re-arms on
 			// `running` and does not retire. An already-settled blip has to keep
 			// waiting here, or the next collect would reproduce it instantly.
@@ -3520,8 +4136,14 @@ export class Orchestrator {
 		}
 	}
 
-	private settleDisposition(result: SettleResult, name: string): "settled" | "timeout" | "gone" {
+	private settleDisposition(result: SettleResult, name: string): CollectWait {
 		if (result.settled) return "settled";
+		// #460: a transport failure is a fact about the CHANNEL, not about the child.
+		// It must never reach the `gone` branch below: that is the branch that turned
+		// "I cannot see it" into "it is over" and re-dispatched a working child. The
+		// supervisor reports this with `abnormal:false` for the same reason — this
+		// check exists so no second reading of that flag (or of `reason`) can drift.
+		if (result.unreachable !== undefined) return "unreachable";
 		if (result.reason === "timeout" || (!result.abnormal && this.supervisor.isAlive(name))) return "timeout";
 		// A connection blip reported as an abnormal settle must not look like
 		// the process exited while that process is still alive.
@@ -3544,7 +4166,83 @@ export class Orchestrator {
 		return { execution, output: parsed.output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance, blocked: true };
 	}
 
+	/**
+	 * The delivery verdict for one finished turn, and the ONE exit every collect takes.
+	 *
+	 * Defect E: the plumbing BELOW this line (verification, ledger settle, artifact
+	 * write, a D13 guard) is not the child's verdict. A throw from it used to escape
+	 * `collect`, and the watch turned any thrown collect into a `failed` notice — so a
+	 * cross-machine centurion that had answered correctly was reported `failed` for a
+	 * reason that had nothing to do with its work. A finished turn with an assistant
+	 * message IS a delivered reply (the same rule `deriveOutcome` uses to decide
+	 * `aborted`), so the delivery survives a cleanup failure and says so:
+	 * `success (delivered with cleanup warning: …)`. The original reason travels
+	 * verbatim inside that line, so nothing is swallowed either.
+	 */
 	private async finishCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>, input: Execution, deadline: number): Promise<CollectResult> {
+		try {
+			return await this.gradeCollect(child, parsed, input, deadline);
+		} catch (error) {
+			const delivered = this.deliveredDespiteCleanupFailure(child, parsed, error);
+			if (!delivered) throw error;
+			return delivered;
+		}
+	}
+
+	/**
+	 * The turn's own grade, published with the cleanup failure ATTACHED (defect E).
+	 *
+	 * Deliberately not a second grading ladder: the execution is `deriveOutcome`'s (the
+	 * same function the normal path uses), and only the reason is extended. `undefined`
+	 * when the child never delivered a reply — an unfinished or silent child must keep
+	 * the original failure, because for it the failure really is the verdict.
+	 */
+	private deliveredDespiteCleanupFailure(
+		child: ChildRecord,
+		parsed: ReturnType<typeof parseSessionFile>,
+		error: unknown,
+	): CollectResult | undefined {
+		if (!isLastTurnComplete(parsed) || parsed.lastTurnOutput === null) return undefined;
+		const graded = deriveOutcome(parsed);
+		if (graded.status === "running" || graded.status === "unknown") return undefined;
+		const warning = `delivered with cleanup warning: ${messageOf(error)}`;
+		const execution: Execution = { ...graded, reason: graded.reason ? `${graded.reason}; ${warning}` : warning };
+		process.stderr.write(
+			`[pi-legion] '${child.name}': its turn finished, so this result is delivered — ${messageOf(error)}\n`,
+		);
+		const acceptance = deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) });
+		// The publication steps that remain are best-effort BY DEFINITION here: the
+		// failure being handled is one of them, so a second throw must not replace the
+		// delivery either.
+		let outputFile: string | undefined;
+		let artifactId: string | undefined;
+		try {
+			const output = parsed.output;
+			const written = this.writeOutputFile(child, output);
+			outputFile = written?.file;
+			artifactId = written?.artifactId;
+		} catch { /* a missing artifact costs the pointer, never the text */ }
+		if (child.state !== "retired") child.state = "awaiting";
+		child.execution = execution;
+		child.acceptance = acceptance;
+		child.outputFile = outputFile;
+		child.artifactId = artifactId;
+		try { this.recordSettled(child, execution, true); } catch { /* the ledger row is a record of the result, not the result */ }
+		try { this.onChildUpdate(child); } catch { /* a repaint may not cost a delivery */ }
+		const readback = this.readbackFacts(child);
+		return {
+			execution,
+			output: parsed.output,
+			...(outputFile ? { outputFile } : {}),
+			...(artifactId ? { artifactId } : {}),
+			...(readback ? { remoteReadback: readback } : {}),
+			usage: parsed.usage,
+			model: parsed.model ?? child.model ?? null,
+			acceptance,
+		};
+	}
+
+	private async gradeCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>, input: Execution, deadline: number): Promise<CollectResult> {
 		// Every collect ends here, so this is the one place a sticky "retried once"
 		// note can be applied without either writing it twice or losing it when the
 		// retry's own wait did not see the terminal turn (#316 review, minor 4).
@@ -3565,28 +4263,41 @@ export class Orchestrator {
 		//
 		// Only `running` is skipped: every other status keeps the exact behaviour it
 		// had before (#393 / D393-1, D393-2 are unchanged inside applyVerification).
-		// D13: acceptance runs HERE, so its cwd can only ever be a local path. A
-		// child whose tree belongs to another machine is refused by name here rather
-		// than having this machine's verifier run inside a path that means something
-		// else (remote verify is S3's work, not a silent local run).
-		assertLocalWorktree(child);
-		// S3/D14: whose machine runs the command. A child that ran elsewhere gets the
-		// remote runner — the command executes THERE, through `machine.exec{on}`, and
-		// its result carries the machine so a failure to reach it is `unknown`, never
-		// `rejected` (see `acceptance.ts`). A whole-file `assertLocalWorktree` above
-		// still refuses the local verifier against a remote TREE; this decides the
-		// cross-machine child that has no local tree at all.
 		//
+		// S3/D14 + D13 NARROWED (defect E1). Whose machine runs the command:
+		// a child that ran elsewhere gets the remote runner — the command executes
+		// THERE, through `machine.exec{on}`, and its result carries the machine so a
+		// failure to reach it is `unknown`, never `rejected` (see `acceptance.ts`).
 		// `remoteVerify` absent = this build cannot verify that host: the child's own
 		// attestation stands (pre-S3 behaviour), never a locally measured pass.
+		//
+		// The whole-record `assertLocalWorktree(child)` used to stand right here, and
+		// it is the reason a SUCCESSFUL cross-machine delivery was reported `failed`:
+		// a remote child OWNS its tree (`worktreeHost` is that machine), so the guard
+		// threw "worktree … belongs to host …" before any verdict was graded (2/2 on
+		// the 6.2.2 release run). D13's purpose is to keep a LOCAL filesystem/git
+		// operation away from a path that means something else — so it belongs on the
+		// command that RUNS, never on the delivery verdict:
+		//   - remote verify  → `machine.exec{on}`, that machine's path; nothing local;
+		//   - no remote verify → no command runs at all (the attestation stands).
+		// D13 still refuses the DELETE (`removeChildWorktree`), which is where a local
+		// recursive `rmSync` on a remote spelling could actually destroy data.
 		const remoteChild = normalizeHost(child.host) !== undefined;
-		const remoteVerify = remoteChild && this.remoteVerify
+		// The tree is on another machine when the pair names a host. Asked of the RECORD,
+		// never of `localWorktreePath`: that helper is the D13 guard itself and THROWS on
+		// a (host, path) pair, so using it as a predicate here turned the guard into the
+		// collect's verdict all over again (measured in the xm harness: the same refusal,
+		// one line lower). Absent host ⇒ today's local path, untouched.
+		const treeOnAnotherMachine = normalizeHost(child.worktreeHost) !== undefined;
+		const remoteVerify = this.remoteVerify && (remoteChild || treeOnAnotherMachine)
 			? this.remoteVerify
 			: undefined;
-		const acceptance = execution.status === "running" || (remoteChild && remoteVerify === undefined)
+		const localCwd = treeOnAnotherMachine ? this.cwd : (localWorktreePath(child) ?? this.cwd);
+		const acceptance = execution.status === "running"
+			|| (remoteVerify === undefined && (remoteChild || treeOnAnotherMachine))
 			? derived
 			: await applyVerification(derived, {
-				cwd: child.worktreePath ?? this.cwd,
+				cwd: treeOnAnotherMachine ? child.worktreePath ?? this.cwd : localCwd,
 				criteria: child.pendingCriteria,
 				// demo-findings F2 / D2 (+ appendix A2): whether the parent ABORTED this turn
 				// is a fact only this frame holds, so it is handed in explicitly —
@@ -3865,6 +4576,10 @@ export class Orchestrator {
 
 	async retire(name: string, opts?: RetireOptions): Promise<ChildRecord> {
 		const child = this.requireChild(name);
+		// #411: a retired child has no transcript left to copy. Idempotent, and it runs
+		// on every exit path below (queued, orphaned, killed) instead of only the ones
+		// that reach the kill.
+		this.stopLiveMirror(name);
 		if (opts?.cause === "session-shutdown") this.parentShutdownRetire.add(name);
 		if (child.state === "retired") return child;
 		if (child.state === "queued") {
@@ -3888,9 +4603,48 @@ export class Orchestrator {
 			this.schedulePump();
 			return child;
 		}
-		const sessionExists = fs.existsSync(child.sessionFile);
-		const parsed = sessionExists ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
+		// 6.2.4 / D2: a cross-machine child is NOT ours to kill.
+		//
+		// The parent session leaving is a PAUSE for it too (#374), but unlike a local
+		// child the work keeps running over there — measured: after 6.2.3's shutdown
+		// stamped `aborted (session-shutdown)`, the remote pi kept working for another
+		// 75s and wrote its result, which `recover` then refused to fetch because a
+		// terminal row is "already settled". So the exit records what it actually
+		// knows (`orphaned` / `unfetched`) and leaves the terminal alive and the
+		// ledger row open. `stop`/`abort` still deliver a kill and still record
+		// `aborted` — this branch only runs for the exit.
+		if (opts?.cause === "session-shutdown" && isCrossMachineHost(child.host)) {
+			this.orphanOnShutdown(name);
+			this.onChildUpdate(child);
+			return child;
+		}
+		// Which file says what the child DID: for a cross-machine child that is the
+		// local mirror (when one was written), never `child.sessionFile` — that path
+		// is the empty placeholder THIS machine pre-created and the child never
+		// writes (`sessionFileOf`'s doc). Asking the placeholder for existence made
+		// `deriveOutcome` run on a file with no bytes whenever the mirror was the
+		// real answer.
+		const transcriptFile = this.sessionFileOf(child);
+		const sessionExists = fs.existsSync(transcriptFile);
+		const parsed = sessionExists ? parseSessionFile(transcriptFile) : emptyParsedSession();
 		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
+		// #423 req 4: `success` is a claim that WORK was delivered, and a child whose
+		// launch never proved it started cannot make it — there is no terminal and no
+		// transcript, so any `success` here was parsed from a file that is not this
+		// child's work (a leftover mirror, a previous round under the same name). The
+		// issue measured exactly that: a shell that never ran retired as
+		// `execution: success`, which a parent (or an automated flow) reads as DELIVERED.
+		if (child.execution?.status === "success") {
+			const evidence = this.launchEvidenceFor(child, transcriptFile);
+			if (isUnstartedShell(evidence)) {
+				child.execution = {
+					status: "unknown",
+					reason: `never started: ${shellReason(evidence) ?? "no execution evidence"}`,
+					turns: 0,
+					toolErrors: 0,
+				};
+			}
+		}
 		// Stamp the cause before killing so an in-flight collect cannot
 		// overwrite it with "no assistant message" after the process dies.
 		if (opts?.cause === "session-shutdown" && this.supervisor.isAlive(name)) {
@@ -3961,11 +4715,91 @@ export class Orchestrator {
 		return child;
 	}
 
+	/**
+	 * 6.2.4 / D2: record a cross-machine child the exit is leaving behind.
+	 *
+	 * Called from {@link retire} for `cause: "session-shutdown"` and from the
+	 * runtime's shutdown release (which is what stops the parent from waiting for
+	 * or killing it). Idempotent: the record marker is written once, and a second
+	 * call is a no-op, so a re-entrant shutdown cannot double-stamp it.
+	 *
+	 * The node row is deliberately NOT updated: `running`/`starting`/`blocked` is
+	 * exactly what keeps it recoverable (`listUnsettledRemoteNodes`, `hasEnded`
+	 * false). Moving it to `retired` here is the 6.2.3 defect.
+	 */
+	orphanOnShutdown(name: string): ChildRecord {
+		const child = this.requireChild(name);
+		if (child.orphaned) return child;
+		const fate = shutdownFate({
+			crossMachine: isCrossMachineHost(child.host),
+			// A shutdown never delivers a stop to another machine; see the branch in
+			// `retire`. `stop`/`abort` do, and they keep recording `aborted`.
+			stopped: false,
+			programEnded: this.remoteTurnEnded(child),
+		});
+		if (fate === "aborted") {
+			// Unreachable for a cross-machine child today (stopped is always false
+			// here); kept so the three-way decision lives in ONE place.
+			return child;
+		}
+		const remoteSessionPath = remoteSessionPathFor(child.remoteDir);
+		child.state = fate;
+		child.orphaned = {
+			at: this.now(),
+			fate,
+			reason: "session-shutdown",
+			...(child.host ? { host: child.host } : {}),
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+			...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+			...(remoteSessionPath ? { remoteSessionPath } : {}),
+			...(child.sessionFile ? { sessionFile: child.sessionFile } : {}),
+		};
+		if (child.nodeId && this.legion) {
+			// The event type is already in the closed set of 16; the fate is a field.
+			this.emitStored(child.nodeId, "orphan_detected", {
+				parentId: this.legion.nodeId,
+				reason: "session-shutdown",
+				fate,
+				...(child.host ? { host: child.host } : {}),
+				...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+				...(remoteSessionPath ? { remoteSessionPath } : {}),
+				...(child.sessionFile ? { sessionFile: child.sessionFile } : {}),
+			});
+		}
+		return child;
+	}
+
+	/**
+	 * Is the work over THERE? Used only to pick `unfetched` over `orphaned`.
+	 *
+	 * Two local facts qualify, and nothing else (no wire at shutdown): the record
+	 * was already graded, or the mirror this machine already holds parses to a
+	 * terminal outcome. Anything weaker (`unknown`, an empty placeholder) answers
+	 * `false` — an unknown fate must read `orphaned`, never a confident
+	 * "finished".
+	 */
+	private remoteTurnEnded(child: ChildRecord): boolean {
+		if (executionIsTerminal(child.execution?.status)) return true;
+		const mirror = remoteMirrorPathFor(this.runDir, child.name);
+		try {
+			if (!fs.existsSync(mirror)) return false;
+			return executionIsTerminal(deriveOutcome(parseSessionFile(mirror)).status);
+		} catch {
+			// An unreadable mirror is not evidence of a finished turn.
+			return false;
+		}
+	}
+
 	async retireAll(): Promise<ChildRecord[]> {
 		const results: ChildRecord[] = [];
 		for (const name of [...this.children.keys()]) {
 			try { results.push(await this.retire(name)); } catch { /* continue with other child processes */ }
 		}
+		// #411: `retire` already stopped each of these; this sweep catches a pump whose
+		// child record is no longer in `children` (a replaced or restored name) so no
+		// interval outlives the run.
+		for (const name of [...this.liveMirrors.keys()]) this.stopLiveMirror(name);
 		return results;
 	}
 

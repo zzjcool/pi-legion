@@ -307,7 +307,22 @@ export type TaskState =
 	| "awaiting"
 	| "blocked"
 	| "retired"
-	| "exited";
+	| "exited"
+	/**
+	 * 6.2.4 / D2: a CROSS-MACHINE child the parent session left behind while it
+	 * was still running over there (or while nobody could say). NOT terminal on
+	 * purpose: `recover` must be allowed to fetch its result, and `status` must
+	 * keep showing it. Never assigned to a local child — that one dies with the
+	 * parent and stays `retired` + `aborted`.
+	 */
+	| "orphaned"
+	/**
+	 * 6.2.4 / D2: the turn over there was already over (graded, or a complete
+	 * transcript is here) and the result was never read back. Same non-terminal
+	 * treatment as {@link TaskState} `orphaned`; the difference is only how much
+	 * is already known about it.
+	 */
+	| "unfetched";
 
 /** Execution outcome, derived ONLY from session jsonl (F26-F31). */
 export type ExecutionStatus =
@@ -400,6 +415,61 @@ export interface NestedPathEntry {
 
 export const MAX_NESTED_PATH_ENTRIES = 4;
 
+/**
+ * 6.2.4 / D2: the record of a cross-machine child its parent session left behind.
+ *
+ * `fate` is the exit's three-way answer minus `aborted` (an aborted child has no
+ * record here — it was stopped, and `state` already says so). `remoteSessionPath`
+ * is spelled out because it is the one fact a recovering process needs and the
+ * one it cannot recompute without knowing that machine's layout.
+ */
+export interface OrphanRecord {
+	/** When the parent session ended. */
+	at: number;
+	fate: "orphaned" | "unfetched";
+	/** Always the #374 pause reason: the parent left, the child did not fail. */
+	reason: "session-shutdown";
+	host?: string;
+	remoteDir?: string;
+	remoteTerminal?: string;
+	/** `<remoteDir>/session.jsonl` — where the result is written on that machine. */
+	remoteSessionPath?: string;
+	/** This machine's placeholder/mirror path (never the transcript itself). */
+	sessionFile?: string;
+}
+
+/**
+ * #456: what one orphan-reclaim inspection concluded (see src/runs/orphan-reclaim.ts).
+ *
+ * #463 adds `no-supervisor`: the row is a leftover nobody in this process holds a
+ * supervisor for (`src/runs/unsupervised-row.ts`). It is a REACHABILITY verdict,
+ * not a death verdict — the row is settled as `retired` (or with its graded
+ * outcome), never as `failed` for lack of an answer (#460).
+ */
+export type OrphanReclaimVerdict = "terminal-gone" | "stale-orphan" | "working" | "unknown" | "no-supervisor";
+
+/** #456: the verdict + the one-sentence evidence a status surface renders for an orphaned row. */
+export interface OrphanStatusFacts {
+	verdict: OrphanReclaimVerdict;
+	evidence?: string;
+}
+
+/**
+ * #451: WHO decided this launch's worktree isolation.
+ *
+ * - `role`    — the launch carried no `worktree` argument, so the role card
+ *               decided (a centurion in a Legion tree is still always `true`).
+ * - `request` — the launch call carried the boolean (`true` or `false`), and
+ *               that value won over the card. `false` is the expression for
+ *               "work in the checkout I was given, create no tree".
+ *
+ * Recorded on `ChildRecord` (run.json) so `status` can say who asked. It is
+ * deliberately NOT a `nodes` column (the ledger schema stays v5) and records
+ * written before it existed simply lack it — absence is never rendered as a
+ * guess.
+ */
+export type WorktreeSource = "role" | "request";
+
 export interface ChildRecord {
 	/** Supervisor-local child name; unique among live children in this run. */
 	name: string;
@@ -473,6 +543,12 @@ export interface ChildRecord {
 	/** Branch created in that worktree; the child ships via MR, not the parent checkout. */
 	worktreeBranch?: string;
 	/**
+	 * #451: who decided the worktree above (or its absence) — see
+	 * {@link WorktreeSource}. A `request` with no `worktreePath` is the in-place
+	 * shape (`worktree: false`), not a missing fact.
+	 */
+	worktreeSource?: WorktreeSource;
+	/**
 	 * Machine that ran this child; absent = this host.
 	 *
 	 * Persisted so a later `wait`/`resume` in another process can tell a local
@@ -508,10 +584,44 @@ export interface ChildRecord {
 	 */
 	remoteTerminal?: string;
 	/**
-	 * The remote launch gate could not confirm the child wrote a transcript, and
-	 * nothing proved it dead either (`remote-child-fate-v1` §4).
+	 * #409: the run that dispatched this child — the `run.json` whose `children`
+	 * list holds this record.
+	 *
+	 * Stored per child (not only as the file's own `runId`) so the ancestry chain
+	 * can be walked from ONE record: child terminal → parent terminal → run. A
+	 * reader that finds a terminal in `hc ls` and wants to know whose it is does
+	 * not have to guess which `run.json` under `.pi-legion/runs/` to open.
 	 */
-	startupUnconfirmed?: boolean;
+	parentRunId?: string;
+	/**
+	 * #409: the address the launch passed as `parent` to `terminal.run`, in the
+	 * namespace of the core that received it.
+	 *
+	 * For a cross-machine child that is a TARGET-LOCAL address (the machine's
+	 * `lgl-anchor`): the caller's own id is meaningless there and a
+	 * machine-qualified spelling is refused by the sending core. Absent exactly
+	 * when {@link parentAbsent} is set.
+	 */
+	parentTerminal?: string;
+	/**
+	 * #409: why no parent address could be named (headless caller, no anchor).
+	 *
+	 * Recorded rather than omitted because "no parent" and "we never asked" look
+	 * identical otherwise: the receipt and `/legion status` both render
+	 * `parent=absent(<reason>)` from this field.
+	 */
+	parentAbsent?: string;
+	/**
+	 * 6.2.4 / D2: the parent session left this cross-machine child behind, and
+	 * where its result lives over there.
+	 *
+	 * Written at shutdown in place of the 6.2.3 `retired` + `aborted
+	 * (session-shutdown)` stamp, which made the row look finished when the work
+	 * was still running. The ledger carries the same facts as an
+	 * `orphan_detected` event, so `recover` and `/legion status` can find it
+	 * without this file; the record copy is what a fresh process reads first.
+	 */
+	orphaned?: OrphanRecord;
 
 	// artifacts
 	artifacts?: Array<{ kind: string; path: string }>;
@@ -1144,6 +1254,16 @@ export interface SubagentsSettings {
 	 * the whole block.
 	 */
 	crossMachine?: CrossMachineSettings;
+	/**
+	 * #445: at session start, re-attach the cross-machine children a PREVIOUS
+	 * session left running (so `status` lists them and their completion notice
+	 * arrives without a `recover` call). Default `true`; `false` disables the
+	 * whole pass and leaves the `recover` path exactly as it was.
+	 *
+	 * Parsed EXPLICITLY in `parseSubagentSettings` — that parser drops every key it
+	 * does not read, so leaving this out of the whitelist would silently ignore it.
+	 */
+	reattachLiveChildren?: boolean;
 }
 
 /**
@@ -1189,6 +1309,36 @@ export class SubagentError extends Error {
 		this.code = code;
 		this.details = details;
 	}
+}
+
+/**
+ * Attach CLEANUP failures to the error that already explains a failure — never
+ * replace it (`secondary:` lines, one per cleanup step).
+ *
+ * The defect this exists for (6.2.2, E1): a launch failed, the rollback that ran
+ * afterwards threw its own error, and `throw error` was reached with the ROLLBACK's
+ * message — so the verdict named a worktree-ownership guard instead of the reason
+ * the launch died. A cleanup step is additional information about a failure; it can
+ * never BE the failure. One shape for the message, so a reader (and a test) can
+ * find the original reason first and the cleanup facts after it.
+ *
+ * `code`/`details` survive: the caller's error class is what every branch on
+ * `ErrorCodes` reads, and a Secondary line must not turn an INVALID_PARAMS refusal
+ * into a generic START_FAILED.
+ */
+export function withSecondaryFailures(error: unknown, failures: readonly string[]): unknown {
+	const lines = failures.map((line) => line.trim()).filter((line) => line.length > 0);
+	if (lines.length === 0) return error;
+	const suffix = lines.map((line) => `\n  secondary: ${line}`).join("");
+	if (error instanceof SubagentError) return new SubagentError(`${error.message}${suffix}`, error.code, error.details);
+	if (error instanceof Error) {
+		const wrapped = new Error(`${error.message}${suffix}`);
+		wrapped.name = error.name;
+		// Keep the original frames: the stack still points at the real failure.
+		wrapped.stack = error.stack;
+		return wrapped;
+	}
+	return new SubagentError(`${String(error)}${suffix}`, ErrorCodes.START_FAILED);
 }
 
 /**

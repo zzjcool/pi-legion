@@ -34,6 +34,22 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	childLaunchContext?: ChildLaunchContext;
 	/** Whether to remove Legion lineage identity from the inherited environment. */
 	stripLegionIdentity?: boolean;
+	/**
+	 * #414: the run that DISPATCHED this child — the initiating run's id.
+	 *
+	 * Carried per SPAWN because the supervisor is built once per process, before
+	 * any run exists (so its constructor value can never name the run a child
+	 * belongs to). The terminal backend derives three facts from it — the hc
+	 * terminal name (`lgl-<runId8>-<handle>`), the remote mirror directory
+	 * (`<mirrorRoot>/<runId>/<name>`) and the `legion.run` label — which is what
+	 * keeps two same-named children of different runs from sharing a directory
+	 * or a terminal name on one machine.
+	 *
+	 * Absent is meaningful and must stay supported: an old caller (or a launch
+	 * with no run id at all) keeps the legacy shape — `lgl-<handle>`,
+	 * `<mirrorRoot>/no-run/<handle>`, no run label.
+	 */
+	runId?: string;
 	/** Optional Pi CLI entry point override. */
 	cliPath?: string;
 	/**
@@ -131,10 +147,20 @@ export interface ChildHandle {
 	 */
 	remoteTerminal?: string;
 	/**
-	 * The launch gate could not confirm a transcript, but nothing proved the child
-	 * dead either (`remote-child-fate-v1` §4). A slow machine is not a bug.
+	 * #409: the address this launch used as the terminal's PARENT, in the namespace
+	 * of the core that received the request (a target-local address for a
+	 * cross-machine child — the machine's anchor).
+	 *
+	 * Persisted onto the child record beside `parentRunId`, so the chain
+	 * child terminal → parent terminal → run is walkable from `run.json` alone.
+	 * Absent when the launch could not name one; {@link parentAbsent} then says why.
 	 */
-	startupUnconfirmed?: boolean;
+	parentTerminal?: string;
+	/**
+	 * #409: why no parent address could be named. Never a silent omission: the
+	 * receipt and the status render `parent=absent(<reason>)`.
+	 */
+	parentAbsent?: string;
 	/**
 	 * NON-FATAL notice from the backend that spawned the child (B5, D14).
 	 *
@@ -201,6 +227,17 @@ export interface SettleResult {
 	exitCode?: number | null;
 	signal?: NodeJS.Signals | null;
 	reason?: string;
+	/**
+	 * #460: the observation channel failed, so this wait learned NOTHING about the
+	 * child — it is not a verdict that the child is over.
+	 *
+	 * Present only on a `{settled:false, abnormal:false}` result whose cause was a
+	 * transport failure (`terminal.get` threw, the `hc` connection dropped, a
+	 * heartbeat read failed). Such a result must never be read as `failed`: the
+	 * child may still be running on the other machine. `detail` is the transport
+	 * failure as text, for the operator — it is diagnostic, not a child fact.
+	 */
+	unreachable?: { detail: string; strikes: number };
 }
 
 /** Cumulative usage reported by the Pi RPC `get_session_stats` command. */
@@ -648,6 +685,40 @@ export interface LegionSupervisor {
 	 */
 	lastEventAt?(name: string): number | undefined;
 	/**
+	 * #441-B/C: the child's own program-status word as its CONTAINER reports it
+	 * (the 7501 status: `working`, `idle`, `blocked`, `done`, …), or `undefined`.
+	 *
+	 * This is the only "is anything in flight" fact a tool-blind backend can offer:
+	 * a child hosted in an `hc` terminal (`terminal-supervisor` D12) emits no tool
+	 * events, so the stall detector cannot tell a 20-minute compile from a hang by
+	 * the stack — but the terminal itself answers `working` for the former.
+	 *
+	 * Optional, and async because one answer is one `terminal.get` on demand, asked
+	 * only when a stall candidate's radius has already elapsed (never per tick).
+	 * Absence, a throw, or `undefined` all mean NO FACT — and "no fact" must never
+	 * become "nothing is running": the detector treats it as undecidable and stays
+	 * silent (#441: unknown ≠ stalled).
+	 *
+	 * `rpc` / `inprocess` backends answer `undefined` on purpose: their in-flight
+	 * stack is the sharper fact, and asking a terminal about an in-process child
+	 * would be a category error.
+	 */
+	programState?(name: string): Promise<string | undefined>;
+	/**
+	 * #441-B: does this backend observe TOOL EVENTS for `name` at all?
+	 *
+	 * `false` is not "nothing is running" — it is "an absent in-flight stack here
+	 * carries no information", which is the difference the whole #441-B defect turned
+	 * on. The `hc` terminal backend runs a real TUI in another process and folds no
+	 * tool events (D12), so for a child it hosts `inFlightTool === undefined` was
+	 * PERMANENTLY true and the detector read it as "no tool in flight".
+	 *
+	 * The supervisor that routes by owner (`routing-supervisor`) is the authoritative
+	 * answer; a backend or test double that predates this read leaves it absent, and
+	 * callers then fall back to the row's own evidence (`remoteTerminal` / `host`).
+	 */
+	observesToolEvents?(name: string): boolean;
+	/**
 	 * Measured decode ms for `name` — the cumulative first-delta→last-delta wall
 	 * clock this backend observed over that child's WHOLE LIFE, or `undefined` when
 	 * it has never observed the name at all.
@@ -698,6 +769,24 @@ export interface LegionSupervisor {
 	capabilities?: { readonly promptDisposition: boolean };
 	stats(name: string): Promise<UsageSnapshot | null>;
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void>;
+	/**
+	 * Release whatever this backend keeps open for the WHOLE session, after the
+	 * children have been retired (defect E2).
+	 *
+	 * The terminal backend is the reason this exists: it holds ONE long-lived
+	 * `hc connect` child process, and a ref'd child process is exactly what keeps
+	 * Node's event loop alive. `pi --print` returns from its turn and lets the loop
+	 * drain (it never calls `process.exit`), so a leftover `hc connect` made a
+	 * finished headless run hang forever — measured 6+ minutes of idle `Sl` with the
+	 * transport still attached, killed by hand. Retire does not help: it ends a
+	 * CHILD's terminal, not the transport.
+	 *
+	 * Optional like the display reads: a backend whose transport is per-child
+	 * (rpc) or in-process (inprocess) has nothing to release, and a test double must
+	 * keep satisfying the seam. Callers read it as `supervisor.shutdown?.()`; a throw
+	 * is swallowed there because this runs on the way out.
+	 */
+	shutdown?(): void;
 }
 
 /**

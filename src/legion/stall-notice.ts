@@ -6,8 +6,21 @@
  * ```
  * L1 (silence) : in-flight stack empty  AND  now - lastEventAt >= silenceNoticeMs
  * L1, stack non-empty : never reported (D1)
- * L2 (long)    : now - loopBaseAt       >= loopRadiusMs
+ * L2 (long)    : now - loopBaseAt >= loopRadiusMs
+ *                AND nothing is in flight                     (#441-C)
+ *                AND, when this host cannot see tools, the transcript did NOT grow
+ *                    inside the window; no growth evidence ⇒ unknown ≠ stalled (#441-B)
  * ```
+ *
+ * **#441 rewrote what L2 is allowed to mean.** Before it, L2's only input was the
+ * clock, so "the child has been running for longer than the radius" was reported
+ * as "it may be looping" no matter what the child was doing — and on a big task
+ * that is true by construction. Measured on 2026-08 (10+ false notices in a day):
+ * a `hub`-hosted child compiling at CPU 27% / 80 °C, a local child blocked in
+ * `gh pr checks --watch` for 16 minutes, another rebasing at CPU 49% / 95 °C, and
+ * a remote child whose `session.jsonl` was being written 23 s AFTER its notice.
+ * The composition above is the rule that keeps L2 an *anomaly* detector: the
+ * clock only opens the question, the two facts answer it.
  *
  * Nothing here reads a clock, touches SQLite, or calls a supervisor: the caller
  * passes `now` and the facts it folded, and gets a decision back. That is what
@@ -23,6 +36,12 @@
  *
  * This module never decides to abort, stop or retire anything (D3). It produces a
  * decision and two strings; the parent decides.
+ *
+ * **#413: the de-duplication key is the crossed THRESHOLD, never a timestamp.**
+ * `floor(elapsed / thresholdMs)` names the boundary (`tier`); a window announces
+ * each tier at most once, so every check inside the same boundary is silent. The
+ * caller passes what it has already announced ({@link StallLineState}) and records
+ * the `tier` of the line it just wrote — see {@link crossedTier} and `decideStallNotice`.
  */
 
 import { DEFAULTS } from "../shared/types.ts";
@@ -38,7 +57,7 @@ export const STALL_NOTICE_SUBJECT_PREFIX = "Stall notice: ";
 
 /** L1 announces at `1×` and `2×` the threshold, then stops (D6). */
 export const SILENCE_NOTICE_LIMIT = 2;
-/** L2 repeats once per radius, and at most three times per window (D6). */
+/** L2 announces at three boundaries per window at most (D6). */
 export const LONG_RUNNING_NOTICE_LIMIT = 3;
 /**
  * D8's last rung: a role that declares neither `loopNoticeMs` nor `timeoutMs`
@@ -55,13 +74,40 @@ export type StallNoticeKind = "silence" | "long-running";
  * `lastEventAt` is the host-clock reading of that child's last coarse event (D2)
  * and is optional on purpose: a supervisor that cannot answer it has no fact, and
  * "no fact" must not become an L1 notice. `inFlightTool` is the innermost frame of
- * the in-flight stack; `undefined` means the stack is empty.
+ * the in-flight stack; `undefined` means the stack is empty — but ONLY when the
+ * backend can observe tools at all, which is what `toolObservationUnavailable`
+ * separates (#441-B): `undefined` from a backend that never sees tool events is
+ * "no fact", not "nothing is running".
  */
 export interface StallChildFacts {
 	readonly name: string;
 	readonly lastEventAt?: number;
 	readonly inFlightTool?: string;
 	readonly inFlightToolStartedAt?: number;
+	/**
+	 * #441-B: this backend observes no tool events (a cross-machine child, or any
+	 * child on the `hc` terminal backend — `routing-supervisor` D12), so an absent
+	 * `inFlightTool` carries no information. L2 may then only be judged by
+	 * {@link programState} + {@link lastSessionGrowthAt}; with neither, unknown.
+	 */
+	readonly toolObservationUnavailable?: boolean;
+	/**
+	 * #441-B/C: the child's own container status word (the 7501 program status the
+	 * `hc` terminal reports: `working`, `idle`, `blocked`, `done`, …), read on demand.
+	 *
+	 * This is the fact a human reads off the child's terminal — "is it working or is
+	 * it sitting at a prompt" — and it is the ONLY tool-activity evidence a
+	 * tool-blind backend can offer. `working` means a tool (or a generation) is in
+	 * flight, so the child is working, never stalled.
+	 */
+	readonly programState?: string;
+	/**
+	 * #441-B: ms epoch of the last observed growth of this child's transcript, or
+	 * `undefined` when this host has no such evidence (mirror off, no session file,
+	 * pump never wrote a row). Only consulted for a tool-blind backend, and absence
+	 * means `unknown` — which is NOT `stalled`, so it never becomes a notice.
+	 */
+	readonly lastSessionGrowthAt?: number;
 }
 
 /** Both thresholds are "off" when they are absent, non-finite, or `<= 0` (D6). */
@@ -71,14 +117,25 @@ export interface StallThresholds {
 }
 
 /**
- * What has already been said in ONE window (D6).
+ * What has already been said in ONE window (D6) — #413: the de-duplication key is
+ * the crossed THRESHOLD, not the time the previous line was sent.
  *
- * `count` and `lastAt` travel together on purpose: the repeat clock is "one
- * interval after the PREVIOUS line", so a count without the time it was sent at is
- * not enough to decide anything. The caller records `lastAt = now` of the tick that
- * emitted.
+ * `tier` is `floor(elapsed / thresholdMs)`: the ordinal of the boundary the window
+ * has reached (`1` = the first threshold, `2` = twice it, …). Recording the highest
+ * tier announced makes "this boundary was already announced" a fact the next tick
+ * can re-derive from `(windowBase, thresholdMs, elapsed)` alone — so N checks inside
+ * one boundary produce exactly ONE line, no matter how the caller's clock moves.
+ * `count` is separate because it is D6's cap: a child first observed three radii in
+ * spends one line, not three, so `count` can stay below `tier` forever.
+ *
+ * `lastAt` is kept for diagnostics only ("when did the last line go out"); nothing
+ * decides on it any more. Measuring the next repeat from the SENT time was the
+ * pre-#413 rule, and it could not answer "was THIS boundary announced?" because a
+ * re-created detector had no sent time to compare against.
  */
 export interface StallLineState {
+	/** Highest boundary index already announced; `0` = nothing yet. */
+	readonly tier: number;
 	/** Lines already announced in this window. */
 	readonly count: number;
 	/** Host-clock reading of the last of them; `undefined` when `count === 0`. */
@@ -101,17 +158,30 @@ export interface StallAnnouncement {
 	readonly childName: string;
 	/**
 	 * The window this line belongs to — L1: `lastEventAt`; L2: the base the radius
-	 * is measured from. It IS the `sinceBucket` of the D6 de-duplication key: a new
-	 * event (L1) or an `extend` (L2) produces a new bucket, which restarts the count.
+	 * is measured from. Half of the D6 de-duplication key: a new event (L1) or an
+	 * `extend` (L2) produces a new bucket, which re-arms the boundary ladder.
 	 */
 	readonly sinceBucket: number;
+	/**
+	 * Which boundary this line announces: `floor(elapsedMs / thresholdMs)`, `>= 1`.
+	 * The OTHER half of the D6 key (#413): `(child, kind, bucket, threshold, tier)`
+	 * is announced at most once, so a child that sits past its threshold does not
+	 * re-mail on every check.
+	 */
+	readonly tier: number;
 	/** 1-based index of this line within its window. */
 	readonly sequence: number;
 	readonly elapsedMs: number;
 	readonly thresholdMs: number;
-	/** L2 only, and only when the child is inside a tool: the evidence (D1). */
-	readonly inFlightTool?: string;
-	readonly inFlightMs?: number;
+	/**
+	 * L2 only: the container's own status word when this host could read it
+	 * (#441-B/C), e.g. `idle` — the fact the line quotes instead of the old
+	 * "inside `bash` for 38m" evidence. `undefined` = the observing backend did not
+	 * answer (a local child: the empty stack was the determination).
+	 */
+	readonly programState?: string;
+	/** L2 only, tool-blind child only: how long its transcript has been stalled (#441-B). */
+	readonly sessionGrowthIdleMs?: number;
 }
 
 /**
@@ -129,7 +199,7 @@ export function isActiveStallThreshold(value: number | undefined): value is numb
  * a child that has been silent with an empty stack for a whole role budget is
  * already described by the sharper fact, and two lines about one child in one mail
  * spends the parent's attention twice on the same node. L2 keeps its own count and
- * still fires on later ticks once L1 has spent its two announcements.
+ * still fires on later boundaries once L1 has spent its two announcements.
  */
 export function decideStallNotice(input: {
 	readonly now: number;
@@ -157,12 +227,14 @@ function silenceAnnouncement(input: {
 	if (sinceBucket === undefined || !Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
+	// #413: the boundary IS the de-duplication key. `tier <= announced.tier` means
+	// this crossing (or a later one) has already been announced, so every further
+	// check inside the same boundary is silent — the defect the issue reports.
+	const tier = crossedTier(elapsedMs, thresholdMs);
+	if (tier <= window.silence.tier) return undefined;
 	const sequence = window.silence.count + 1;
 	if (sequence > SILENCE_NOTICE_LIMIT) return undefined;
-	// The rhythm, not merely "past the threshold" (D6): the FIRST line is measured
-	// from the window's start, every LATER line from the line before it.
-	if (!afterPreviousLine(window.silence, now, thresholdMs)) return undefined;
-	return { kind: "silence", childName: child.name, sinceBucket, sequence, elapsedMs, thresholdMs };
+	return { kind: "silence", childName: child.name, sinceBucket, tier, sequence, elapsedMs, thresholdMs };
 }
 
 function longRunningAnnouncement(input: {
@@ -178,43 +250,65 @@ function longRunningAnnouncement(input: {
 	if (!Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
+	// #441-C: a child the container can SEE inside a command is WORKING, and "it has
+	// been running for 45 minutes" is then a description of the work, not an anomaly.
+	// The measured case: a worker blocked in `gh pr checks --watch` for 16 minutes,
+	// producing no session bytes — reported as a stall on every boundary.
+	if (child.inFlightTool !== undefined) return undefined;
+	// #441-B: the composition. A tool-blind backend cannot answer "is something in
+	// flight", so the empty stack above is not evidence of anything; the container's
+	// own status word is. `working` there is the same "it is working" fact as a stack
+	// frame (a terminal-hosted centurion compiles for 20 minutes with no session
+	// writes). With no status word either, this host has no view of the child at all:
+	// not decidable ⇒ no notice.
+	const programState = typeof child.programState === "string" ? child.programState.trim().toLowerCase() : "";
+	const toolBlind = child.toolObservationUnavailable === true;
+	const containerIdle = programState.length > 0 ? programState !== "working" : !toolBlind;
+	if (!containerIdle) return undefined;
+	// #441-B: the growth half of the composition, and ONLY for a tool-blind child.
+	// A growing transcript is proof of life no clock can argue with; a missing
+	// growth fact is `unknown`, and `unknown ≠ stalled`.
+	if (toolBlind) {
+		const growthAt = child.lastSessionGrowthAt;
+		if (growthAt === undefined || !Number.isFinite(growthAt)) return undefined;
+		if (!(now - growthAt >= thresholdMs)) return undefined;
+	}
+	// #413: one line per crossed boundary — see `crossedTier`. The cap below is the
+	// other half of D6 and stays: three boundaries, then silence until `extend`.
+	const tier = crossedTier(elapsedMs, thresholdMs);
+	if (tier <= window.longRunning.tier) return undefined;
 	const sequence = window.longRunning.count + 1;
 	if (sequence > LONG_RUNNING_NOTICE_LIMIT) return undefined;
-	if (!afterPreviousLine(window.longRunning, now, thresholdMs)) return undefined;
-	const inFlightMs = child.inFlightTool === undefined ? undefined : now - (child.inFlightToolStartedAt ?? Number.NaN);
 	return {
 		kind: "long-running",
 		childName: child.name,
 		sinceBucket,
+		tier,
 		sequence,
 		elapsedMs,
 		thresholdMs,
-		...(child.inFlightTool === undefined ? {} : { inFlightTool: child.inFlightTool }),
-		...(inFlightMs !== undefined && Number.isFinite(inFlightMs) && inFlightMs >= 0 ? { inFlightMs } : {}),
+		...(programState.length > 0 ? { programState } : {}),
+		...(toolBlind && child.lastSessionGrowthAt !== undefined
+			? { sessionGrowthIdleMs: now - child.lastSessionGrowthAt }
+			: {}),
 	};
 }
 
 /**
- * D6's repeat clock: nothing has been said yet, or one whole interval has passed
- * since the last line.
+ * The boundary ordinal of an elapsed time: `1` at the threshold, `2` at twice it, …
  *
- * Measuring repeats from the WINDOW BASE (`base + n × radius`) is the bug this
- * function exists to prevent: a child first observed long past its threshold would
- * satisfy every `n` at once and spend the entire quota in three consecutive 2s
- * ticks. A line once sent is a fact with a timestamp — the next one waits for it.
+ * `Math.floor`, never `round`: the tier is the de-duplication key (#413), so the
+ * instant it flips must be exactly `base + n × threshold` — the same boundary the
+ * `elapsed >= thresholdMs` gate uses. Rounding up would announce a boundary a hair
+ * early; rounding down would repeat a boundary for half a radius.
  *
- * A `count > 0` with no `lastAt` is a caller defect (the two fields travel
- * together), and the safe reading is "not due": guessing would re-spam.
+ * The caller has already checked `elapsed >= threshold`, so the result is `>= 1`.
+ * A non-finite or non-positive threshold cannot reach here (the detectors are gated
+ * by `isActiveStallThreshold`), and a non-finite elapsed would make the comparisons
+ * false rather than crash.
  */
-function afterPreviousLine(
-	state: StallLineState,
-	now: number,
-	intervalMs: number,
-): boolean {
-	if (state.count === 0) return true;
-	const lastAt = state.lastAt;
-	if (lastAt === undefined || !Number.isFinite(lastAt)) return false;
-	return now - lastAt >= intervalMs;
+function crossedTier(elapsedMs: number, thresholdMs: number): number {
+	return Math.floor(elapsedMs / thresholdMs);
 }
 
 /**
@@ -349,9 +443,21 @@ function silenceLine(announcement: StallAnnouncement): string {
 	return `- ${announcement.childName}: no event for ${formatStallDuration(announcement.elapsedMs)} with nothing in flight (threshold ${formatStallDuration(announcement.thresholdMs)}). The child is not inside a turn, so steer cannot land here; abort can.`;
 }
 
+/**
+ * L2's line: the age, then the two facts that made it an anomaly (#441).
+ *
+ * The old sentence said `with no tool in flight` even for a backend that cannot
+ * see tools at all — a claim this host had no way to make, printed for every
+ * cross-machine child. The wording now says exactly what was measured: either an
+ * empty in-flight stack (`nothing in flight`), the container's own idle word, or
+ * (tool-blind) the stalled transcript. A growing child never reaches this line.
+ */
 function longRunningLine(announcement: StallAnnouncement): string {
-	const evidence = announcement.inFlightTool === undefined
-		? "with no tool in flight"
-		: `inside \`${announcement.inFlightTool}\`${announcement.inFlightMs === undefined ? "" : ` for ${formatStallDuration(announcement.inFlightMs)}`}`;
-	return `- ${announcement.childName}: running for ${formatStallDuration(announcement.elapsedMs)} (threshold ${formatStallDuration(announcement.thresholdMs)}), ${evidence}. It may be looping — check its actual execution context; steer reaches a child at a turn boundary.`;
+	const container = announcement.programState === undefined
+		? "nothing in flight"
+		: `nothing in flight, container status \`${announcement.programState}\``;
+	const growth = announcement.sessionGrowthIdleMs === undefined
+		? ""
+		: ` and its transcript has not grown for ${formatStallDuration(announcement.sessionGrowthIdleMs)}`;
+	return `- ${announcement.childName}: running for ${formatStallDuration(announcement.elapsedMs)} (threshold ${formatStallDuration(announcement.thresholdMs)}), ${container}${growth}. It may be looping — check its actual execution context; steer reaches a child at a turn boundary.`;
 }

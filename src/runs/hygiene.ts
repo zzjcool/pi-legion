@@ -8,19 +8,27 @@
  *
  *  - #38 temp sweep: `runs/<id>/rpc-child-*` dirs whose owner pid is dead
  *    (or, for legacy dirs without a marker, older than the legacy age).
- *  - #38 stale records: in run dirs whose owner pid is dead, non-root ledger
- *    nodes still `starting`/`running`/`blocked` and not updated for
+ *  - #38 stale records: in run dirs whose owner pid is dead, non-root LOCAL
+ *    ledger nodes still `starting`/`running`/`blocked` and not updated for
  *    `staleNodeHours` are marked `failed` with a `node_abandoned` event, and
- *    a leftover WAL is checkpointed.
+ *    a leftover WAL is checkpointed. Cross-machine rows (`host` recorded) are
+ *    exempt since #407: the owner dying HERE does not end the work THERE, and
+ *    such a row is the only record `recover` can still collect.
  *  - #37 prune: whole run dirs idle longer than `retentionDays`, owner dead,
  *    and WITHOUT a `worktrees/` entry (retired worktrees are kept on purpose
- *    as resume credentials — docs/legion-v2-contract.md:270).
+ *    as resume credentials — docs/legion-v2-contract.md:270). A run dir that
+ *    still owns an UNSETTLED cross-machine row is skipped since #408: its
+ *    `nodes.remote_dir` / `nodes.remote_terminal` is the only record on this
+ *    machine of which remote directory and terminal the row left behind, so
+ *    pruning it would orphan a directory that is still there. Retention keeps
+ *    deleting everything else — the protection is that row, not "never prune".
  *  - #40 event retention: see `applyEventRetention` (called on the live db).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
+import { legionDbPath, openLegionDb, type DatabaseSync } from "../legion/db.ts";
+import { listUnsettledRemoteNodes } from "../legion/nodes.ts";
 import { RUN_OWNER_FILE, TEMP_OWNER_FILE, isPidAlive, ownerState } from "./owner.ts";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -87,9 +95,35 @@ export interface HygieneReport {
 	abandonedNodes: string[];
 	checkpointedDbs: string[];
 	prunedRuns: string[];
+	/** #408: run dirs retention refused to prune because a live cross-machine row lives there. */
+	keptRemoteRuns: RemoteHold[];
 	deletedEvents: number;
 	freedBytes: number;
 	errors: string[];
+}
+
+/** One unsettled cross-machine row: the reason its run dir is not prunable (#408). */
+export interface RemoteHoldRow {
+	nodeId: string;
+	name: string;
+	host: string;
+	status: string;
+	remoteDir: string | null;
+	remoteTerminal: string | null;
+}
+
+/**
+ * #408: a run dir retention must not prune, and the rows that keep it.
+ *
+ * `error` is set when the ledger could not be read at all: the dir is then kept
+ * too, because "cannot tell" is not "nothing to lose" — the bytes on the other
+ * machine outlive any bookkeeping mistake on this one.
+ */
+export interface RemoteHold {
+	runId: string;
+	runDir: string;
+	rows: RemoteHoldRow[];
+	error?: string;
 }
 
 export interface HygieneOptions {
@@ -150,13 +184,67 @@ function hasWorktrees(runDir: string): boolean {
 	}
 }
 
+/**
+ * #408: the unsettled cross-machine rows still open in ONE run dir's ledger.
+ *
+ * The predicate is `listUnsettledRemoteNodes` — the same one `/legion status`
+ * lists and `recover` collects from (`host` recorded and NOT ended, #407), so
+ * retention, status and recovery can never disagree about "this row is still
+ * work somewhere else". Only the fields a human needs to chase the far side
+ * are carried over: `remote_dir` / `remote_terminal` (schema v5) are the two
+ * facts that cannot be re-derived from anything else this machine stores.
+ */
+export function readRemoteHold(runDir: string): RemoteHold {
+	const runId = path.basename(runDir);
+	const dbPath = legionDbPath(runDir);
+	if (!safeStat(dbPath)) return { runId, runDir, rows: [] };
+	let db: DatabaseSync | undefined;
+	try {
+		db = openLegionDb(dbPath);
+		const rows = listUnsettledRemoteNodes(db).map((node) => ({
+			nodeId: node.id,
+			name: node.name,
+			host: node.host ?? "",
+			status: node.status,
+			remoteDir: node.remoteDir ?? null,
+			remoteTerminal: node.remoteTerminal ?? null,
+		}));
+		return { runId, runDir, rows };
+	} catch (error) {
+		return { runId, runDir, rows: [], error: String(error) };
+	} finally {
+		db?.close();
+	}
+}
+
+/**
+ * Every run dir under `storeRoot` that still holds an unsettled cross-machine
+ * row (or whose ledger could not be read). Backs the `legion doctor` storage
+ * report (#408): the runs listed here are exactly the ones retention skipped.
+ */
+export function findRemoteHolds(storeRoot: string): RemoteHold[] {
+	const holds = listDirs(path.join(storeRoot, "runs")).map(readRemoteHold);
+	return holds.filter((hold) => hold.rows.length > 0 || hold.error !== undefined);
+}
+
 const ACTIVE_STATUSES = ["starting", "running", "blocked"];
 
 function markAbandoned(dbPath: string, staleBefore: number, now: number): string[] {
 	const db = openLegionDb(dbPath);
 	try {
+		// #407: a dead owner on THIS host says nothing about a child that ran on
+		// ANOTHER one — that process kept going, and its row is the only record
+		// `recover` can still collect. Failing the row also failed the visibility
+		// test: `listUnsettledRemoteNodes` (the `/legion status` block) lists live
+		// statuses only, while `recover` reads the row by name regardless of status.
+		// So the sweep hid a leftover it had just proven nothing about, and status
+		// said "gone" while recover said "here". The row stays OPEN, which is the
+		// same invariant 6.2.4's exit fate (`orphaned`/`unfetched`) relies on; its
+		// age is still on screen (`launched` / `heartbeat` in the ownership block).
+		// `host IS NOT NULL AND host <> ''` is the ledger's cross-machine marker,
+		// spelled exactly as `listUnsettledRemoteNodes` spells it.
 		const rows = db.prepare(
-			`SELECT id FROM nodes WHERE parent_id IS NOT NULL AND status IN (${ACTIVE_STATUSES.map(() => "?").join(",")}) AND updated_at < ?`,
+			`SELECT id FROM nodes WHERE parent_id IS NOT NULL AND status IN (${ACTIVE_STATUSES.map(() => "?").join(",")}) AND updated_at < ? AND (host IS NULL OR host = '')`,
 		).all(...ACTIVE_STATUSES, staleBefore);
 		const ids = rows.map((r) => String(r.id));
 		for (const id of ids) {
@@ -185,7 +273,7 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 	const now = (opts.now ?? Date.now)();
 	const alive = opts.isAlive ?? isPidAlive;
 	const protect = new Set(opts.protectRunIds ?? []);
-	const report: HygieneReport = { removedTempDirs: [], abandonedNodes: [], checkpointedDbs: [], prunedRuns: [], deletedEvents: 0, freedBytes: 0, errors: [] };
+	const report: HygieneReport = { removedTempDirs: [], abandonedNodes: [], checkpointedDbs: [], prunedRuns: [], keptRemoteRuns: [], deletedEvents: 0, freedBytes: 0, errors: [] };
 	const runsRoot = path.join(opts.storeRoot, "runs");
 
 	for (const runDir of listDirs(runsRoot)) {
@@ -215,14 +303,30 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 
 		// #37: prune whole idle run dirs, keeping any with worktrees.
 		if (config.retentionDays > 0 && idleMs > config.retentionDays * DAY_MS && !hasWorktrees(runDir) && safeStat(path.join(runDir, "run.json"))) {
-			try {
-				const bytes = dirBytes(runDir);
-				fs.rmSync(runDir, { recursive: true, force: true });
-				report.prunedRuns.push(runDir);
-				report.freedBytes += bytes;
-				continue;
-			} catch (error) {
-				report.errors.push(`${runDir}: ${String(error)}`);
+			// #408: an idle run dir is NOT automatically garbage. If its ledger still
+			// owns an unsettled cross-machine row, the far side (directory + terminal)
+			// is still out there and this dir is the only local record of where — the
+			// row's `remote_dir` / `remote_terminal` cannot be re-derived from host
+			// config or from the core, so deleting it makes the leftover unanswerable.
+			// Skip the dir, report it, and let the sweep keep working on everything else:
+			// the protection is that row, not "never prune".
+			const hold = readRemoteHold(runDir);
+			if (hold.rows.length > 0) {
+				report.keptRemoteRuns.push(hold);
+			} else if (hold.error !== undefined) {
+				// Unreadable ledger: keep it rather than delete blind. The next sweep
+				// re-reads it; the error stays visible in the sweep report.
+				report.errors.push(`${runDir}: retention kept the dir (${hold.error})`);
+			} else {
+				try {
+					const bytes = dirBytes(runDir);
+					fs.rmSync(runDir, { recursive: true, force: true });
+					report.prunedRuns.push(runDir);
+					report.freedBytes += bytes;
+					continue;
+				} catch (error) {
+					report.errors.push(`${runDir}: ${String(error)}`);
+				}
 			}
 		}
 
@@ -259,6 +363,7 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 				removedTempDirs: report.removedTempDirs.length,
 				abandonedNodes: report.abandonedNodes.length,
 				prunedRuns: report.prunedRuns.length,
+				keptRemoteRuns: report.keptRemoteRuns.length,
 				deletedEvents: report.deletedEvents,
 				freedBytes: report.freedBytes,
 				errors: report.errors.length,
@@ -325,6 +430,7 @@ export function applyEventRetention(db: DatabaseSync, config: HygieneConfig = re
 export function formatHygieneReport(report: HygieneReport): string | undefined {
 	const parts: string[] = [];
 	if (report.prunedRuns.length) parts.push(`pruned ${report.prunedRuns.length} idle run dir(s)`);
+	if (report.keptRemoteRuns.length) parts.push(`kept ${report.keptRemoteRuns.length} run dir(s) holding an unsettled cross-machine row`);
 	if (report.removedTempDirs.length) parts.push(`removed ${report.removedTempDirs.length} orphan rpc-child temp dir(s)`);
 	if (report.abandonedNodes.length) parts.push(`marked ${report.abandonedNodes.length} abandoned node(s) failed`);
 	if (report.deletedEvents) parts.push(`dropped ${report.deletedEvents} old ledger event(s)`);

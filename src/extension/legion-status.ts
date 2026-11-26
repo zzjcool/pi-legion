@@ -7,14 +7,11 @@
  */
 
 import { NODE_STATUSES, type LegionNode } from "../legion/nodes.ts";
-import { recoveryCallFor } from "../runs/remote-recover.ts";
+import { recoveryStateWord, renderRemoteOwnershipBlock } from "../runs/remote-recover.ts";
 import type { InFlightToolStack } from "../supervisor/types.ts";
 import { formatInFlightToolLine } from "../supervisor/types.ts";
 import { formatTree } from "./legion-tools.ts";
-import {
-	renderLiveChildStatus,
-	type LiveChildStatusInput,
-} from "./runtime.ts";
+import { renderLiveChildStatus, type LiveChildStatusInput } from "./runtime.ts";
 import { formatDuration } from "./summary.ts";
 
 /** Child snapshot the status tool already prints. `now` is supplied by the caller. */
@@ -25,6 +22,29 @@ export type LegionChildStatusFacts = Omit<LiveChildStatusInput, "now"> & {
 	 * a rebuilt record (another session's child) has none and none is invented.
 	 */
 	inFlightTools?: InFlightToolStack;
+};
+
+/**
+ * 6.2.4 / D2/D3: a recoverable row, annotated with the exit's three-way fate.
+ *
+ * The fate lives in the ledger as `orphan_detected{reason:"session-shutdown"}`
+ * and is read by the caller (which has the database handle); the renderer only
+ * needs the word. `LegionNode` plus one optional field keeps every existing
+ * caller valid — a row without a marker renders exactly as before.
+ */
+export type RecoverableNode = LegionNode & {
+	orphaned?: "orphaned" | "unfetched";
+	/**
+	 * 6.2.5 / D4: the run-dir ownership facts, carried from `listRecoverableLeftovers`
+	 * (`run.json`'s cwd + session, the run dir's owner pid). Optional so a caller
+	 * holding only the node still renders the block (with `(not recorded)` where the
+	 * fact is missing) — never a guessed value.
+	 */
+	ledgerRunId?: string;
+	cwd?: string;
+	ownerSessionFile?: string;
+	ownerPid?: number;
+	ownerAlive?: boolean;
 };
 
 /**
@@ -56,6 +76,69 @@ export interface LegionStatusJob {
 	name: string;
 	nodeId?: string;
 	state: string;
+	/**
+	 * 6.2.5 / D5: the machine this job runs on, when it is not this one. A live
+	 * runtime job already carries it (`TrackedJob.host`), so the job-only fallback
+	 * (`renderJob`) can say where it is instead of guessing `local`.
+	 */
+	host?: string;
+	/** The address the core holds for that job's terminal (`host/name`), when known. */
+	remoteTerminal?: string;
+}
+
+/**
+ * 6.2.5 / D5: where a child runs and how to reach its terminal, chosen from the
+ * two records that already hold the pair — nothing new is persisted here.
+ *
+ *  1. the run store's child record (`ChildRecord.host` / `.remoteTerminal`),
+ *     written at launch, so it describes the attempt being viewed;
+ *  2. the ledger's node row (`nodes.host` / `nodes.remote_terminal`, schema v5),
+ *     which survives a run.json that a rebuild or an older build wrote without
+ *     them — the leftover case `/legion status` exists for.
+ *
+ * `{}` when neither knows: the renderer then writes `host=local` / `terminal=-`,
+ * and "no data" can never masquerade as "nothing worth saying". That silence is
+ * exactly what hid a live `hw-nj` child behind a block identical to a local one.
+ */
+export interface ChildRemoteFacts {
+	host?: string;
+	remoteTerminal?: string;
+	/** #409: the address this launch used as the child's terminal parent. */
+	parentTerminal?: string;
+	/** #409: why no parent address could be named (renders `parent=absent(...)`). */
+	parentAbsent?: string;
+}
+
+interface RemoteFactSource {
+	host?: string | null;
+	remoteTerminal?: string | null;
+	parentTerminal?: string | null;
+	parentAbsent?: string | null;
+}
+
+function nonEmpty(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function childRemoteFacts(
+	record: RemoteFactSource | null | undefined,
+	node: RemoteFactSource | null | undefined,
+): ChildRemoteFacts {
+	const host = nonEmpty(record?.host) ?? nonEmpty(node?.host);
+	const remoteTerminal = nonEmpty(record?.remoteTerminal) ?? nonEmpty(node?.remoteTerminal);
+	// #409: the parent is a run.json fact only — the ledger's `nodes` table has no
+	// ancestry column and this fix does not add one (the same deliberate boundary
+	// `modelProvider` took). A record without it renders no line, never a guess.
+	const parentTerminal = nonEmpty(record?.parentTerminal);
+	const parentAbsent = nonEmpty(record?.parentAbsent);
+	return {
+		...(host ? { host } : {}),
+		...(remoteTerminal ? { remoteTerminal } : {}),
+		...(parentTerminal ? { parentTerminal } : {}),
+		...(parentAbsent ? { parentAbsent } : {}),
+	};
 }
 
 export interface LegionStatusInput {
@@ -69,7 +152,7 @@ export interface LegionStatusInput {
 	 * caller (`listUnsettledRemoteNodes`), never from this process's memory — the
 	 * whole point is that this session has no handle on them.
 	 */
-	recoverable?: readonly LegionNode[];
+	recoverable?: readonly RecoverableNode[];
 	/**
 	 * Persisted child behind the subagent status action.
 	 * Undefined when this process has no run-store record for the name.
@@ -133,7 +216,10 @@ function renderNode(
 	now: number | undefined,
 ): string {
 	const facts = lookupChild?.(node.name);
-	if (facts) return renderFacts(facts, now);
+	// 6.2.5 / D5: the ledger row is the SECOND half of the host/terminal answer, so a
+	// run-store record written without them still renders where the child runs.
+	const remote = childRemoteFacts(facts, node);
+	if (facts) return renderFacts({ ...facts, ...remote }, now);
 	const job = liveJobForNode(node, jobs);
 	const alive = job
 		? job.state === "working" || job.state === "blocked"
@@ -145,6 +231,7 @@ function renderNode(
 		kind: node.kind,
 		sessionFile: node.sessionFile ?? "",
 		alive,
+		...remote,
 	}, now));
 }
 
@@ -160,6 +247,8 @@ function renderJob(
 		state: job.state,
 		sessionFile: "",
 		alive: job.state === "working" || job.state === "blocked",
+		...(job.host ? { host: job.host } : {}),
+		...(job.remoteTerminal ? { remoteTerminal: job.remoteTerminal } : {}),
 	}, now));
 }
 
@@ -210,7 +299,7 @@ function renderTree(
  * send the reader to an action that does not exist.
  */
 export function renderRecoverableSection(
-	recoverable: readonly LegionNode[],
+	recoverable: readonly RecoverableNode[],
 	jobs: readonly LegionStatusJob[],
 	now: number,
 ): string | undefined {
@@ -225,12 +314,26 @@ export function renderRecoverableSection(
 	if (rows.length === 0) return undefined;
 	const lines = ["Recoverable cross-machine children (this session never launched them):"];
 	for (const node of rows) {
-		const age = Number.isFinite(node.updatedAt) ? `${formatDuration(Math.max(0, now - node.updatedAt))} old` : "age unknown";
-		const terminal = node.remoteTerminal ?? "(terminal not recorded)";
-		lines.push(
-			`- ${node.name} · ${node.role} · host ${node.host} · ${node.status} · terminal ${terminal} · ${age}`,
-		);
-		lines.push(`  collect: ${recoveryCallFor(node.name)}`);
+		// 6.2.5 / D1+D4: ONE ownership block, shared with `recover`'s headline and miss
+		// (`renderRemoteOwnershipBlock`). It answers whose leftover this is — name, node
+		// id, machine, state, terminal, LAUNCH time, run, cwd, session, owner pid — and
+		// it is the only place the age is computed (from `createdAt`; `updatedAt` is the
+		// heartbeat, because hygiene rewrites it and an age off it was fiction).
+		lines.push(...renderRemoteOwnershipBlock({
+			name: node.name,
+			nodeId: node.id,
+			host: node.host ?? "(unknown host)",
+			state: recoveryStateWord(node),
+			...(node.remoteTerminal ? { terminal: node.remoteTerminal } : {}),
+			launchedAt: node.createdAt,
+			...(Number.isFinite(node.updatedAt) ? { heartbeatAt: node.updatedAt } : {}),
+			...(node.ledgerRunId ? { runId: node.ledgerRunId } : {}),
+			...(node.cwd ? { cwd: node.cwd } : {}),
+			...(node.ownerSessionFile ? { sessionFile: node.ownerSessionFile } : {}),
+			...(node.ownerPid !== undefined ? { ownerPid: node.ownerPid } : {}),
+			...(node.ownerAlive !== undefined ? { ownerAlive: node.ownerAlive } : {}),
+			now,
+		}));
 	}
 	return lines.join("\n");
 }

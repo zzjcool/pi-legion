@@ -17,7 +17,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -215,7 +215,8 @@ test("D4: argv is rpc's argv (includeTask:false) plus the task as one positional
 		assert.match(readFileSync(promptFile, "utf8"), /You are a test centurion\./);
 
 		// Byte-for-byte parity with the builder the rpc backend uses (D4): the only
-		// difference allowed is the temp dir the prompt file lives in.
+		// differences allowed are the temp dir the prompt file lives in and the
+		// per-run trust flag this backend adds on purpose (#424, asserted below).
 		const expectedDir = mkdtempSync(path.join(h.root, "expected-"));
 		const expected = buildPiArgs({
 			agent: input.agent,
@@ -223,10 +224,26 @@ test("D4: argv is rpc's argv (includeTask:false) plus the task as one positional
 			sessionFile: input.sessionFile,
 			tempDir: expectedDir,
 			includeTask: false,
+			approve: true,
 		}).args;
 		const normalize = (values: string[], dir: string): string[] =>
 			values.map((value) => (value === path.join(dir, "system-prompt.md") ? "<tmp>/system-prompt.md" : value));
 		assert.deepEqual(normalize(flags, supervisorTempDir), normalize(expected, expectedDir));
+		// The delta against rpc's argv is exactly that one flag — nothing else may
+		// drift in while adding it.
+		assert.deepEqual(
+			normalize(flags.filter((flag) => flag !== "--approve"), supervisorTempDir),
+			normalize(
+				buildPiArgs({
+					agent: input.agent,
+					task: input.task,
+					sessionFile: input.sessionFile,
+					tempDir: expectedDir,
+					includeTask: false,
+				}).args,
+				expectedDir,
+			),
+		);
 
 		// `--no-extensions` + an explicit `-e` set (provider extensions included by
 		// the shared builder) is what makes the TUI load a model at all.
@@ -246,6 +263,66 @@ test("D4: argv is rpc's argv (includeTask:false) plus the task as one positional
 		assert.equal(handle.name, input.name);
 		assert.equal(handle.sessionFile, input.sessionFile);
 		assert.equal(handle.pid, 4242);
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── #424: per-run project trust ───────────────────────────────────────────
+
+/**
+ * The one question a TUI child cannot answer for itself (#424).
+ *
+ * A terminal child starts in a directory legion created moments earlier — a fresh
+ * worktree, or a checkout nobody has opened. pi has no trust decision for that
+ * cwd, so without `--approve` it stops at the interactive
+ * `Trust project folder?` prompt BEFORE writing a session file: the parent sees a
+ * live terminal that never starts, and a human has to press Enter. `--approve` is
+ * per RUN (pi does not write the trust store for it), never `--no-approve`, and
+ * exactly once — a second one would be a contradictory trust decision on the same
+ * command line.
+ */
+function assertApprovedForRun(argv: readonly string[], label: string): void {
+	assert.equal(argv.includes("--no-approve"), false, `${label}: a child must never opt OUT of project trust`);
+	assert.equal(
+		argv.filter((arg) => arg === "--approve").length,
+		1,
+		`${label}: argv must carry exactly one --approve (#424), got: ${argv.join(" ")}`,
+	);
+}
+
+test("#424: a local terminal child's argv trusts the project for THIS run only", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		const argv = h.client.paramsFor("terminal.run")[0]!.argv as string[];
+		assertApprovedForRun(argv, "local child");
+		// The last element is the positional task that starts turn 1 (D4); the trust
+		// flag must be a real flag, not that message.
+		assert.notEqual(argv[argv.length - 1], "--approve");
+		// Negative control: the verdict above is evidence only if the same predicate
+		// REJECTS the argv with the flag removed. This is the mutation the report
+		// claims turns this test red (drop `approve: true` from the spawn).
+		assert.throws(
+			() => assertApprovedForRun(argv.filter((arg) => arg !== "--approve"), "mutant"),
+			/exactly one --approve/,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#424: approve is FORCED, not inherited from subagents.rpc.approve", async () => {
+	const h = harness();
+	try {
+		// `approve: false` is the one spelling upstream config can produce that would
+		// UNDO this. The terminal backend must override it: that setting is the RPC
+		// backend's opt-in (#193), where no UI can block a launch.
+		await h.supervisor.spawnChild(spawnInput(h.root, { approve: false }));
+		assertApprovedForRun(h.client.paramsFor("terminal.run")[0]!.argv as string[], "approve:false child");
+		// An explicit `true` is not added twice (argv is a set, not a stack).
+		await h.supervisor.spawnChild(spawnInput(h.root, { name: "root.centurion-1", approve: true }));
+		assertApprovedForRun(h.client.paramsFor("terminal.run")[1]!.argv as string[], "approve:true child");
 	} finally {
 		h.cleanup();
 	}
@@ -329,6 +406,63 @@ test("D6: with no runId known the run label is omitted, not invented", async () 
 		const labels = h.client.paramsFor("terminal.run")[0]!.labels as Record<string, string>;
 		assert.equal(LEGION_RUN_LABEL in labels, false);
 		assert.equal(labels[LEGION_ROLE_LABEL], "centurion");
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── #414: the run that DISPATCHED this child names it ─────────────────────
+
+test("#414: SpawnInput.runId names the terminal and the legion.run label", async () => {
+	// Production builds ONE supervisor before any run exists, so the fact has to
+	// travel on the spawn. The legacy shape (no runId) is pinned by D6/D7 above.
+	const h = harness();
+	try {
+		const runId = "r-1a2b3c4d";
+		const input = spawnInput(h.root, { runId });
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal(run.name, terminalName(runId, input.name));
+		assert.match(String(run.name), /^lgl-r-1a2b3c-/);
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], runId);
+		// The collision the issue measured: SAME child name, DIFFERENT runs. Their
+		// terminal names must differ (the name is unique only per core, and the
+		// handle is unique only per run).
+		assert.notEqual(
+			terminalName("r-1a2b3c4d", "root.worker-0"),
+			terminalName("r-5e6f7a8b", "root.worker-0"),
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: the spawn's runId wins over the constructor value (per-spawn fact)", async () => {
+	const h = harness({ runId: "r-constructor" });
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root, { runId: "r-dispatch" }));
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], "r-dispatch");
+		assert.match(String(run.name), /^lgl-r-dispat-/);
+		// A spawn that names nothing still gets the constructor fallback — the
+		// pre-#414 seam keeps working for a caller that really owns one run.
+		await h.supervisor.spawnChild(spawnInput(h.root, { name: "root.centurion-1" }));
+		const second = h.client.paramsFor("terminal.run")[1]!;
+		assert.equal((second.labels as Record<string, string>)[LEGION_RUN_LABEL], "r-constructor");
+		assert.match(String(second.name), /^lgl-r-constr-/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: no runId anywhere keeps the legacy shape byte for byte", async () => {
+	const h = harness();
+	try {
+		const input = spawnInput(h.root);
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal(run.name, "lgl-root-centurion-0");
+		assert.equal(LEGION_RUN_LABEL in (run.labels as Record<string, string>), false);
 	} finally {
 		h.cleanup();
 	}
@@ -822,5 +956,195 @@ test("D3: HC_BIN wins, then PATH, then ~/.local/bin/hc, then the bare name", () 
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 		rmSync(pathDir, { recursive: true, force: true });
+	}
+});
+
+// ── #432: the local cwd preflight (the local half of D6/D9) ────────────────
+//
+// #410 re-explained the core's `spawn_failed` AFTER the fact; #432 asks the same
+// question BEFORE `terminal.run`, so a launch that cannot work never creates a
+// terminal, a temp dir or a half-record — and the operator is never told that
+// `node` is missing when what is missing is the DIRECTORY (the core cannot tell
+// the two apart: both are `ENOENT` on the exec/chdir pair). Two harms are pinned
+// here: the attribution, and the fact that a RELATIVE cwd is resolved by the core
+// against the CORE's directory (measured: `hc run --cwd real …` where `real`
+// exists under this process's cwd dies blaming node).
+//
+// #410's post-hoc mapping stays as the second line of defence: a cwd that is
+// removed between the preflight and the spawn still has to be named.
+
+test("#432: a local launch with a missing cwd is refused before terminal.run, naming the cwd", async () => {
+	const h = harness();
+	try {
+		// A FILE where the parent directory would go: nothing can create through it,
+		// and the message has to say so instead of blaming the interpreter.
+		const blocker = path.join(h.root, "blocked");
+		writeFileSync(blocker, "not a directory\n");
+		const cwd = path.join(blocker, "tree");
+		const program = process.execPath;
+
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				const message = error.message;
+				// The sentence #432 asks for, with the path verbatim.
+				assert.ok(message.includes(`cwd does not exist: ${cwd}`), `the cwd must be named verbatim: ${message}`);
+				// The program is NAMED — as the thing that is NOT the problem. The core's
+				// own `cannot start "<node>"` is exactly what must not appear here.
+				assert.ok(message.includes(program), `the program is named as a note: ${message}`);
+				assert.match(message, /is not the problem/);
+				assert.doesNotMatch(message, /cannot start/);
+				// Nothing was spawned, so the core's own vocabulary would be a lie about
+				// where this verdict came from (the post-hoc path below keeps it).
+				assert.doesNotMatch(message, /spawn_failed/);
+				// And what the launch directory's parent looks like (a FILE here), measured.
+				assert.match(message, /its parent directory is missing or is not a directory/);
+				const details = error.details as { cwd?: string; program?: string; preflight?: string };
+				assert.equal(details.cwd, cwd);
+				assert.equal(details.program, program);
+				assert.equal(details.preflight, "local-cwd");
+				return true;
+			},
+		);
+		// The core was never asked: no terminal was created for a launch that cannot work.
+		assert.deepEqual(h.client.paramsFor("terminal.run"), []);
+		// …and nothing of the refused launch survives it: the temp dir (system prompt +
+		// owner file) is gone, so a bad cwd does not leave a pile of prompt files.
+		assert.deepEqual(
+			readdirSync(h.root).filter((entry) => entry.startsWith("terminal-child-")),
+			[],
+			"a refused launch leaves no temp dir behind",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#432: a worktree launch mkdir -p's the missing parent chain, and leaves the tree to git", async () => {
+	const h = harness();
+	try {
+		// Two missing levels, so a single-level `mkdir` would not pass.
+		const cwd = path.join(h.root, "runs", "r-432", "worktrees", "lgl-tree");
+		assert.equal(existsSync(path.dirname(path.dirname(cwd))), false, "precondition: two levels are missing");
+
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd, worktree: true }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				assert.ok(error.message.includes(`cwd does not exist: ${cwd}`), error.message);
+				return true;
+			},
+		);
+
+		// The whole parent chain exists now: that is the half the launcher owns
+		// (`git worktree add` creates the final directory but not its parents — the
+		// same split `ensureRemoteDir` keeps on the remote side).
+		assert.ok(statSync(path.dirname(cwd)).isDirectory(), "the whole parent chain was created");
+		// The tree itself is NOT invented: handing `git worktree add` an existing
+		// directory is a refusal (#410's frozen decision).
+		assert.equal(existsSync(cwd), false, "the launch directory itself belongs to git, not to this backend");
+		// Refused before the request, so the core never heard about it.
+		assert.deepEqual(h.client.paramsFor("terminal.run"), []);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#432: a relative local cwd is resolved HERE, not by the core", async () => {
+	const h = harness();
+	try {
+		const relative = path.relative(process.cwd(), h.root);
+		assert.equal(path.isAbsolute(relative), false, "precondition: a relative path");
+
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root, { cwd: relative }));
+
+		const run = h.client.paramsFor("terminal.run")[0];
+		assert.ok(run, "terminal.run must be called");
+		// What travels on the wire is absolute: a relative path would be resolved against
+		// the CORE's own directory, which is how a directory that exists here became
+		// `No such file or directory` on `node` there (#432's measured failure).
+		assert.equal(run.cwd, path.resolve(h.root));
+		assert.equal(handle.name, "root.centurion-0");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#432: a cwd that DOES exist keeps the program's sentence — the attributions never merge", async () => {
+	const h = harness();
+	try {
+		const program = process.execPath;
+		h.client.on("terminal.run", () => {
+			// The real core's wording for a program it cannot start, measured.
+			throw new HcRpcError({
+				code: -32000,
+				message: `cannot start "${program}": No such file or directory (os error 2)`,
+				data: { kind: "spawn_failed" },
+			});
+		});
+
+		await assert.rejects(
+			async () => {
+				// cwd = h.root: it IS a directory, so the directory is not the story here.
+				await h.supervisor.spawnChild(spawnInput(h.root));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				assert.match(error.message, /spawn_failed: cannot start/);
+				assert.equal(
+					error.message.includes("cwd does not exist"),
+					false,
+					`a present cwd must never be blamed: ${error.message}`,
+				);
+				return true;
+			},
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#410: a cwd removed between the preflight and the spawn still names the cwd", async () => {
+	const h = harness();
+	try {
+		const cwd = path.join(h.root, "vanishing");
+		mkdirSync(cwd, { recursive: true });
+		const program = process.execPath;
+		h.client.on("terminal.run", () => {
+			// The directory was there when the preflight looked, and is gone by the time
+			// the core answers: the post-hoc mapping is what has to carry that.
+			rmSync(cwd, { recursive: true, force: true });
+			throw new HcRpcError({
+				code: -32000,
+				message: `cannot start "${program}": No such file or directory (os error 2)`,
+				data: { kind: "spawn_failed" },
+			});
+		});
+
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				// #410's frozen shape: the core's own word first, then the fact it could
+				// not report — the second line of defence, unchanged.
+				assert.match(error.message, /spawn_failed: cwd does not exist: /);
+				assert.ok(error.message.includes(cwd), `the cwd must be named verbatim: ${error.message}`);
+				assert.match(error.message, /the program is not the problem/);
+				return true;
+			},
+		);
+	} finally {
+		h.cleanup();
 	}
 });

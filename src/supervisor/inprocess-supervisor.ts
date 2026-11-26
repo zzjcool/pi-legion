@@ -33,6 +33,11 @@ import {
 	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
 import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./child-builtins.ts";
+import {
+	childDiagnosticsLogFile,
+	createChildDiagnosticSink,
+	flushOnFailure,
+} from "./child-diagnostics.ts";
 import { bindChildSessionExtensions, attachChildSessionRelease } from "./child-session.ts";
 import { DECODE_ARCHIVE_MAX, foldDecode, seedDecode, type DecodeClock } from "./decode-clock.ts";
 import {
@@ -559,6 +564,13 @@ function phasesFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): {
 		const machine = parsePhaseMachine(JSON.parse(declared), LEGION_PHASES_ENV);
 		return machine ? { phases: machine } : {};
 	} catch (error) {
+		// #468 audit: deliberately NOT routed through the child's diagnostic sink.
+		// This is a SPAWN-REQUEST problem (the parent declared a phase machine we
+		// cannot parse), stated once per spawn, and the consequence is destructive and
+		// silent — the team stops walking its machine. It belongs with the host's other
+		// "you asked for something we refused" warnings (`MAX_DEPTH_ENV`, worktree
+		// denials), not with the child's per-turn chatter that #468 is about. The
+		// per-turn/per-event sinks live in `child-session.ts` + `child-diagnostics.ts`.
 		console.warn(
 			`[pi-legion] ignoring an unreadable ${LEGION_PHASES_ENV} declaration on an in-process spawn: ` +
 				(error instanceof Error ? error.message : String(error)),
@@ -789,15 +801,38 @@ async function defaultSessionFactory(
 	// session without `createAgentSessionServices()` never does). Drain them into
 	// the runtime handed to `createAgentSession` so extension-provided providers
 	// are resolvable by both the `--model` resolve below and the session itself.
-	const modelRuntime = await ModelRuntime.create();
-	for (const diagnostic of await drainExtensionRegistrations(
-		resourceLoader,
-		modelRuntime,
+	// #468: ONE sink per child run, created before anything can fail so that every
+	// diagnostic of this run (registration, extension handler, teardown) ends up in
+	// the same `<runDir>/diagnostics.log` and in the same single run-end host line.
+	// `<runDir>` is the transcript's directory — the orchestrator pre-creates
+	// `<runDir>/<name>.jsonl` (`preCreateSessionFile`), so no path needs threading.
+	const diagnosticsLogFile = childDiagnosticsLogFile(input.sessionFile);
+	const childDiagnostics = createChildDiagnosticSink({
+		child: input.name,
+		...(diagnosticsLogFile === undefined ? {} : { logFile: diagnosticsLogFile }),
+	});
+	// #468: a real failure recorded BEFORE the session exists has no `dispose()` to
+	// flush it — nothing below is armed yet, so if one of these steps throws, the run
+	// dies with the record on disk and the user never hears the one line they are owed
+	// (the pre-#468 code printed it immediately, so silence would be a regression on
+	// the issue's own terms). Every pre-session step goes through `flushOnFailure`.
+	const modelRuntime = await flushOnFailure(childDiagnostics, () => ModelRuntime.create());
+	for (const diagnostic of await flushOnFailure(childDiagnostics, () =>
+		drainExtensionRegistrations(resourceLoader, modelRuntime),
 	)) {
 		if (diagnostic.type === "error") {
 			// Non-fatal by design (same as the SDK): the spawn only fails if the
 			// model itself cannot be resolved.
-			console.warn(`[pi-legion] inprocess child '${input.name}': ${diagnostic.message}`);
+			//
+			// #468: this IS a real extension failure (an extension loaded and its
+			// provider never registered), so it stays the user's business — but it is
+			// recorded, not printed, and reaches the host as part of the one run-end
+			// summary line instead of one `console.warn` per registration.
+			childDiagnostics.record({
+				event: "extension.registration.error",
+				reason: diagnostic.message,
+				real: true,
+			});
 		}
 	}
 
@@ -828,6 +863,9 @@ async function defaultSessionFactory(
 			modelRuntime,
 		});
 		if (resolved.error || !resolved.model) {
+			// #468: same rule — a recorded registration failure must not die with the spawn
+			// (this branch has no step to wrap, so it flushes directly).
+			childDiagnostics.flush();
 			throw new SubagentError(
 				`inprocess model resolve failed for '${plan.modelRef}'` +
 					(resolved.error ? `: ${resolved.error}` : ""),
@@ -850,7 +888,7 @@ async function defaultSessionFactory(
 		}
 	}
 
-	const { session } = await createAgentSession(createOptions);
+	const { session } = await flushOnFailure(childDiagnostics, () => createAgentSession(createOptions));
 	// `child-mcp-v1` D3 + r2 + r3, the only bind: `createAgentSession` does NOT emit
 	// `session_start` (`bindExtensions` is its sole emitter), so every
 	// `session_start` consumer — most visibly the MCP extension's
@@ -876,10 +914,10 @@ async function defaultSessionFactory(
 	// have reached the extensions (MCP included) and `spawnChild` only records the
 	// session AFTER this factory resolves — so its `rollbackSpawn` would have
 	// nothing to dispose. Dispose here (the armed release still emits) and rethrow.
-	attachChildSessionRelease(session);
+	attachChildSessionRelease(session, childDiagnostics);
 	if (childEnablesMcp(process.env)) {
 		try {
-			await bindChildSessionExtensions(session, input.name);
+			await bindChildSessionExtensions(session, input.name, childDiagnostics);
 		} catch (error) {
 			// r5 G3: awaited — the wrapper never rejects, so this is free, and it keeps
 			// the failure path from unwinding while the `session_shutdown` emit is still
@@ -1512,6 +1550,11 @@ export class InProcessSupervisor implements LegionSupervisor {
 		if (!this.isAlive(name)) return undefined;
 		const stack = this.children.get(name)?.inFlightTools;
 		return stack?.[stack.length - 1];
+	}
+
+	/** #441-B: this backend folds the child's own tool events, so an empty stack MEANS empty. */
+	observesToolEvents(_name: string): boolean {
+		return true;
 	}
 
 	/** The whole stack (#331), innermost last; same `isAlive` gate as above. */

@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { initTheme } from "@earendil-works/pi-coding-agent";
+import { liveMirrorStatePathFor } from "../../src/runs/live-mirror.ts";
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { RunStore } from "../../src/runs/store.ts";
@@ -61,24 +62,42 @@ import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 const MINUTE = 60_000;
 
+/**
+ * #441-B: write the pump's persisted facts row for a cross-machine test child.
+ *
+ * A cross-machine child may only be judged by GROWTH, so a fixture that expects a
+ * notice for one must give it a mirror row — exactly what the pump writes every 5 s.
+ */
+function writeMirrorState(sessionFile: string, lastGrowthAt: number, mode: "on" | "off" = "on"): void {
+	const statePath = liveMirrorStatePathFor(sessionFile);
+	mkdirSync(path.dirname(statePath), { recursive: true });
+	writeFileSync(statePath, `${JSON.stringify({ mode, bytes: 10, offset: 10, staleBytes: 0, lastGrowthAt, lastSyncAt: lastGrowthAt })}\n`);
+}
+
 // ───────────────────────────── 1. pure decision ─────────────────────────────
 
-/** The window as the postman builds it: `announced` = lines already sent. */
-/** The window as the postman builds it: per-kind `{ count, lastAt }` (D6). */
+/** The window as the postman builds it: per-kind `{ tier, count }` (D6/#413). */
 function window(
 	loopBaseAt: number,
 	announced: { silence?: StallLineState; longRunning?: StallLineState } = {},
 ) {
 	return {
 		loopBaseAt,
-		silence: announced.silence ?? { count: 0 },
-		longRunning: announced.longRunning ?? { count: 0 },
+		silence: announced.silence ?? EMPTY_LINE,
+		longRunning: announced.longRunning ?? EMPTY_LINE,
 	};
 }
 
-/** A line already sent at `lastAt` (the repeat clock's whole input). */
-function sentAt(count: number, lastAt: number): StallLineState {
-	return { count, lastAt };
+/** Nothing announced yet in this window. */
+const EMPTY_LINE: StallLineState = { tier: 0, count: 0 };
+
+/**
+ * What one window has already announced (#413): the highest crossed BOUNDARY
+ * (`tier`), and how many lines D6's cap has spent (`count`, which can be lower
+ * when a child was first observed past several boundaries at once).
+ */
+function sent(tier: number, count: number): StallLineState {
+	return { tier, count };
 }
 
 function child(facts: Partial<StallChildFacts> = {}): StallChildFacts {
@@ -168,14 +187,16 @@ test("L1: announced at 1× and 2×, then never again in the same silence window 
 			window: window(0, { silence: already }),
 		});
 
-	assert.equal(announce(silenceNoticeMs, { count: 0 })?.sequence, 1);
-	// D6: the second line waits one threshold after the FIRST line, not after `2×base`.
-	assert.equal(announce(silenceNoticeMs + 1_000, sentAt(1, silenceNoticeMs)), undefined, "no second mail one tick later");
-	assert.equal(announce(2 * silenceNoticeMs - 1, sentAt(1, silenceNoticeMs)), undefined, "one threshold after the first line");
-	assert.equal(announce(2 * silenceNoticeMs, sentAt(1, silenceNoticeMs))?.sequence, 2);
+	assert.equal(announce(silenceNoticeMs, EMPTY_LINE)?.sequence, 1);
+	// #413/D6: the second line waits for the NEXT boundary, not for one threshold
+	// after the first line's timestamp (the two agree here because the first line
+	// landed exactly on `1×`).
+	assert.equal(announce(silenceNoticeMs + 1_000, sent(1, 1)), undefined, "no second mail one tick later");
+	assert.equal(announce(2 * silenceNoticeMs - 1, sent(1, 1)), undefined, "not before the second boundary");
+	assert.equal(announce(2 * silenceNoticeMs, sent(1, 1))?.sequence, 2);
 	assert.equal(SILENCE_NOTICE_LIMIT, 2);
-	assert.equal(announce(3 * silenceNoticeMs, sentAt(2, 2 * silenceNoticeMs)), undefined, "a dead child must not mail every 2 minutes");
-	assert.equal(announce(100 * silenceNoticeMs, sentAt(2, 3 * silenceNoticeMs)), undefined);
+	assert.equal(announce(3 * silenceNoticeMs, sent(2, 2)), undefined, "a dead child must not mail every 2 minutes");
+	assert.equal(announce(100 * silenceNoticeMs, sent(2, 2)), undefined);
 	// A NEW event opens a new window, and the count restarts with it.
 	assert.equal(
 		decideStallNotice({
@@ -204,7 +225,11 @@ test("L2: the radius boundary, and it works without lastEventAt (D2)", () => {
 	assert.ok(fired);
 	assert.equal(fired.kind, "long-running");
 	assert.equal(fired.sinceBucket, base, "the bucket is the L2 baseline");
-	assert.equal(fired.inFlightTool, undefined);
+	// #441: the local (tool-observable) decision carries no container word and no
+	// growth fact — the empty stack was the determination, so the line says only
+	// `nothing in flight`.
+	assert.equal(fired.programState, undefined);
+	assert.equal(fired.sessionGrowthIdleMs, undefined);
 });
 
 test("L2: it repeats once per radius and stops after three unhandled lines (D6)", () => {
@@ -218,36 +243,139 @@ test("L2: it repeats once per radius and stops after three unhandled lines (D6)"
 			window: window(base, { longRunning }),
 		});
 
-	assert.equal(at(radius, { count: 0 })?.sequence, 1);
-	// ‘每再过一个 loopRadiusMs’ measured from the PREVIOUS line (D6), not one tick later.
-	assert.equal(at(radius + 1, sentAt(1, radius)), undefined);
-	assert.equal(at(2 * radius - 1, sentAt(1, radius)), undefined);
-	assert.equal(at(2 * radius, sentAt(1, radius))?.sequence, 2);
-	assert.equal(at(3 * radius, sentAt(2, 2 * radius))?.sequence, 3);
+	assert.equal(at(radius, EMPTY_LINE)?.sequence, 1);
+	// #413: one line per crossed BOUNDARY, not one tick and not one sent-time window.
+	assert.equal(at(radius + 1, sent(1, 1)), undefined);
+	assert.equal(at(2 * radius - 1, sent(1, 1)), undefined);
+	assert.equal(at(2 * radius, sent(1, 1))?.sequence, 2);
+	assert.equal(at(3 * radius, sent(2, 2))?.sequence, 3);
 	assert.equal(LONG_RUNNING_NOTICE_LIMIT, 3);
-	assert.equal(at(4 * radius, sentAt(3, 3 * radius)), undefined, "the cap holds until an `extend` or the child ends");
-	assert.equal(at(100 * radius, sentAt(3, 4 * radius)), undefined);
+	assert.equal(at(4 * radius, sent(3, 3)), undefined, "the cap holds until an `extend` or the child ends");
+	assert.equal(at(100 * radius, sent(3, 3)), undefined);
 });
 
-test("L2: a non-empty stack becomes EVIDENCE inside the line, never a verdict of its own (D1)", () => {
-	const announcement = decideStallNotice({
-		now: 46 * MINUTE,
-		child: child({ inFlightTool: "bash", inFlightToolStartedAt: 8 * MINUTE }),
-		thresholds: long(45 * MINUTE),
+test("#413: N checks inside ONE boundary announce exactly once (the key is the threshold, not a timestamp)", () => {
+	const radius = 30 * MINUTE;
+	const base = 0;
+	// The reported defect: a child sits past its 30m threshold and every check
+	// re-detects it. Ten checks spread over the SAME boundary must write one line.
+	let announced = EMPTY_LINE;
+	const tiers: number[] = [];
+	for (let tick = 0; tick < 10; tick += 1) {
+		const decision = decideStallNotice({
+			now: base + radius + tick * 1_000,
+			child: child(),
+			thresholds: long(radius),
+			window: window(base, { longRunning: announced }),
+		});
+		if (!decision) continue;
+		tiers.push(decision.tier);
+		// The caller's whole job: record the boundary it just spent.
+		announced = { tier: decision.tier, count: decision.sequence };
+	}
+	assert.deepEqual(tiers, [1], "ten checks, one line — the second 30m boundary was never crossed");
+	// `floor`, not `round`: the boundary flips exactly at `base + n × threshold`.
+	assert.equal(decideStallNotice({ now: base + 2 * radius - 1, child: child(), thresholds: long(radius), window: window(base, { longRunning: sent(1, 1) }) }), undefined);
+	assert.equal(decideStallNotice({ now: base + 2 * radius, child: child(), thresholds: long(radius), window: window(base, { longRunning: sent(1, 1) }) })?.tier, 2);
+});
+
+test("#413: the NEXT boundary re-arms — one threshold after the last line was the old rule", () => {
+	const radius = 45 * MINUTE;
+	const base = 0;
+	const at = (now: number, longRunning: StallLineState) =>
+		decideStallNotice({ now, child: child(), thresholds: long(radius), window: window(base, { longRunning }) });
+	// First observed 10 minutes into its fourth boundary (190m): that boundary is
+	// announced once, and the next line belongs to the boundary at 225m — 35m away,
+	// not a full radius after the line that was just sent.
+	const late = at(190 * MINUTE, EMPTY_LINE);
+	assert.equal(late?.sequence, 1);
+	assert.equal(late?.tier, 4);
+	assert.equal(at(224 * MINUTE, sent(4, 1)), undefined, "still inside the boundary just announced");
+	assert.equal(at(225 * MINUTE, sent(4, 1))?.tier, 5, "crossing the next boundary re-arms the reminder");
+});
+
+test("#441-C: a child the container can SEE inside a command is WORKING — no L2 line", () => {
+	// The measured false positive: a worker blocked in `gh pr checks --watch` for 16
+	// minutes, session not written at all, reported on every boundary. Before #441
+	// the stack was EVIDENCE ("inside `bash` for 38m"); now it is a verdict that the
+	// child is working, so the clock alone cannot raise a notice.
+	for (const startedAt of [8 * MINUTE, Number.NaN]) {
+		assert.equal(
+			decideStallNotice({
+				now: 46 * MINUTE,
+				child: child({ inFlightTool: "bash", inFlightToolStartedAt: startedAt }),
+				thresholds: long(45 * MINUTE),
+				window: window(0),
+			}),
+			undefined,
+			`an in-flight tool (startedAt=${startedAt}) is working, not stalled`,
+		);
+	}
+	// The container's own status word is the same fact on a tool-blind backend: a
+	// terminal-hosted centurion compiling for 20 minutes reports `working`.
+	assert.equal(
+		decideStallNotice({
+			now: 46 * MINUTE,
+			child: child({ toolObservationUnavailable: true, programState: "working", lastSessionGrowthAt: 0 }),
+			thresholds: long(45 * MINUTE),
+			window: window(0),
+		}),
+		undefined,
+		"a `working` container is not a stalled child, whatever the clock says",
+	);
+});
+
+test("#441-B: a tool-blind child is judged by GROWTH — an idle container with a stalled transcript fires, and the line quotes both facts", () => {
+	const radius = 45 * MINUTE;
+	const now = 46 * MINUTE;
+	// The child sits at its prompt (`idle`) and its transcript has not grown for 38m.
+	const announced = decideStallNotice({
+		now,
+		child: child({
+			toolObservationUnavailable: true,
+			programState: "idle",
+			lastSessionGrowthAt: now - 50 * MINUTE,
+		}),
+		thresholds: long(radius),
 		window: window(0),
 	});
-	assert.ok(announcement);
-	assert.equal(announcement.inFlightTool, "bash");
-	assert.equal(announcement.inFlightMs, 46 * MINUTE - 8 * MINUTE);
-	// An unusable tool start is no evidence — the line must not print `NaN`.
-	const noClock = decideStallNotice({
-		now: 46 * MINUTE,
-		child: child({ inFlightTool: "bash", inFlightToolStartedAt: Number.NaN }),
-		thresholds: long(45 * MINUTE),
-		window: window(0),
-	});
-	assert.equal(noClock?.inFlightTool, "bash");
-	assert.equal(noClock?.inFlightMs, undefined);
+	assert.ok(announced, "idle container + stalled transcript IS an anomaly");
+	assert.equal(announced.programState, "idle");
+	assert.equal(announced.sessionGrowthIdleMs, 50 * MINUTE, "the line quotes how long the transcript has been still");
+	// A transcript that grew INSIDE the window is proof of life the clock cannot beat.
+	assert.equal(
+		decideStallNotice({
+			now,
+			child: child({ toolObservationUnavailable: true, programState: "idle", lastSessionGrowthAt: now - 44 * MINUTE }),
+			thresholds: long(radius),
+			window: window(0),
+		}),
+		undefined,
+		"growth 44m ago is inside the 45m window",
+	);
+	// No growth evidence at all (mirror off / no session) is `unknown`, never `stalled`.
+	assert.equal(
+		decideStallNotice({
+			now,
+			child: child({ toolObservationUnavailable: true, programState: "idle" }),
+			thresholds: long(radius),
+			window: window(0),
+		}),
+		undefined,
+		"unknown ≠ stalled",
+	);
+	// And a tool-blind child with NO container word either is undecidable — the
+	// empty stack on such a backend means nothing at all ("本机永远看不到").
+	assert.equal(
+		decideStallNotice({
+			now,
+			child: child({ toolObservationUnavailable: true, lastSessionGrowthAt: 0 }),
+			thresholds: long(radius),
+			window: window(0),
+		}),
+		undefined,
+		"no container view ⇒ not decidable ⇒ no notice",
+	);
 });
 
 test("L1 wins over L2 for the same child in the same tick (one line per child)", () => {
@@ -264,7 +392,7 @@ test("L1 wins over L2 for the same child in the same tick (one line per child)",
 		now: 60 * MINUTE,
 		child: child({ lastEventAt: 0 }),
 		thresholds: { silenceNoticeMs: 120_000, loopRadiusMs: 45 * MINUTE },
-		window: window(0, { silence: sentAt(SILENCE_NOTICE_LIMIT, 2 * 120_000) }),
+		window: window(0, { silence: sent(SILENCE_NOTICE_LIMIT, SILENCE_NOTICE_LIMIT) }),
 	});
 	assert.equal(later?.kind, "long-running");
 });
@@ -285,6 +413,7 @@ function silenceAnnouncement(childName: string, overrides: Partial<StallAnnounce
 		kind: "silence",
 		childName,
 		sinceBucket: 0,
+		tier: 1,
 		sequence: 1,
 		elapsedMs: 125_000,
 		thresholdMs: 120_000,
@@ -297,6 +426,7 @@ test("L1 text carries the frozen qualifier: steer cannot land, abort can (D3)", 
 		kind: "silence",
 		childName: "root.worker",
 		sinceBucket: 0,
+		tier: 1,
 		sequence: 1,
 		elapsedMs: 125_000,
 		thresholdMs: 120_000,
@@ -340,15 +470,17 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 			kind: "long-running",
 			childName: "root.worker",
 			sinceBucket: 0,
+			tier: 1,
 			sequence: 1,
 			elapsedMs: 46 * MINUTE,
 			thresholdMs: 45 * MINUTE,
-			inFlightTool: "bash",
-			inFlightMs: 38 * MINUTE,
+			programState: "idle",
+			sessionGrowthIdleMs: 38 * MINUTE,
 		},
 	], DETECTED_AT);
 	assert.doesNotMatch(body, /steer cannot land/);
-	assert.match(body, /inside `bash` for 38m 0s/, "the stack is evidence, spelled out as one");
+	assert.match(body, /nothing in flight, container status `idle`/, "the two facts that made it an anomaly");
+	assert.match(body, /transcript has not grown for 38m 0s/, "and the growth evidence, spelled out as one");
 	assert.match(body, /running for 46m 0s/);
 	assert.match(body, /threshold 45m 0s/);
 	assert.match(body, /steer reaches a child at a turn boundary/);
@@ -360,9 +492,9 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 
 test("many children in one tick merge into ONE mail with one line each (D7)", () => {
 	const merged = formatStallNotice([
-		{ kind: "silence", childName: "root.a", sinceBucket: 0, sequence: 1, elapsedMs: 130_000, thresholdMs: 120_000 },
-		{ kind: "silence", childName: "root.b", sinceBucket: 0, sequence: 1, elapsedMs: 140_000, thresholdMs: 120_000 },
-		{ kind: "long-running", childName: "root.c", sinceBucket: 0, sequence: 1, elapsedMs: 46 * MINUTE, thresholdMs: 45 * MINUTE },
+		{ kind: "silence", childName: "root.a", sinceBucket: 0, tier: 1, sequence: 1, elapsedMs: 130_000, thresholdMs: 120_000 },
+		{ kind: "silence", childName: "root.b", sinceBucket: 0, tier: 1, sequence: 1, elapsedMs: 140_000, thresholdMs: 120_000 },
+		{ kind: "long-running", childName: "root.c", sinceBucket: 0, tier: 1, sequence: 1, elapsedMs: 46 * MINUTE, thresholdMs: 45 * MINUTE },
 	], DETECTED_AT);
 	assert.equal(merged.subject, "Stall notice: 3 children");
 	const lines = merged.body.split("\n").filter((line) => line.startsWith("- "));
@@ -545,6 +677,17 @@ class StallSupervisor extends FakeSupervisor {
 	inFlightToolStack(name: string): InFlightToolStack | undefined {
 		return this.stacks.get(name);
 	}
+
+	/**
+	 * #441-B/C: the container's status word. A tool-blind child (a terminal-backed /
+	 * cross-machine row) is judged by this plus the mirror's growth, so the postman
+	 * test can prove the composition without an `hc` core.
+	 */
+	readonly programStates = new Map<string, string>();
+
+	async programState(name: string): Promise<string | undefined> {
+		return this.programStates.get(name);
+	}
 }
 
 const TICK_AT = 3_600_000;
@@ -559,7 +702,19 @@ interface Fixture {
 }
 
 function fixture(options: {
-	children?: Array<{ name: string; role: string; createdAt?: number; phase?: string | null; status?: "running" | "settled" }>;
+	children?: Array<{
+		name: string;
+		role: string;
+		createdAt?: number;
+		phase?: string | null;
+		status?: "running" | "settled";
+		/** #423: the machine the child runs on (absent = this host). */
+		host?: string;
+		/** #423: `host/name` of the terminal the core holds, when it holds one. */
+		remoteTerminal?: string;
+		/** #423: the transcript path this host knows (empty/missing = nothing written). */
+		sessionFile?: string;
+	}>;
 	loopRadiusMs?: number;
 	silenceNoticeMs?: number;
 	mailRatePer5Min?: number;
@@ -578,6 +733,9 @@ function fixture(options: {
 				role: spec.role,
 				status: spec.status ?? "running",
 				...(spec.phase === undefined ? {} : { phase: spec.phase }),
+				...(spec.host === undefined ? {} : { host: spec.host }),
+				...(spec.remoteTerminal === undefined ? {} : { remoteTerminal: spec.remoteTerminal }),
+				...(spec.sessionFile === undefined ? {} : { sessionFile: spec.sessionFile }),
 			},
 			// A child born at THIS tick is below every radius by default, so a test that
 			// cares about L2 must say how old its child is. Keeps L1 tests about L1.
@@ -688,6 +846,76 @@ test("postman: a dead child and a terminal child produce nothing", async () => {
 	}
 });
 
+test("#423 req 5: a SHELL is not a stall candidate — no terminal and no session means nothing was ever running", async () => {
+	// The measured notice: `anotify-456: running for 30m 0s, no tool in flight` for a
+	// child that had never started (no terminal on `host-workspace`, no transcript,
+	// a run.json that never moved after creation). It was ALIVE in the supervisor's
+	// registry — that is exactly why the `isAlive` gate cannot be the whole story.
+	const root = mkdtempSync(path.join(tmpdir(), "stall-shell-"));
+	try {
+		const emptyTrace = path.join(root, "shell.jsonl");
+		writeFileSync(emptyTrace, "");
+		const realTrace = path.join(root, "real.jsonl");
+		writeFileSync(realTrace, '{"type":"message","message":{"role":"user","content":"hi"}}\n');
+		const fx = fixture({
+			children: [
+				// The shell: a cross-machine row with neither of the two facts that
+				// prove a launch happened.
+				{ name: "shell", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", sessionFile: emptyTrace },
+				// The control: the SAME age, the same role, but a terminal the core holds.
+				// #441-B: it also needs the two facts a cross-machine child is judged by —
+				// the container's own `idle` word, and a transcript that has not grown.
+				{ name: "real", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", remoteTerminal: "host-workspace/lgl-rx-real", sessionFile: realTrace },
+			],
+			loopRadiusMs: 15 * MINUTE,
+		});
+		// The mirror row the pump would have written: last growth long before the radius.
+		writeMirrorState(realTrace, TICK_AT - 30 * MINUTE);
+		fx.supervisor.programStates.set("real", "idle");
+		try {
+			await fx.postman.tick();
+			fx.stop();
+			const mails = inbox(fx.db, "root");
+			assert.equal(mails.length, 1, `one line, not two:\n${mails.map((mail) => mail.body).join("\n")}`);
+			assert.match(mails[0]!.body, /real: running for /);
+			assert.doesNotMatch(mails[0]!.body, /shell: /, "a child that never started cannot have been quiet for 30 minutes");
+		} finally {
+			fx.db.close();
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#423 req 5: the SAME shell becomes a candidate once a transcript with bytes exists", async () => {
+	// The gate is evidence, not a name or a host: one byte of transcript is enough
+	// for the detector to judge it again (the shell above is otherwise identical).
+	const root = mkdtempSync(path.join(tmpdir(), "stall-shell-bytes-"));
+	try {
+		const written = path.join(root, "written.jsonl");
+		writeFileSync(written, '{"type":"message","message":{"role":"user","content":"hi"}}\n');
+		const fx = fixture({
+			children: [{ name: "slow", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", remoteTerminal: "host-workspace/lgl-rx-slow", sessionFile: written }],
+			loopRadiusMs: 15 * MINUTE,
+		});
+		// #441-B: candidate ≠ noticed. A cross-machine child is announced only when its
+		// container says it is not working AND its transcript has stopped growing.
+		writeMirrorState(written, TICK_AT - 30 * MINUTE);
+		fx.supervisor.programStates.set("slow", "idle");
+		try {
+			await fx.postman.tick();
+			fx.stop();
+			const mails = inbox(fx.db, "root");
+			assert.equal(mails.length, 1);
+			assert.match(mails[0]!.body, /slow: running for /);
+		} finally {
+			fx.db.close();
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("postman L2: the role-derived radius fires, and the merged mail names every child", async () => {
 	const fx = fixture({
 		children: [
@@ -700,7 +928,9 @@ test("postman L2: the role-derived radius fires, and the merged mail names every
 		noticeMsForRole: () => 45 * MINUTE,
 	});
 	try {
-		// `worker-a` is inside a tool: that becomes evidence, not a verdict (D1).
+		// #441-C: `worker-a` is inside a tool, so it is WORKING — the observation that
+		// used to be quoted as evidence is now a verdict, and the notice covers only
+		// the idle sibling.
 		fx.supervisor.stacks.set("worker-a", [{ tool: "bash", startedAt: TICK_AT - 38 * MINUTE }]);
 
 		await fx.postman.tick();
@@ -709,11 +939,11 @@ test("postman L2: the role-derived radius fires, and the merged mail names every
 		const rows = inbox(fx.db, "root");
 		assert.equal(rows.length, 1, "D7: one mail for the whole tick");
 		const body = rows[0]!.body;
-		assert.match(rows[0]!.subject, /2 children/);
-		assert.match(body, /\bworker-a\b/);
+		assert.doesNotMatch(rows[0]!.subject, /2 children/, "only the idle child is a candidate");
+		assert.doesNotMatch(body, /\bworker-a\b/, "#441-C: a child inside `bash` is working, never stalled");
 		assert.match(body, /\bworker-b\b/);
 		assert.doesNotMatch(body, /\bworker-c\b/, "a child under its radius is not mentioned");
-		assert.match(body, /inside `bash` for 38m 0s/, "D1: the stack is the evidence the L2 line carries");
+		assert.match(body, /nothing in flight/, "the line says what this host actually measured");
 		assert.doesNotMatch(body, /steer cannot land/, "D3: an L2 line must not deny steer");
 	} finally {
 		fx.db.close();
@@ -754,6 +984,102 @@ test("postman L2: 3 lines per window, then silence until `extend` (D5/D6)", asyn
 		assert.equal(count(), 3, "the new window has not elapsed yet");
 		await tickAt(TICK_AT + 10 * radius + radius);
 		assert.equal(count(), 4, "the reminder resumes after the deferral");
+	} finally {
+		fx.db.close();
+	}
+});
+
+test("#413 postman: ten checks inside ONE boundary write ONE mail", async () => {
+	const radius = 30 * MINUTE;
+	let now = TICK_AT;
+	const fx = fixture({
+		now: () => now,
+		// Just past the 30m boundary at the first check, and still inside it at the
+		// last: the reported defect is that EVERY such check mailed the parent.
+		children: [{ name: "worker", role: "worker", createdAt: TICK_AT - radius - 1_000 }],
+		noticeMsForRole: () => radius,
+	});
+	try {
+		for (let tick = 0; tick < 10; tick += 1) {
+			now = TICK_AT + tick * 1_000;
+			await fx.postman.tick();
+		}
+		fx.stop();
+
+		const rows = inbox(fx.db, "root");
+		assert.equal(rows.length, 1, "the (child, threshold) pair is announced exactly once");
+		assert.equal(fx.rootMessages.length, 1, "and it is delivered once, not once per check");
+		assert.match(rows[0]!.body, /running for 30m 1s/);
+	} finally {
+		fx.db.close();
+	}
+});
+
+test("#413 postman: activity then a second silence re-arms ONE more line (a new window, not a new tick)", async () => {
+	const silenceNoticeMs = 120_000;
+	let now = TICK_AT;
+	const fx = fixture({ now: () => now, silenceNoticeMs });
+	try {
+		const count = () => inbox(fx.db, "root").length;
+		// The first silence window has crossed 2m.
+		fx.supervisor.eventAges.set("worker", now - 125_000);
+		await fx.postman.tick();
+		assert.equal(count(), 1);
+
+		// More checks inside the SAME window: nothing is said again.
+		now += 2_000;
+		await fx.postman.tick();
+		now += 2_000;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the same boundary is spent, however many checks see it");
+
+		// The child moves: D6 says a new event opens a new window, so the 1× boundary
+		// of that window is announceable again — exactly one line.
+		fx.supervisor.eventAges.set("worker", now);
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the activity itself is not an announcement");
+		now += 125_000;
+		await fx.postman.tick();
+		now += 2_000;
+		await fx.postman.tick();
+		assert.equal(count(), 2, "one more line for the new silence window, and only one");
+	} finally {
+		fx.db.close();
+	}
+});
+
+test("#413 postman: `extend` pushes the WHOLE threshold out and re-arms the ladder", async () => {
+	const radius = 10 * MINUTE;
+	let now = TICK_AT;
+	const fx = fixture({
+		now: () => now,
+		children: [{ name: "worker", role: "worker", createdAt: TICK_AT - radius }],
+		noticeMsForRole: () => radius,
+	});
+	try {
+		const count = () => inbox(fx.db, "root").length;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the first boundary is due");
+
+		// Extend three minutes PAST the boundary, with a bigger radius. The next line
+		// must be one whole new threshold from the extend — not the leftover of the
+		// boundary that was just crossed, and not the old radius.
+		now = TICK_AT + 3 * MINUTE;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "a spent boundary stays spent while time moves inside it");
+		const receipt = fx.postman.extendStallWindow("worker", 2 * radius);
+		assert.ok("childName" in receipt, "a live child gets a receipt");
+		assert.equal(receipt.loopBaseAt, now, "the baseline moves to the extend");
+		assert.equal(receipt.loopRadiusMs, 2 * radius, "and the radius is the operator's");
+
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the extend instant is the far side of a whole threshold");
+		now += 2 * radius - 1;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "one millisecond short is not the next boundary");
+		now += 1;
+		await fx.postman.tick();
+		assert.equal(count(), 2, "the re-armed ladder fires at exactly base + the new radius");
 	} finally {
 		fx.db.close();
 	}
@@ -981,15 +1307,17 @@ test("D6 late first line: one line now, the next only after a whole radius", () 
 	const at = (now: number, longRunning: StallLineState) =>
 		decideStallNotice({ now, child: child(), thresholds: long(radius), window: window(base, { longRunning }) });
 
-	const first = at(180 * MINUTE, { count: 0 });
+	const first = at(180 * MINUTE, EMPTY_LINE);
 	assert.equal(first?.sequence, 1, "the late first line is due at once");
-	// Three ticks 2s apart must not walk through 2× and 3× of the base.
+	assert.equal(first?.tier, 4, "180m at a 45m radius is the FOURTH boundary, announced once");
+	// Three ticks 2s apart must not walk through 5× and 6× of the base: the first
+	// line spent the whole boundary it landed in.
 	for (const tick of [180 * MINUTE + 2_000, 180 * MINUTE + 4_000, 180 * MINUTE + 6_000]) {
-		assert.equal(at(tick, sentAt(1, 180 * MINUTE)), undefined, "the repeat clock starts at the SENT line");
+		assert.equal(at(tick, sent(4, 1)), undefined, "a tick inside a spent boundary says nothing");
 	}
-	assert.equal(at(180 * MINUTE + radius, sentAt(1, 180 * MINUTE))?.sequence, 2);
-	assert.equal(at(180 * MINUTE + 2 * radius, sentAt(2, 180 * MINUTE + radius))?.sequence, 3);
-	assert.equal(at(180 * MINUTE + 3 * radius, sentAt(3, 180 * MINUTE + 2 * radius)), undefined, "cap holds");
+	assert.equal(at(180 * MINUTE + radius, sent(4, 1))?.sequence, 2);
+	assert.equal(at(180 * MINUTE + 2 * radius, sent(5, 2))?.sequence, 3);
+	assert.equal(at(180 * MINUTE + 3 * radius, sent(6, 3)), undefined, "cap holds");
 });
 
 test("m4: the role radius is cached per (cwd, role) for the TTL, then re-resolved", () => {

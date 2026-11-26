@@ -216,6 +216,7 @@ function queueStallNotice(db: DatabaseSync, nodeId: string, names: readonly stri
 		names.map((childName) => ({
 			kind: "long-running" as const,
 			childName,
+			tier: 1,
 			sinceBucket: detectedAt,
 			sequence: 1,
 			elapsedMs: 600_000,

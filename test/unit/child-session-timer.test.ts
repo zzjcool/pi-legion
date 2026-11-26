@@ -25,7 +25,7 @@ test("the shutdown cap fires in a process with nothing else pending", () => {
 			extensionRunner: { hasHandlers: () => true, emit: () => new Promise(() => {}) },
 			dispose: () => { disposed = true; },
 		};
-		attachChildSessionRelease(session, 10);
+		attachChildSessionRelease(session, undefined, 10);
 		await bindChildSessionExtensions(session);
 		await session.dispose();
 		console.log(disposed ? "DISPOSED" : "MISSED");
@@ -48,13 +48,47 @@ test("the shutdown cap fires in a process with nothing else pending", () => {
 /**
  * Same process, same question — but proving the module is importable without the
  * SDK, which is what keeps `test/unit` fast and portable.
+ *
+ * #468 narrowed this from "no import statement at all" to "no HOST import", and
+ * the difference matters: the child diagnostic sink has to be reachable from this
+ * module, and the sink (`./child-diagnostics.ts`) uses `node:fs` + `node:path`
+ * only. The invariant being protected is that importing `child-session.ts` never
+ * pulls `@earendil-works/pi-coding-agent` into every unit run — a static "zero
+ * imports" test never protected more than that, and it would now fail for a
+ * sibling module that loads no SDK at all.
+ *
+ * Both files are scanned (a sibling on the same path is exactly where an SDK
+ * import could hide) and every specifier form counts — `import … from`, for
+ * `export … from`, `await import(…)` and `require(…)` — so a re-export or a
+ * dynamic import cannot slip past the way a `^\s*import\b` regex allowed (review
+ * of #468, finding 2).
  */
-test("child-session has no SDK import", async () => {
-	const request = fileURLToPath(new URL("../../src/supervisor/child-session.ts", import.meta.url));
-	const source = (await import("node:fs")).readFileSync(request, "utf8");
-	assert.equal(
-		/^\s*import\b/m.test(source),
-		false,
-		"child-session.ts must stay import-free (structural types only): a host import would load the SDK in every unit run",
+const SPECIFIER_PATTERNS = [
+	/\bfrom\s*["']([^"']+)["']/g, // import … from "x" / export … from "x"
+	/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g, // await import("x")
+	/\brequire\s*\(\s*["']([^"']+)["']\s*\)/g, // require("x")
+	/^\s*import\s+["']([^"']+)["']/gm, // side-effect import "x"
+];
+
+function importedSpecifiers(source: string): string[] {
+	return SPECIFIER_PATTERNS.flatMap((pattern) => [...source.matchAll(pattern)].map((match) => match[1]!));
+}
+
+test("child-session's module path imports nothing but node builtins and its own siblings (no SDK)", async () => {
+	const read = (await import("node:fs")).readFileSync;
+	const base = new URL("../../src/supervisor/", import.meta.url);
+	for (const file of ["child-session.ts", "child-diagnostics.ts"]) {
+		const specifiers = importedSpecifiers(read(fileURLToPath(new URL(file, base)), "utf8"));
+		// The doc comments legitimately name the host package, so the check is on the
+		// SPECIFIERS only: a bare specifier is what would load it.
+		assert.deepEqual(
+			specifiers.filter((specifier) => !specifier.startsWith("node:") && !specifier.startsWith("./")),
+			[],
+			`${file} must not import the HOST package: that would load the SDK in every unit run`,
+		);
+	}
+	assert.ok(
+		importedSpecifiers("export * from \"pkg\"; await import('pkg'); require(\"pkg\"); import x from 'pkg';").length === 4,
+		"the detector itself must see every specifier form",
 	);
 });

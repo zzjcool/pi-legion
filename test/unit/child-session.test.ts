@@ -29,7 +29,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
 	BUILTIN_MCP,
 	BUILTIN_TOOL_SEARCH,
@@ -37,6 +39,7 @@ import {
 	collectChildExtensions,
 } from "../../src/runs/args.ts";
 import { childEnablesMcp as policyChildEnablesMcp } from "../../src/runs/extension-inheritance.ts";
+import { createChildDiagnosticSink } from "../../src/supervisor/child-diagnostics.ts";
 import {
 	attachChildSessionRelease,
 	bindChildSessionExtensions,
@@ -97,6 +100,33 @@ async function captureWarnings(fn: (warnings: string[]) => Promise<void> | void)
 	return warnings;
 }
 
+/**
+ * A child sink aimed at a throwaway run dir (#468), with the host channel captured.
+ *
+ * `host` is what the HOST would show: the whole point of #468 is that it stays
+ * empty unless real extension errors happened (one run-end summary line) or the
+ * `PI_LEGION_CHILD_DIAGNOSTICS` switch is on.
+ */
+function testSink(options: { child?: string; host?: boolean } = {}) {
+	const runDir = mkdtempSync(path.join(tmpdir(), "legion-child-diag-"));
+	const host: string[] = [];
+	const logFile = path.join(runDir, "diagnostics.log");
+	const sink = createChildDiagnosticSink({
+		...(options.child ? { child: options.child } : {}),
+		logFile,
+		host: options.host ?? false,
+		hostWrite: (line) => host.push(line),
+	});
+	const log = () => {
+		try {
+			return readFileSync(logFile, "utf8");
+		} catch {
+			return "";
+		}
+	};
+	return { sink, host, logFile, log, runDir };
+}
+
 test("D7.3 binds exactly once, with exactly { mode: \"print\", onError }", async () => {
 	const { session, calls } = fakeSession();
 
@@ -115,39 +145,112 @@ test("D7.3 binds exactly once, with exactly { mode: \"print\", onError }", async
 	assert.equal(typeof bindings.onError, "function", "onError is mandatory: without it errors vanish");
 });
 
-test("D7.3 onError goes to console.warn, labelled with the child name", async () => {
+test("D7.3 onError goes to the child sink, labelled with the child name (never the host)", async () => {
+	// #468: an in-process child shares the host's stderr, so `console.warn` here was
+	// drawn above the user's input box. The record must land on the child sink — and
+	// nothing may reach the host for the *live* error line.
 	const { session, calls } = fakeSession();
-	await bindChildSessionExtensions(session, "root.scout");
+	const { sink, host, log } = testSink({ child: "root.scout" });
+	await bindChildSessionExtensions(session, "root.scout", sink);
 
 	await captureWarnings(async (warnings) => {
 		// The SDK's shape: a record, not an Error.
 		calls[0]!.onError!({ extensionPath: "builtin:mcp", event: "session_start", error: "spawn npx ENOENT" });
-		assert.equal(warnings.length, 1, "one line per extension error, never silence");
-		assert.match(warnings[0]!, /^\[pi-legion\] in-process child root\.scout extension error: /);
-		assert.match(warnings[0]!, /builtin:mcp/, "the failing extension is named");
-		assert.match(warnings[0]!, /session_start/, "the failing event is named");
-		assert.match(warnings[0]!, /spawn npx ENOENT/, "the cause survives");
+		assert.equal(warnings.length, 0, "nothing on the host console — that is the whole point");
 	});
 
+	assert.deepEqual(host, [], "no UI/console line while the run is still going");
+	const record = log().trim().split("\n");
+	assert.equal(record.length, 1, "one record on disk, never silence");
+	assert.match(record[0]!, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z child=root\.scout event=extension\.error real=true reason=/, "timestamp + event + reason");
+	assert.match(record[0]!, /builtin:mcp/, "the failing extension is named");
+	assert.match(record[0]!, /session_start/, "the failing event is named");
+	assert.match(record[0]!, /spawn npx ENOENT/, "the cause survives");
+
 	// A listener must never be the thing that throws.
-	await captureWarnings(async (warnings) => {
+	assert.doesNotThrow(() => {
 		calls[0]!.onError!("plain string");
 		calls[0]!.onError!(new Error("a real Error"));
-		assert.equal(warnings.length, 2, "both odd payloads still produce exactly one line");
-		assert.match(warnings[0]!, /plain string/);
-		assert.match(warnings[1]!, /a real Error/);
 	});
+	const lines = log().trim().split("\n");
+	assert.equal(lines.length, 3, "both odd payloads still produce exactly one record each");
+	assert.match(lines[1]!, /reason=plain string$/);
+	assert.match(lines[2]!, /reason=Error: a real Error$/);
 });
 
 test("D7.3 an unnamed child still binds (label is optional, bindings are not)", async () => {
 	const { session, calls } = fakeSession();
-	await bindChildSessionExtensions(session);
+	const { sink, host, log } = testSink();
+	await bindChildSessionExtensions(session, undefined, sink);
 
 	await captureWarnings(async (warnings) => {
 		calls[0]!.onError!({ error: "boom" });
-		assert.equal(warnings.length, 1);
-		assert.match(warnings[0]!, /^\[pi-legion\] in-process child extension error: boom$/);
+		assert.equal(warnings.length, 0, "still nothing on the host console");
 	});
+
+	assert.deepEqual(host, []);
+	assert.match(log(), /child=- event=extension\.error real=true reason=boom/);
+});
+
+// #415 — the host's SKIPPED `turn_end` boundary (see `skippedTurnEndBoundary`).
+
+/** The exact record the host's `_dispatchTurnEndBoundary` emits (`agent-session.js`), verbatim. */
+const SKIPPED_BOUNDARY_RECORD = {
+	extensionPath: "<boundary>",
+	event: "turn_end",
+	error: "turn_end could not resolve the persisted assistant entry ID",
+};
+
+test("#415: a skipped turn_end boundary is recorded as a skip, not as an extension error (§468: disk only)", async () => {
+	// Reproduction: `pi-async` registers a real `turn_end` handler, so the host's
+	// `hasHandlers("turn_end")` gate is true. The host then fails to resolve this turn's
+	// assistant message to a persisted entry — a turn ended by `dispose()`'s abort, by
+	// compaction, or after a fork — and emits this record against the `<boundary>`
+	// pseudo-extension. Before #415 legion printed it as
+	// `<child> extension error: <boundary> turn_end: …`, blaming a healthy extension.
+	// Before #468 it then printed the corrected line ABOVE THE USER'S INPUT BOX.
+	// Mutation that must turn this red: moving the record back to `console.warn`.
+	const { session, calls } = fakeSession();
+	const { sink, host, log } = testSink({ child: "hygiene-doctor" });
+	await bindChildSessionExtensions(session, "hygiene-doctor", sink);
+
+	await captureWarnings(async (warnings) => {
+		assert.doesNotThrow(() => calls[0]!.onError!(SKIPPED_BOUNDARY_RECORD), "degrade, never throw");
+		assert.equal(warnings.length, 0, "#468: a benign skip is never host-visible");
+	});
+
+	assert.deepEqual(host, [], "and it never reaches the host channel either");
+	const line = log().trim();
+	assert.match(line, /child=hygiene-doctor /, "the child is still named");
+	assert.match(line, /event=turn_end\.skipped /, "the log says the HOOK was skipped");
+	assert.doesNotMatch(line, /extension\.error/, "no extension failed, so do not claim one did");
+	assert.match(line, /real=false/, "and it is not something to interrupt the user with");
+	assert.match(line, /turn_end could not resolve the persisted assistant entry ID/, "the host's cause survives");
+	assert.match(line, /no persisted entry/, "and the reader learns why it was skipped");
+});
+
+test("#415: the degrade is exact — anything else is still an extension error", async () => {
+	// Pins the match width. A broad match (substring, or the path alone) would silently
+	// reclassify genuine extension failures as benign skips — the inverse of the bug.
+	const { session, calls } = fakeSession();
+	const { sink, log } = testSink({ child: "hygiene-doctor" });
+	await bindChildSessionExtensions(session, "hygiene-doctor", sink);
+
+	// Same pseudo-extension, different cause: not the entry-id diagnostic.
+	calls[0]!.onError!({
+		...SKIPPED_BOUNDARY_RECORD,
+		error: "turn_end requested continuation without runnable model context",
+	});
+	// Same message, but a real extension failed while handling turn_end.
+	calls[0]!.onError!({ ...SKIPPED_BOUNDARY_RECORD, extensionPath: "builtin:mcp" });
+	// Same message, a near-miss path.
+	calls[0]!.onError!({ ...SKIPPED_BOUNDARY_RECORD, extensionPath: "<boundary>x" });
+
+	const lines = log().trim().split("\n");
+	assert.equal(lines.length, 3, "one record each, never silence");
+	for (const line of lines) assert.match(line, /event=extension\.error real=true/, "these are real failures");
+	assert.match(lines[0]!, /requested continuation without runnable model context/);
+	assert.match(lines[1]!, /builtin:mcp turn_end: turn_end could not resolve/);
 });
 
 test("D7.3 a bind failure propagates (it is not swallowed)", async () => {
@@ -236,18 +339,60 @@ test("D7.5 dispose emits session_shutdown once, reason=quit, before the real dis
 	);
 });
 
-test("D7.5 a throwing shutdown handler still gets disposed", async () => {
+test("D7.5 a throwing shutdown handler still gets disposed, and is reported once (§468)", async () => {
 	const { session, order } = fakeSession({ emitThrows: true });
-	await bindChildSessionExtensions(session);
-	attachChildSessionRelease(session);
+	const { sink, host, log } = testSink({ child: "root.scout" });
+	await bindChildSessionExtensions(session, undefined, sink);
+	attachChildSessionRelease(session, sink);
 
 	await captureWarnings(async (warnings) => {
 		session.dispose?.();
 		await settle();
 		assert.deepEqual(order, ["bind", "emit", "dispose"], "dispose must run on the rejection path too");
-		assert.equal(warnings.length, 1, "the failure is reported, not silent");
-		assert.match(warnings[0]!, /in-process child session_shutdown failed/);
+		assert.equal(warnings.length, 0, "#468: the live line no longer goes to the host console");
 	});
+
+	assert.match(log(), /event=session_shutdown\.failed real=true reason=Error: shutdown handler exploded/);
+	// The failure is real, so the host gets it — as ONE line, at run end.
+	assert.equal(host.length, 1, "one summary line, not one per event");
+	assert.match(host[0]!, /^\[pi-legion\] in-process child root\.scout: 1 extension error this run — first: session_shutdown failed: Error: shutdown handler exploded/);
+});
+
+test("#468: the sink is resolved at dispose, so a session armed BEFORE the bind still reports its name", async () => {
+	// `defaultSessionFactory` arms the release before it binds the extensions. If the
+	// sink were derived eagerly at arm time it would be the unnamed one, and every
+	// record of a named child would lose its name — the summary line would say
+	// `in-process child: …` instead of `in-process child hygiene-doctor: …`.
+	const { session } = fakeSession({ emitThrows: true });
+	attachChildSessionRelease(session);
+	await bindChildSessionExtensions(session, "hygiene-doctor");
+
+	const host = await captureWarnings(async (warnings) => {
+		session.dispose?.();
+		await settle();
+		assert.equal(warnings.length, 1, "one summary line, and it is the only host output");
+		assert.match(warnings[0]!, /^\[pi-legion\] in-process child hygiene-doctor: 1 extension error this run/);
+	});
+	assert.equal(host.length, 1);
+});
+
+test("#468: a second sink handed to the bind WINS, and the first one is flushed (no lost failure)", async () => {
+	// The production factory passes ONE sink to both calls, so this arm is only
+	// reachable from a caller that mixes them — but silently dropping either sink's
+	// real failures would be the bug this file exists to prevent.
+	const { session } = fakeSession();
+	const armed = testSink({ child: "hygiene-doctor" });
+	const bound = testSink({ child: "hygiene-doctor" });
+	armed.sink.record({ event: "extension.error", reason: "recorded before the bind", real: true });
+
+	attachChildSessionRelease(session, armed.sink);
+	await bindChildSessionExtensions(session, "hygiene-doctor", bound.sink);
+	session.dispose?.();
+	await settle();
+
+	assert.equal(armed.host.length, 1, "the replaced sink is flushed, not dropped");
+	assert.match(armed.host[0]!, /first: extension error: recorded before the bind/);
+	assert.equal(bound.host.length, 0, "the surviving sink had nothing real to report");
 });
 
 test("D7.5 repeated dispose() emits once (idempotent)", async () => {
@@ -342,7 +487,7 @@ test("D7.5 a wedged handler cannot hold the session: dispose still runs (r4 F5)"
 			order.push("dispose");
 		},
 	};
-	attachChildSessionRelease(session, 10);
+	attachChildSessionRelease(session, undefined, 10);
 	await bindChildSessionExtensions(session);
 
 	const startedAt = Date.now();
@@ -363,5 +508,29 @@ test("r3 C1 wiring: the factory arms the release exactly once (format tripwire)"
 		source.split("attachChildSessionRelease(").length - 1,
 		1,
 		"format tripwire: the factory file calls attachChildSessionRelease( once",
+	);
+});
+
+test("#468 wiring: extension registration failures are RECORDED, never printed (format tripwire)", () => {
+	// `defaultSessionFactory` is not exported, so this is the same kind of tripwire as
+	// the two above: it cannot prove the call works, only that the pre-#468
+	// `console.warn("… inprocess child '<name>': …")` did not come back and that the
+	// real failure still reaches the sink (deleting the `record()` leaves every other
+	// test green, which is exactly the hole this closes).
+	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
+	assert.equal(
+		source.split('event: "extension.registration.error"').length - 1,
+		1,
+		"the registration failure is recorded exactly once",
+	);
+	assert.equal(
+		source.includes("inprocess child '"),
+		false,
+		"the per-registration host line must not come back (#468)",
+	);
+	assert.equal(
+		source.split("real: true").length - 1 >= 1,
+		true,
+		"and it is a REAL failure, so the run-end summary carries it",
 	);
 });

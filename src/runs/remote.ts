@@ -900,6 +900,19 @@ export function remoteStartupProbeLine(argv: string[], cwd: string): string {
 }
 
 /**
+ * #423: the launch's own command line, `cd`ed into the directory it asked for.
+ *
+ * Not {@link remoteStartupProbeLine}: that one replaces the task with
+ * `--list-models` because it asks a different question ("can this machine see
+ * the model"). A failed-startup receipt has to hand the operator the command that
+ * FAILED, task included, or reproducing it reproduces something else.
+ */
+export function remoteLaunchReproLine(argv: readonly string[], cwd: string): string {
+	const command = argv.map((part) => shQuote(part)).join(" ");
+	return `cd -- ${shQuote(cwd)} && ${command}`;
+}
+
+/**
  * How many of that machine's models a model refusal quotes.
  *
  * Five was arbitrary: a registry commonly lists more, and a truncated list that
@@ -1157,6 +1170,71 @@ export interface HostTargetOverrides {
  */
 export function missingRemoteCwdQuestion(host: string): string {
 	return `host '${host}' needs a directory on that machine, and this call did not name one — which directory should the child work in? Pass it with the call: subagent({ agent: "centurion", host: "${host}", cwd: "/abs/path/on/${host}", task: "..." }) (that path is read ON ${host}; it is never translated from here). If this conversation has not named a directory on ${host}, ask the user which one to use. Do not ssh or run \`hc exec\` to browse that machine — a guess here becomes a child in the wrong tree.`;
+}
+
+/**
+ * What a READ-ONLY remote call needs to know about a machine: WHO, not WHERE.
+ *
+ * Deliberately a narrower type than {@link HostTarget}. A target carries the launch
+ * facts (cwd, node, piCli, pathMap, extensions) and `resolveHostTarget` refuses to
+ * build one without an absolute `cwd` — correctly, because a launch in a guessed
+ * directory edits the wrong tree. A read has no such question: `file.read`/
+ * `terminal.get`/`machine.exec` are addressed by `on: <host>` plus an absolute path
+ * the RECORD already holds. Requiring a launch target for a read is what made a
+ * zero-config `collect` refuse before it ever fetched anything (`d0`): the launch had
+ * discovered its cwd per call, so `hosts.<host>` stayed empty, and the read-back
+ * treated "no settings entry" as "this machine cannot be named".
+ *
+ * `mirrorRoot` is present only when it can be derived (`hosts.<host>.cwd` or a
+ * `worktreeRoot`), and it is a FALLBACK: a record written by schema v5 carries
+ * `remote_dir`, so the transcript's path is known without any host config at all.
+ */
+export interface RemoteReadTarget {
+	/** `hc` machine name — the `on` parameter of every read. */
+	host: string;
+	/** Where that machine keeps mirrored run dirs, when derivable from the settings. */
+	mirrorRoot?: string;
+}
+
+/**
+ * Resolve a machine for a READ-ONLY call, from `crossMachine` alone (`d0`).
+ *
+ * The only requirement is what the launch's own gate requires: cross-machine must be
+ * enabled and the host must have a name. No `cwd`, no `piExtensions`, no discovery —
+ * none of those is a fact a read needs, and demanding them is how a working launch
+ * became an un-readable child.
+ *
+ * Throws exactly where a read genuinely cannot proceed: cross-machine disabled, or no
+ * host name. A missing `hosts.<host>` entry is NOT one of those cases; it only means
+ * `mirrorRoot` is unknown, and a record with `remote_dir` does not need it.
+ */
+export function resolveReadTarget(
+	host: string,
+	config: SubagentsSettings["crossMachine"] | undefined,
+): RemoteReadTarget {
+	const name = normalizeHost(host);
+	if (name === undefined) {
+		throw new SubagentError(
+			"a remote read needs a host name; a local child has no transcript on another machine",
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+	if (config?.enabled !== true) {
+		throw new SubagentError(
+			`host '${name}' needs subagents.crossMachine.enabled = true`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name },
+		);
+	}
+	const entry = config.hosts?.[name];
+	const cwd = typeof entry?.cwd === "string" ? entry.cwd.trim() : "";
+	const mirrorRoot = entry !== undefined && cwd.length > 0 && path.posix.isAbsolute(cwd)
+		// The SAME expression `resolveHostTarget` uses for `mirrorRoot` (worktreeRoot
+		// decides the prefix, `REMOTE_MIRROR_DIR_NAME` is the leaf), so a configured host
+		// cannot have two mirror dirs depending on who asks.
+		? path.posix.join(path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)), REMOTE_MIRROR_DIR_NAME)
+		: undefined;
+	return { host: name, ...(mirrorRoot !== undefined ? { mirrorRoot } : {}) };
 }
 
 export function resolveHostTarget(
@@ -2420,6 +2498,81 @@ function discoveryIncompleteError(
 
 // ── S1: the transport layer (one round trip each) ──────────────────────────
 
+/**
+ * What a `terminal.get` reply says about the PROGRAM in that terminal.
+ *
+ * `hc`'s own schema separates the two questions, and so must we:
+ *  - `state` is the TERMINAL's: `"live"` or `"finished"`. A terminal the core
+ *    KEEPS (`keep`/`rm` off, the default) stays `"live"` after its program exits
+ *    — that is the whole point of keeping it, and it is why reading `state` alone
+ *    reports a finished child as "still working there" (the defect `recover`
+ *    shipped with: `read-back 8 of 8 lines` next to `still 'live'`).
+ *  - the PROGRAM's end is said by `exit_code` / `finished_ms` / `reason` (hc's
+ *    documented end reasons), or by its own last word `status.state` leaving the
+ *    working set (`done`/`error`).
+ *
+ * One rule, two readers (`createRemoteTerminalProbe` for recovery,
+ * `TerminalSupervisor.startupFacts` for the startup-death gate), so "is that child
+ * over?" cannot be answered two ways.
+ */
+export interface HcTerminalRunFacts {
+	/** The TERMINAL's state: `"live"` or `"finished"` (hc `RunResult.state`). */
+	state?: string;
+	/** Set once the program ended — the core's exit code. */
+	exit_code?: number | null;
+	/** Set once the program ended (hc `RunResult.finished_ms`). */
+	finished_ms?: number | null;
+	/** Why the program ended: exited, killed, signaled, holder_lost, … */
+	reason?: string | null;
+	/**
+	 * The program's own word (hc `RunResult.status`, OSC 7501):
+	 * `idle` | `working` | `done` | `blocked` | `error`.
+	 */
+	status?: { state?: string } | null;
+}
+
+/** The program's words that mean "this turn is over", never "still working". */
+const TERMINAL_PROGRAM_ENDED_STATUS = new Set(["done", "error"]);
+
+/**
+ * The one judgement: has the PROGRAM in this terminal ended?
+ *
+ * Returns WHY, so a caller can say it (a verdict line, a startup-death probe):
+ * `exit` (the core recorded the end), `status` (the program said it was done) or
+ * `missing` (the core does not hold the terminal at all). `undefined` = still
+ * running, i.e. every end signal is absent and the program's own word is one of
+ * the working set or absent entirely.
+ */
+export function terminalProgramEnd(
+	facts: HcTerminalRunFacts | undefined,
+	opts: { terminalInferred?: boolean } = {},
+): { by: "exit" | "status" | "missing"; detail: string } | undefined {
+	if (!facts) return { by: "missing", detail: "the core returned no facts" };
+	const state = typeof facts.state === "string" ? facts.state.trim() : "";
+	if (state === "missing") {
+		// `terminal.get` said `not_found`: a fact about the ADDRESS. Only a recorded
+		// one proves the child ended (an inferred spelling proves nothing).
+		return opts.terminalInferred === true ? undefined : { by: "missing", detail: "the core does not hold that terminal" };
+	}
+	if (typeof facts.exit_code === "number") {
+		return { by: "exit", detail: `exit ${facts.exit_code}` };
+	}
+	if (typeof facts.finished_ms === "number") return { by: "exit", detail: "the core recorded when it finished" };
+	if (typeof facts.reason === "string" && facts.reason.trim().length > 0) {
+		return { by: "exit", detail: `the core says it ended (${facts.reason.trim()})` };
+	}
+	if (state === "finished") return { by: "exit", detail: "terminal state 'finished'" };
+	const program = typeof facts.status?.state === "string" ? facts.status.state.trim() : "";
+	if (TERMINAL_PROGRAM_ENDED_STATUS.has(program)) return { by: "status", detail: `the program reported '${program}'` };
+	return undefined;
+}
+
+/** The program's own word, for a verdict line (`done`, `working`, …), or `undefined`. */
+export function terminalProgramWord(facts: HcTerminalRunFacts | undefined): string | undefined {
+	const word = typeof facts?.status?.state === "string" ? facts.status.state.trim() : "";
+	return word.length > 0 ? word : undefined;
+}
+
 /** The `hc` `machine.exec` result, with BASE64 stdout/stderr (real core shape). */
 export interface HcExecResult {
 	code?: number | null;
@@ -2822,6 +2975,30 @@ function isNotFoundError(error: unknown): boolean {
 }
 
 /**
+ * The last non-empty lines a terminal shows, read over `terminal.read` (#423).
+ *
+ * `terminal.get`'s `screen` field LOOKS like this and is not: on hc 0.1.21 it
+ * answers the literal word `"exact"` (a mode name), which is why every receipt
+ * built from it quoted `| exact` and nothing else. The text lives behind
+ * `terminal.read` (`{text, how, complete}`), so that is what this asks; a core
+ * that does not know the method (older build) leaves `[]` and the caller falls
+ * back to whatever `terminal.get` said.
+ *
+ * Never throws: a receipt must not be lost to a screen it could not read.
+ */
+export async function readTerminalScreenTail(
+	client: HcClient,
+	terminal: string,
+): Promise<string[]> {
+	try {
+		const reply = await client.request<{ text?: unknown }>("terminal.read", { terminal });
+		return screenTailOf(reply?.text);
+	} catch {
+		return [];
+	}
+}
+
+/**
  * Ask the core and the machine what became of one remote child (§2).
  *
  * Two round trips, both already in the whitelist (no new `hc` method): the
@@ -2839,7 +3016,8 @@ function isNotFoundError(error: unknown): boolean {
  */
 export async function probeRemoteChild(opts: {
 	client: HcClient;
-	target: HostTarget;
+	/** WHO to ask (`d0`): the probe addresses the machine and a path it already has. */
+	target: RemoteReadTarget;
 	/** `host/name` — the address the core holds, not a bare name (D2). */
 	terminal: string;
 	sessionPath: string;
@@ -2861,6 +3039,7 @@ export async function probeRemoteChild(opts: {
 	let exitCode: number | undefined;
 	let pid: number | undefined;
 	let screenTail: string[] = [];
+	let terminalKnown = false;
 	try {
 		const facts = await opts.client.request<{ state?: string; exit_code?: number | null; pid?: number | null; screen?: string }>(
 			"terminal.get",
@@ -2869,9 +3048,18 @@ export async function probeRemoteChild(opts: {
 		terminalState = typeof facts?.state === "string" && facts.state.length > 0 ? facts.state : "missing";
 		if (typeof facts?.exit_code === "number") exitCode = facts.exit_code;
 		if (typeof facts?.pid === "number") pid = facts.pid;
+		terminalKnown = true;
 		screenTail = screenTailOf(facts?.screen);
 	} catch (error) {
 		if (!isNotFoundError(error)) throw error;
+	}
+	// #423: the SCREEN TEXT is its own read (`terminal.read`) — `terminal.get`'s
+	// `screen` field is a mode word on a real core (see `readTerminalScreenTail`).
+	// Asked only when the core still holds the terminal: a `not_found` terminal has
+	// no screen left to read, and one extra round trip on that path buys nothing.
+	if (terminalKnown) {
+		const text = await readTerminalScreenTail(opts.client, opts.terminal);
+		if (text.length > 0) screenTail = text;
 	}
 	const listing = await opts.client.request<HcExecResult>("machine.exec", {
 		on: opts.target.host,
@@ -2907,6 +3095,154 @@ export async function probeRemoteChild(opts: {
 		summary: remoteFateSummary(kind),
 		nextStep: remoteFateNextStep(kind, opts.target.host),
 	};
+}
+
+/**
+ * #423: what a launch that never proved it started can say about itself.
+ *
+ * The gate exists because "the parent cannot see the child" is not the same fact
+ * as "the child is fine": a remote `pi` that stopped at an interactive prompt
+ * ("Trust project folder?", #424), a spawn that failed on the machine, or a
+ * network that ate the reply all leave the SAME observable at the parent — a
+ * live terminal, no transcript, no error. Left alone that observable becomes a
+ * `working` shell nobody looks at again, so the launch now refuses and must say
+ * enough for one read to locate the cause.
+ *
+ * The five facts below are exactly the ones an operator asked for on 2026-08
+ * (@423): machine, attempted cwd, terminal, `hc`'s own error, and the terminal's
+ * last lines. The screen tail is the load-bearing one — it is where
+ * "Trust project folder?" appeared, one keystroke away from a diagnosis that
+ * instead took 30 minutes of waiting.
+ */
+export interface RemoteStartupFailure {
+	host: string;
+	/** The directory this launch asked the child to start in (on THAT machine). */
+	cwd: string;
+	/** `host/name` — the address the core returned for the terminal it created. */
+	terminal: string;
+	/** `<remoteDir>/session.jsonl` — the file whose absence is the failure. */
+	sessionPath: string;
+	/** How long the launch waited for that file. */
+	waitedMs: number;
+	/** Last non-empty lines of the child's terminal, newest last. At most 6. */
+	screenTail: string[];
+	/** The last `hc` error the gate saw (`kind: message`), when it saw one. */
+	lastError?: string;
+	/** The pid the core reports: absent means "nothing may have been started". */
+	pid?: number;
+	/** `false` when the core cannot see the mirror dir at all. */
+	dirExists?: boolean;
+	/** `false` when the transcript is missing (the normal case). */
+	sessionExists?: boolean;
+}
+
+/**
+ * Ask the core and the machine for the evidence a failed startup leaves behind.
+ *
+ * Never throws: this runs on the failure path, where the launch's own reason is
+ * worth more than the probe's. A probe that cannot answer leaves the optional
+ * fields absent instead of inventing them, and the message says which question
+ * went unanswered.
+ */
+export async function probeRemoteStartupFailure(opts: {
+	client: HcClient;
+	target: RemoteReadTarget;
+	/** `host/name` the core holds. */
+	terminal: string;
+	remoteDir: string;
+	cwd: string;
+	waitedMs: number;
+	lastError?: string;
+}): Promise<RemoteStartupFailure> {
+	const sessionPath = path.posix.join(opts.remoteDir, "session.jsonl");
+	const base: RemoteStartupFailure = {
+		host: opts.target.host,
+		cwd: opts.cwd,
+		terminal: opts.terminal,
+		sessionPath,
+		waitedMs: opts.waitedMs,
+		screenTail: [],
+		...(opts.lastError !== undefined ? { lastError: opts.lastError } : {}),
+	};
+	let fate: RemoteChildFate | undefined;
+	try {
+		fate = await probeRemoteChild({
+			client: opts.client,
+			target: opts.target,
+			terminal: opts.terminal,
+			sessionPath,
+		});
+	} catch {
+		// A probe that cannot answer must not replace the failure with its own.
+		return base;
+	}
+	return {
+		...base,
+		screenTail: fate.screenTail,
+		...(fate.pid !== undefined ? { pid: fate.pid } : {}),
+		dirExists: fate.dirExists,
+		sessionExists: fate.sessionExists,
+	};
+}
+
+/** What the launch managed to do about the terminal it created. */
+export type RemoteTerminalDisposal = "removed" | "kept";
+
+/**
+ * #423 req 6: the receipt for a launch that never proved it started.
+ *
+ * Every line is a fact this launch measured (never a guess about the child's
+ * intent), and the last one is the reproduce command, because "what would I type
+ * to see it myself" is the only way to confirm a fix on a machine this process
+ * cannot reach.
+ *
+ * `removed`/`kept` is reported rather than assumed: a terminal left behind holds
+ * its NAME in that core (`terminal.run` answers `name_taken` for it), so a
+ * re-dispatch of the same handle is only free if this line says `removed`.
+ */
+export function remoteStartupFailureMessage(
+	failure: RemoteStartupFailure,
+	opts: {
+		/** Did the launch kill+remove the terminal it created? */
+		disposal: RemoteTerminalDisposal;
+		/** The launch argv (task last): quoted back as a reproduce command. */
+		argv: readonly string[];
+		/** Why the terminal was kept, when it was (a kill that failed). */
+		disposalError?: string;
+	},
+): string {
+	const screen = failure.screenTail.length > 0
+		? failure.screenTail.map((line) => `    | ${line}`).join("\n")
+		: "    | (the terminal rendered nothing)";
+	const dirLine = failure.dirExists === false
+		? "gone (the launch created it; nothing is in it to read)"
+		: failure.dirExists === true
+			? "there (the child never wrote into it)"
+			: "unknown (the machine did not answer the directory question)";
+	const transcript = failure.sessionExists === true
+		? `${failure.sessionPath} (the file exists — this launch gave up on a file that IS there)`
+		: failure.sessionExists === false
+			? `${failure.sessionPath} (does not exist)`
+			: `${failure.sessionPath} (could not be checked)`;
+	const pidLine = failure.pid === undefined
+		? "the core reports no pid for it: nothing may have been started in that terminal"
+		: `pid ${failure.pid} (a program is running there, but it has written no transcript)`;
+	const terminalLine = opts.disposal === "removed"
+		? `${failure.terminal} (created, then killed and removed: the name is free again)`
+		: `${failure.terminal} (KEPT${opts.disposalError ? `: ${opts.disposalError}` : ""} — a re-dispatch of this name will answer NAME_TAKEN until it is removed on that machine)`;
+	return [
+		`host '${failure.host}': the launch never proved the child started — no session file appeared at ${failure.sessionPath} within ${failure.waitedMs}ms`,
+		`  host: ${failure.host}`,
+		`  cwd: ${failure.cwd} (the directory this launch asked for, on ${failure.host})`,
+		`  terminal: ${terminalLine}`,
+		`  mirror dir: ${dirLine}`,
+		`  transcript: ${transcript}`,
+		`  hc error: ${failure.lastError ?? "(the core reported no error: every call answered)"}`,
+		`  process: ${pidLine}`,
+		`  screen (last ${REMOTE_FATE_SCREEN_LINES} lines of that terminal):\n${screen}`,
+		`  next: ${failure.host} accepted the launch but the child did not start. The screen above is the child's own words — an interactive prompt, a missing provider, a rejected --extension. Fix that on ${failure.host} and re-dispatch (a launch that fails later is now refused here instead of becoming a "working" shell).`,
+		`  Command (run on '${failure.host}' to reproduce):\n${remoteLaunchReproLine(opts.argv, failure.cwd)}`,
+	].join("\n");
 }
 
 /** `mkdir -p <dir>` on the target — the remote half of D9's two temp dirs. */

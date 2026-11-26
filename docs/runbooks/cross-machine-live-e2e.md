@@ -384,12 +384,12 @@ hc exec --on vps -- sh -c 'test -e /root/.pi/agent/npm/node_modules/pi-any-endpo
 
 ### 3.6.5 launch 阶段的启动确认门（8 秒）与被丢弃的扩展
 
-`terminal.run` 返回地址之后，远端 launch 会做一次**启动确认**：`REMOTE_STARTUP_CONFIRM_MS = 8_000`，每 500ms
+`terminal.run` 返回地址之后，远端 launch 会做一次**启动确认**：`REMOTE_STARTUP_CONFIRM_MS = 20_000`（#423 从 8 秒上调），每 500ms
 用 `file.read {limit: 0}` 看 `<remoteDir>/session.jsonl` 是否已经出现。一轮里只有三种结局：
 
 1. `session.jsonl` 出现 ⇒ 确认，继续（正常路径，读者看不到任何额外输出）。
 2. `terminal.get` 报 `state === "finished"` 或带数字 `exit_code` ⇒ **证明死亡**，抛 `START_FAILED`。
-3. 到点两者都没有 ⇒ **只 warn 并照常 launch**，记录上打 `startupUnconfirmed: true`。**慢不是 bug**，不判死。
+3. 到点两者都没有 ⇒ **抛 `START_FAILED`**（#423 改；旧行为是「只 warn 并照常 launch + `startupUnconfirmed: true`」，正是 #423 的空壳来源）。回执同时 kill+rm 这个空终端，所以同名重派不会再撞 `NAME_TAKEN`。
 
 第 2 种的文案（冻结）：
 
@@ -412,7 +412,8 @@ host '<host>': the child did not survive startup — its terminal ended before i
 「child 已结束」的证据（归 `no-session`，并在 `evidence` 里明说名字是推断的）。
 
 > §4 里 R1 的「判定点 ③（10 秒内 transcript 仍 0 行）」描述的是 **live e2e 用例自己的观测量**；
-> 生产代码不再因为「终端还活着但没写」判死 —— 那只是慢，只 warn（`startupUnconfirmed: true`）。
+> **#423 之后**生产代码在「终端还活着但没写」时也不再放行：超时即 `START_FAILED`（`startupUnconfirmed` 已移除）。
+> 这是本 runbook 与 `docs/contracts/remote-child-fate-v1.md` §4.2 的当前约定。
 
 ### 3.6.6 为什么「没有会话文件」等于「启动期死了」（pi 1.5.2 本机实测）
 

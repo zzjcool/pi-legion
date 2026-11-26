@@ -149,11 +149,11 @@ cd -- '/home/zzjcool/legion-xm-demo' && 'node' '/root/.pi/…/cli.js' '--session
 
 ### 5.2 启动确认门（`src/supervisor/terminal-supervisor.ts:1308`）
 
-remote launch 拿到 address 后，最多等 8 秒（`REMOTE_STARTUP_CONFIRM_MS`，500ms 一轮）：
+remote launch 拿到 address 后，最多等 20 秒（`REMOTE_STARTUP_CONFIRM_MS`，500ms 一轮；#423 之前是 8 秒）：
 
 - `file.read {limit:0}` 命中 `<remoteDir>/session.jsonl` ⇒ 确认存活，继续；
 - `terminal.get` 证明**已结束** ⇒ 立刻抛 `START_FAILED`（§4.3 的报错原文，含 exit code / 目录 / 屏幕 / 可复现命令）；
-- 到点仍未确认 ⇒ **只 warn**（附「core 没给 pid」提示）并记 `startupUnconfirmed: true`，照常 launch —— 慢机器不是 bug。
+- 到点仍未确认 ⇒ **抛 `START_FAILED`**（#423 改：旧行为是「只 warn 并照常 launch，记 `startupUnconfirmed: true`」，产出了父机报 `working`、远端什么都没起的空壳）。回执把机器 / cwd / 终端地址 / hc 错误原文 / 该终端最后 6 行（`terminal.read`）一起带回来，见 `docs/contracts/remote-child-fate-v1.md` §4.2 与 `docs/reports/launch-verification.md`。
 
 ### 5.3 缺扩展：启动前判定，而不是事后猜
 
@@ -198,7 +198,7 @@ fake core 增加 `FAKE_HC_TERMINALS`（JSON manifest，`terminal.run` 时应用�
 |---|---|---|
 | T1 | 正常：manifest 写完整 session | launch 成功；`remoteReadback.ok`；`read-back … N of N lines (complete)`；无 `· read-back:` 后缀 |
 | T2 | 起不来：`finished` + `exit_code 1` + 屏幕有 pi 的 `Error:` | **launch 抛** `START_FAILED`，含 `did not survive startup` / `exit 1` / 屏幕原文 / `Command (run on '`；且 `terminal.run` 确实发过一次 |
-| T3 | 无会话：终端 `running`、无 writes | launch 成功 + `startupUnconfirmed`；collect ⇒ `fate: "no-session"`，渲染含 `FAILED (no-session)` 与 `next:` |
+| T3 | 无会话：终端 `running`、无 writes | **#423 后**：launch 被拒（`START_FAILED`，T3b）；本表原断言的 `fate: "no-session"` 归读回层（门关掉时仍成立：`test/integration/remote-child-fate.test.ts` T3 用 `remoteStartupConfirmMs: 0` 保留它） |
 | T4 | 路径不对：记录的前缀 ≠ 当前配置（`/srv/old-root/...` vs `<mirrorRoot>/...`） | `fate: "path"`，evidence 同时点名 `recorded dir:` 与 `configured dir:` |
 | T5 | `piExtensions` 缺失 | launch 抛错，点名路径 + `does not exist on that machine`；`terminal.run` **一次都没发** |
 | T6 | 无法映射的扩展（既不在 checkout、也无 `pathMap`/包可锚） | launch **被拒**（v1.2），点名路径与 `pathMap` 键，`terminal.run` **一次都没发** |

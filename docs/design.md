@@ -437,7 +437,7 @@ frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/ag
 ### 7.4 迁移与卫生
 
 - `LEGION_DB_USER_VERSION = 3`：v0 → v1 建表；v1 → v2 只 bump 版本（`messages.delivered` 从三值域扩成五值域，列类型本就是 `INTEGER`，旧值 `1` 语义上等同新 `accepted`）；v2 → v3 只加结果账本两张表（`artifacts` / `consumptions`，`CREATE TABLE/INDEX IF NOT EXISTS`，四张既有表零列变更、零迁数据）。每一步都先写 DDL 再写 `PRAGMA user_version`，故同一个 `migrate()` 从任意旧版本都能落到当前版本，且重跑幂等。比支持版本更新的库直接拒绝打开。
-- 启动卫生（`src/runs/hygiene.ts`，每个 root 会话一次、best-effort、绝不抛）：清扫死 owner 的 `rpc-child-*`；把 owner 已死且长时间没更新的 `starting/running/blocked` 节点标 `failed`（`node_abandoned`）；按 `retentionDays`（默认 14 天）删空闲 run 目录（**带 `worktrees/` 的除外**）；events 按 `eventRetentionDays` / `eventMaxRows` 裁剪。每一步都同时看**年龄**与**进程所有权**，绝不碰别的活跃会话。
+- 启动卫生（`src/runs/hygiene.ts`，每个 root 会话一次、best-effort、绝不抛）：清扫死 owner 的 `rpc-child-*`；把 owner 已死且长时间没更新的 `starting/running/blocked` 节点标 `failed`（`node_abandoned`，`host` 非空的跨机行除外 —— #407）；按 `retentionDays`（默认 14 天）删空闲 run 目录（**带 `worktrees/` 的除外**，**仍持有 unsettled 跨机行的除外** —— #408，那行里的 `nodes.remote_dir` / `remote_terminal` 是本机唯一记得远端目录/终端归属的记录）；events 按 `eventRetentionDays` / `eventMaxRows` 裁剪。每一步都同时看**年龄**与**进程所有权**，绝不碰别的活跃会话。
 
 ### 7.5 run 目录的降级定位
 

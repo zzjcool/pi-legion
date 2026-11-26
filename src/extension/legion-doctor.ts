@@ -45,6 +45,7 @@ import {
 	HYGIENE_ENV,
 	HYGIENE_LAST_FILE,
 	dirBytes,
+	findRemoteHolds,
 	hygieneEnabled,
 	resolveHygieneConfig,
 } from "../runs/hygiene.ts";
@@ -611,6 +612,8 @@ interface HygieneLastMarker {
 	at?: number;
 	removedTempDirs?: number;
 	prunedRuns?: number;
+	/** #408: run dirs the sweep declined to prune because a live cross-machine row lives there. */
+	keptRemoteRuns?: number;
 	deletedEvents?: number;
 	freedBytes?: number;
 	errors?: number;
@@ -661,6 +664,9 @@ function formatHygieneConfigLines(env: NodeJS.ProcessEnv): string[] {
 
 const HYGIENE_SWEEP_HINT =
 	`Restart the root pi session so startup hygiene runs, or check ${HYGIENE_ENV.disable}=0.`;
+
+/** How many held run dirs the storage section spells out before it summarizes (#408). */
+const REMOTE_HOLD_SAMPLES = 5;
 
 export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	const env = options.env ?? process.env;
@@ -855,6 +861,10 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	const sessionErrors = options.sessionErrors ?? summarizeSessionErrors({ storeRoot });
 	const orphans = storeRoot ? scanOrphanTemps(storeRoot) : undefined;
 	const hygieneLast = storeRoot ? readHygieneLast(storeRoot) : undefined;
+	// #408: run dirs retention has to keep because a cross-machine row in them is
+	// still open. Only read when the storage section is actually rendered: this
+	// opens every run ledger, which a `doctor models` run must not pay for.
+	const remoteHolds = storeRoot && want(selected, "storage") ? findRemoteHolds(storeRoot) : [];
 	if (sessionErrors.total > 0) {
 		issues.push({
 			severity: "info",
@@ -885,6 +895,18 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 				? `No ${HYGIENE_LAST_FILE} marker — startup hygiene has not recorded a sweep.`
 				: `Last hygiene sweep ${new Date(sweepAt).toISOString()} is older than ${HYGIENE_SWEEP_STALE_DAYS} days.`,
 			fix: HYGIENE_SWEEP_HINT,
+		});
+	}
+	const remoteHoldRows = remoteHolds.flatMap((hold) => hold.rows);
+	const remoteHoldRuns = remoteHolds.filter((hold) => hold.rows.length > 0).length;
+	if (remoteHoldRuns > 0) {
+		const hosts = [...new Set(remoteHoldRows.map((row) => row.host))];
+		issues.push({
+			severity: "info",
+			code: "RETENTION_HOLDS_REMOTE",
+			section: "storage",
+			message: `Retention keeps ${remoteHoldRuns} run dir(s) that still hold ${remoteHoldRows.length} unsettled cross-machine row(s) — this machine's only record of those remote dirs/terminals (${hosts.join(", ")}).`,
+			fix: `Check the far side with ${hosts.map((host) => `hc terminal ls --on ${host}`).join(", ")}, then settle the row (subagent recover) or remove the run dir by hand.`,
 		});
 	}
 
@@ -1080,7 +1102,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		} else {
 			push(`- storeRoot: ${homeize(storeRoot, home)}`);
 			if (sweepAt !== undefined) {
-				push(`- last sweep: ${new Date(sweepAt).toISOString()} (removedTemps=${hygieneLast?.removedTempDirs ?? 0}, prunedRuns=${hygieneLast?.prunedRuns ?? 0}, deletedEvents=${hygieneLast?.deletedEvents ?? 0}, freed=${formatBytes(hygieneLast?.freedBytes ?? 0)}, errors=${hygieneLast?.errors ?? 0})`);
+				push(`- last sweep: ${new Date(sweepAt).toISOString()} (removedTemps=${hygieneLast?.removedTempDirs ?? 0}, prunedRuns=${hygieneLast?.prunedRuns ?? 0}, keptRemoteRuns=${hygieneLast?.keptRemoteRuns ?? 0}, deletedEvents=${hygieneLast?.deletedEvents ?? 0}, freed=${formatBytes(hygieneLast?.freedBytes ?? 0)}, errors=${hygieneLast?.errors ?? 0})`);
 			} else {
 				push("- last sweep: (no marker yet — written on next root-session startup hygiene)");
 			}
@@ -1105,6 +1127,24 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 				}
 			} catch { /* missing */ }
 			push(`- runs: ${runCount}; legion.db total ≈ ${formatBytes(dbBytes)}${largestName ? `; largest ${largestName} (${formatBytes(largestSize)})` : ""}`);
+			if (remoteHolds.length > 0) {
+				// #408: name the withheld dirs and the far side they belong to.
+				const kept = remoteHolds.filter((hold) => hold.rows.length > 0);
+				if (kept.length > 0) {
+					push(`- kept by retention: ${kept.length} run dir(s) hold an unsettled cross-machine row (prune skips them)`);
+					for (const hold of kept.slice(0, REMOTE_HOLD_SAMPLES)) {
+						for (const row of hold.rows) {
+							push(`    ${hold.runId}/${row.nodeId} ${row.name}@${row.host} ${row.status}`);
+							push(`      remote_dir=${row.remoteDir ?? "(not recorded)"} remote_terminal=${row.remoteTerminal ?? "(not recorded)"}`);
+							push(`      inspect: hc terminal ls --on ${row.host}`);
+						}
+					}
+					if (kept.length > REMOTE_HOLD_SAMPLES) push(`    … ${kept.length - REMOTE_HOLD_SAMPLES} more run dir(s)`);
+				}
+				for (const hold of remoteHolds.filter((h) => h.error !== undefined)) {
+					push(`    ${hold.runId}: ledger unreadable, dir kept (${hold.error})`);
+				}
+			}
 			if (orphans) {
 				push(`- rpc-child temps: ${orphans.total} (live=${orphans.live}, dead-owner=${orphans.orphanDead}, unknown=${orphans.unknown})`);
 				for (const s of orphans.samples) push(`    ${s}`);

@@ -12,6 +12,7 @@ import {
 	formatCompletionNotice,
 	formatGroupedNotice,
 	collectFailureInput,
+	SUBAGENT_NOTIFY_TYPE,
 	type CompletionInput,
 	type CompletionNotice,
 	type CompletionStatus,
@@ -37,6 +38,9 @@ import {
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
 import type { LiveProgress } from "../shared/progress.ts";
+import { shellReason, transcriptBytesOf } from "../runs/launch-evidence.ts";
+import type { HoldChild, TakenHoldNotice } from "./hold.ts";
+import { parentLine } from "../runs/parent-anchor.ts";
 import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
 import { isTerminalState, liveness } from "./liveness.ts";
@@ -46,11 +50,13 @@ import {
 	type AgentKind,
 	type RetireOptions,
 	type SpawnMode,
+	type WorktreeSource,
 } from "../shared/types.ts";
 import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
+import type { OrphanStatusFacts, OrphanReclaimVerdict } from "../shared/types.ts";
 import type { LegionEvent, LegionEventBus } from "./event-bus.ts";
 import { LEGION_EVENT_TYPES, isDetailDeltaEvent } from "./event-bus.ts";
 import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
@@ -58,6 +64,11 @@ import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
+import { readMirrorFacts, type LiveMirrorFacts } from "../runs/live-mirror.ts";
+/** #441-B: re-exported so the pre-existing importers (`readMirrorFacts(...)` in the
+ * status path and its tests) keep one spelling of the parser; the implementation
+ * moved to `runs/live-mirror.ts` because the stall detector reads it too. */
+export { readMirrorFacts };
 import { listArtifacts, markNotified, undelivered } from "../legion/ledger.ts";
 import { publishLegionRunActivity } from "../legion/run-active.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
@@ -146,6 +157,18 @@ export interface TrackedJobInput {
 	 */
 	worktreeHost?: string;
 	/**
+	 * 6.2.4 / D2: machine that RAN the child, when it was not this one.
+	 *
+	 * The shutdown needs it for one decision only: a cross-machine child is not
+	 * killed and not waited for by this process — it is released as `orphaned`.
+	 */
+	host?: string;
+	/**
+	 * 6.2.5 / D5: the address the core holds for that child's terminal
+	 * (`host/name`), so the job-only status fallback can name it.
+	 */
+	remoteTerminal?: string;
+	/**
 	 * Arbitrated backend for this child (`Handle.spawnMode`, #209). Optional:
 	 * a job tracked from a legacy record has no value and must render as
 	 * unknown rather than a guessed `rpc`.
@@ -194,6 +217,17 @@ export interface TrackedJob extends TrackedJobInput {
 	settledAt?: number;
 	unsubscribeRpcEvents?: () => void;
 	collectPromise?: Promise<CollectSnapshot>;
+	/**
+	 * 6.2.4 / D2: this job's in-flight collect can be stopped.
+	 *
+	 * A collect on a still-running cross-machine child polls until its deadline, and
+	 * those timers are ref'd — that is a `pi --print` run that cannot exit while the
+	 * work over there continues. Before this, the exit killed the remote child,
+	 * which unblocked the collect; now the exit leaves it running (that is the whole
+	 * point of `orphaned`), so the wait itself has to be cancellable. Per job, not
+	 * per runtime: a local child still owes its one last collect during the drain.
+	 */
+	collectAbort: AbortController;
 }
 
 export interface LegionTreeIdentity {
@@ -543,6 +577,17 @@ export interface LiveChildStatusInput {
 	 * never a guessed `rpc`.
 	 */
 	spawnMode?: string;
+	/**
+	 * #451: who decided this launch's worktree isolation — `role` (the role card)
+	 * or `request` (the caller's explicit launch argument). Absent on records
+	 * written before the field existed, and then no line is invented: the block
+	 * stays byte-identical.
+	 */
+	worktreeSource?: WorktreeSource;
+	/** Isolated tree this child holds (#451 display); absent = no tree. */
+	worktreePath?: string | null;
+	/** Branch created in that tree; shown instead of the path when both exist. */
+	worktreeBranch?: string;
 	/** RPC process is still running. */
 	alive: boolean;
 	/**
@@ -552,6 +597,33 @@ export interface LiveChildStatusInput {
 	 * by the owner marker instead. Only consulted when `alive` is false.
 	 */
 	owner?: "live" | "dead" | "unknown";
+	/**
+	 * 6.2.4 / D3: the machine that RAN the child (`ChildRecord.host`), when it was
+	 * not this one. The `subagent({action:"status"})` dead block printed only the
+	 * local path facts, so a leftover from another machine had to be read from
+	 * `recover`'s first line to learn where it lives.
+	 *
+	 * 6.2.5 / D5: `undefined` means "this machine" for a LIVE child, and the block
+	 * now says so (`host=local`) instead of printing nothing. Before that, silence
+	 * meant two different things — "local" and "the fact never reached the
+	 * renderer" — and a live child on `hw-nj` rendered byte-identically to a local
+	 * one, which is why nobody could find it in the Herdr UI.
+	 */
+	host?: string;
+	/**
+	 * The address the core holds for that child's terminal (`host/name`).
+	 * `undefined` on a live child renders `terminal=-` (unknown), never nothing.
+	 */
+	remoteTerminal?: string;
+	/**
+	 * #409: the address this launch used as the child's terminal PARENT, in the
+	 * namespace of the core that received it. Rendered beside `terminal=` for a
+	 * cross-machine child (where the anchor address is the proof the ancestry is
+	 * connected) and whenever {@link parentAbsent} says one could not be named.
+	 */
+	parentTerminal?: string;
+	/** #409: why no parent address could be named; renders `parent=absent(<reason>)`. */
+	parentAbsent?: string;
 	/**
 	 * Own OS process of an `rpc` child (`Handle.pid`), when this session owns it.
 	 *
@@ -566,6 +638,38 @@ export interface LiveChildStatusInput {
 	 * `accumulateUsage` source of truth the widget reads.
 	 */
 	contextTokens?: number;
+	/**
+	 * #450: which run store this record lives in (`store=<label>`), when it is NOT the
+	 * session's own store. A child record is keyed by `(store, name)`, so a name alone
+	 * cannot tell a reader where to look; the line names the directory instead.
+	 *
+	 * Absent for every child of the session's own store (and for every caller that does
+	 * not do a cross-store scan), which keeps every pre-#450 block byte-identical.
+	 */
+	store?: string;
+	/**
+	 * #456: set only for a row whose run.json/ledger says orphaned/unfetched; absent
+	 * leaves the pre-#456 output byte-identical. Display only — it never decides
+	 * liveness or writes anything.
+	 */
+	/**
+	 * #456: the orphaned-row verdict (terminal gone / idle / still working / unknown).
+	 *
+	 * #463: mutually exclusive with {@link unsupervised} — an orphaned leftover and a
+	 * row nobody holds are two different verdicts, and a record is only ever one.
+	 */
+	orphan?: OrphanStatusFacts;
+	/**
+	 * #463: the row is a leftover nobody in this process holds a supervisor for
+	 * (`src/runs/unsupervised-row.ts`).
+	 *
+	 * The state word becomes `unreachable (no supervisor)` and the evidence goes on
+	 * its own line right under the header: `working` was the lie that made `status`
+	 * count a child that finished and was retired as a live child forever, and
+	 * `owner: live` alone cannot refute it (the marker's pid is often the very
+	 * process reading it).
+	 */
+	unsupervised?: { reason: string; evidence: string };
 	now?: number;
 }
 
@@ -681,6 +785,53 @@ function memoryLine(input: LiveChildStatusInput): string | undefined {
 }
 
 /**
+ * #411 §4: the `mirror=` marker for a child whose transcript is a cross-machine
+ * live mirror (`src/runs/live-mirror.ts`).
+ *
+ * Pure and total: `undefined` means "print nothing at all", which is the ONLY
+ * outcome for a local child — no state file is ever written for one, so the
+ * status block of every local child stays byte for byte what it was.
+ *
+ * The three states answer the one question a reader has about a remote child:
+ * "is the text I am looking at current?". `stale` therefore wins over `ok` — it
+ * carries the byte count the reader is still missing, and an `error` with zero
+ * stale bytes is still a pump that just failed (the last failure is cleared by
+ * the next success, so its presence is current news, not history).
+ */
+export function formatMirrorLine(facts: LiveMirrorFacts | undefined): string | undefined {
+	if (!facts) return undefined;
+	// Configured off: there is no mirror at all, and no byte count to quote.
+	if (facts.mode === "off") return "mirror=off";
+	if (facts.staleBytes > 0 || facts.error !== undefined) return `mirror=stale(${facts.staleBytes} bytes)`;
+	return `mirror=ok(${facts.bytes} bytes)`;
+}
+
+/**
+ * #456: the state word an orphaned row is allowed to show.
+ *
+ * The four verdicts `src/runs/orphan-reclaim.ts` can reach are the four answers a
+ * reader needs; `state=orphaned` alone was true and useless — a row whose terminal
+ * was gone and whose work was done read exactly like one still running over there.
+ */
+export function orphanVerdictWord(verdict: OrphanReclaimVerdict): string {
+	switch (verdict) {
+		case "terminal-gone":
+			return "terminal gone, work done";
+		case "stale-orphan":
+			return "idle, transcript quiet";
+		case "working":
+			return "still working";
+		case "unknown":
+			return "liveness unknown";
+		// #463: not an orphaned row — a local leftover nobody holds a supervisor
+		// for. The state word is `unreachable (no supervisor)`, so this word only
+		// appears if a caller routes the verdict through the orphan suffix.
+		case "no-supervisor":
+			return "no supervisor";
+	}
+}
+
+/**
  * Status text for one child (`/legion status <name>` and `subagent status`).
  *
  * Living children lead with `alive · quiet Ns` so a long silent reasoning
@@ -696,18 +847,55 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	// dead, not working. `stale` (alive process + retired/failed snapshot) keeps
 	// owning the opposite direction, so the two never fight over one record.
 	const ownerDead = input.owner === "dead" && !input.alive;
-	const state = stale
-		? "working"
-		: ownerDead && input.state === "working"
-			? "failed"
-			: input.state;
+	// #423 req 4: a cross-machine child with NO terminal address and NO transcript
+	// never proved it started, and neither `working` nor `living` is a fact this
+	// renderer can support. Measured in the issue: `state=working` + `quiet 1057s
+	// (living)` next to an empty placeholder and nothing on the target machine.
+	// The state word and the liveness line are the two places that lie, so both
+	// come from the one shared rule (`launch-evidence`) instead of each guessing.
+	const shell = shellReason({
+		...(input.host !== undefined ? { host: input.host } : {}),
+		...(input.remoteTerminal !== undefined ? { remoteTerminal: input.remoteTerminal } : {}),
+		transcriptBytes: transcriptBytesOf(input.sessionFile),
+	});
+	// #463: the ghost verdict wins over every other state rule — `working` is the lie
+	// this line exists to stop repeating, and a row nobody holds has no process whose
+	// silence could be read as `stale`. The reason is rendered verbatim so the word
+	// is `unreachable (no supervisor)`, never a bare `unknown`.
+	const state = input.unsupervised !== undefined
+		? `unreachable (${input.unsupervised.reason})`
+		: shell !== undefined
+			? "unknown"
+			: stale
+				? "working"
+				: ownerDead && input.state === "working"
+					? "failed"
+					: input.state;
 	const execution = stale
 		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
 		: input.execution;
+	// #456: the verdict is a presentation suffix on the frozen state word — the
+	// stale/ownerDead/shell rules above still decide what `state` says.
+	const orphanWord = input.orphan ? ` (${orphanVerdictWord(input.orphan.verdict)})` : "";
 	const lines = [
-		`${input.name} — state=${state} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
+		`${input.name} — state=${state}${orphanWord} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
 	];
-	if (input.alive) {
+	// #463: the reachability evidence, directly under the header like #456's — the
+	// reader must be able to check WHY a `working` record is not live.
+	if (input.unsupervised !== undefined && input.unsupervised.evidence.trim().length > 0) {
+		lines.push(`unreachable: ${input.unsupervised.evidence}`);
+	}
+	// Directly under the header: the one sentence the verdict rests on, so a reader
+	// can check the word instead of trusting it. Display only, no line otherwise.
+	if (input.orphan?.evidence !== undefined && input.orphan.evidence.trim().length > 0) {
+		lines.push(`orphan: ${input.orphan.evidence}`);
+	}
+	if (shell !== undefined) {
+		// A shell is not "quiet": nothing was ever running to be quiet. This line is
+		// the answer to "is it working?", and `unknown` is the only claim the facts
+		// support (display-liveness D2: unknown must never render as live).
+		lines.push(`liveness=unknown (${shell})`);
+	} else if (input.alive) {
 		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
 		lines.push(formatAliveQuiet(age));
 	}
@@ -718,6 +906,59 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		`supervisor=${input.spawnMode ?? "unknown"}`,
 		`session=${input.sessionFile}`,
 	];
+	// 6.2.4 / D3: where a cross-machine child actually lives. Right after the owner
+	// line — identity facts first, verdicts after — so every existing line keeps its
+	// text and relative order.
+	//
+	// 6.2.5 / D5: a LIVE child always names both facts, with an explicit fallback.
+	// Silence was the bug: a child on `hw-nj` printed exactly the block a local one
+	// did, so "local" and "we never got the fact" were indistinguishable and there
+	// was no way to find its terminal. A DEAD record keeps the 6.2.4 shape (a dead
+	// LOCAL record grows no lines), because a fate note is not a place to look.
+	if (input.alive) {
+		lines.push(`host=${input.host ?? "local"}`);
+		lines.push(`terminal=${input.remoteTerminal ?? "-"}`);
+		// #409: whose terminal it hangs from, in the target core's namespace. Right
+		// below the address because the two answer one question — "where do I look
+		// for this child, and what is it attached to". A local launch grows no line
+		// (its parent is the terminal the reader is sitting in); an ABSENT parent is
+		// always printed, with its reason: "no parent" and "we never asked" must
+		// not look alike.
+		const parent = parentLine({ parentTerminal: input.parentTerminal, parentAbsent: input.parentAbsent });
+		if (parent !== undefined && (input.host !== undefined || input.parentAbsent !== undefined)) {
+			lines.push(parent);
+		}
+		// The address `hc` accepts (`hc read <machine>/<terminal>`), and the reason a
+		// human needs it at all: there is no pane on THIS machine to click.
+		if (input.host) {
+			lines.push(`see: hc read ${input.remoteTerminal ?? input.host}   (cross-machine children have no Herdr pane)`);
+		}
+	} else {
+		// 6.2.4 / D3, byte for byte: a dead record only grows the lines it has facts for.
+		if (input.host) lines.push(`host=${input.host}`);
+		if (input.remoteTerminal) lines.push(`terminal=${input.remoteTerminal}`);
+		// #409: a dead record prints the parent it has — always for a cross-machine
+		// child, always when absent, and never for a local one (that record's shape is
+		// frozen: a fate note is not a place to look).
+		const parent = parentLine({ parentTerminal: input.parentTerminal, parentAbsent: input.parentAbsent });
+		if (parent !== undefined && (input.host !== undefined || input.parentAbsent !== undefined)) {
+			lines.push(parent);
+		}
+	}
+	// #451: WHO asked for the worktree. A `request` with no tree is the in-place
+	// shape (`worktree:false`), not a missing fact, so it prints `worktree=none`
+	// instead of vanishing; a legacy record has no source and grows no line.
+	if (input.worktreeSource !== undefined) {
+		lines.push(
+			`worktreeSource=${input.worktreeSource} worktree=${input.worktreeBranch ?? input.worktreePath ?? "none"}`,
+		);
+	}
+	// #411 §4: only a child whose transcript is a live mirror has a state file, so
+	// this line is absent for every local child (byte-identical output, by design).
+	// Placed after the host/terminal identity facts and before the snapshots: it is
+	// a freshness fact about the transcript, not a verdict about the child.
+	const mirror = formatMirrorLine(readMirrorFacts(input.sessionFile));
+	if (mirror !== undefined) lines.push(mirror);
 	if (execution) {
 		lines.push(formatExecutionStatusLine(input.alive, execution));
 		if (execution.usage) {
@@ -739,6 +980,10 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const memory = memoryLine(input);
 	if (memory) lines.push(memory);
 	lines.push(...meta);
+	// #450: which store the record came from — right after the `session=` meta line it
+	// qualifies (both are path facts about the same record). One line, and only when the
+	// caller scanned more than one store: a same-store child grows no line at all.
+	if (input.store !== undefined) lines.push(`store=${input.store}`);
 	if (stale) {
 		const persistedExecution = input.execution
 			? `execution=${input.execution.status}${input.execution.reason ? ` (${input.execution.reason})` : ""}`
@@ -801,6 +1046,26 @@ export interface SessionRuntime {
 	release(name: string): void;
 	get(name: string): TrackedJob | undefined;
 	activeJobs(): TrackedJob[];
+	/**
+	 * 6.2.4 / D2: let go of every CROSS-MACHINE child before anything drains.
+	 *
+	 * A cross-machine child is not this process's to kill or to wait for: the exit
+	 * records it `orphaned`/`unfetched` and leaves it running over there, where a
+	 * later session can `recover` its result. Releasing it means three things, in
+	 * this order and no other:
+	 *
+	 *  1. stamp the fate/record WHILE the facts still exist (the collect below is
+	 *     about to answer `running · aborted by parent`, which would erase them);
+	 *  2. cancel its in-flight collect — a collect on a live child polls ref'd
+	 *     timers until its deadline, and that is a `pi --print` run that never
+	 *     exits (`--print` waits for the event loop to drain, never calls
+	 *     `process.exit`);
+	 *  3. drop it from the job map, so the drain does not wait for it and the
+	 *     retire loop does not kill it.
+	 *
+	 * Returns the released names (for the caller's log/notice).
+	 */
+	releaseCrossMachineChildren(): Promise<string[]>;
 	/** Immutable metadata snapshot for tree/custom UI consumers. */
 	treeNodes(): TreeNodeSnapshot[];
 	/** Current live widget rows, including any retained Legion tree facts. */
@@ -824,6 +1089,50 @@ export interface SessionRuntime {
 	notifyParentSettled(): void;
 	/** Introspection seam for tests/doctor: deferred-notice queue state (D-B/D6 health). */
 	noticeQueueStats(): NoticeQueueStats;
+	/**
+	 * #417 settle hold: children of this session the hold may WAIT for.
+	 *
+	 * A job that is not watched, already `awaiting` (terminal snapshot buffered, parked
+	 * in `retire`), `retired`, or declared dead has no completion en route. `blocked` is
+	 * excluded for a different reason: a blocked child DOES owe a notice once its approval
+	 * resumes it (`runtime.ts` "Approval resumed the child … owes that one a notice"), but
+	 * a hold must never sit in front of a user decision for ten minutes. Excluding it is
+	 * why `takeHeldNotice` has to flush the join window (a blocked sibling is still
+	 * `watching:true` for the join, so it keeps a finished sibling's notice buffered).
+	 *
+	 * Optional on purpose — the same reason `publishRunActivity` below is: `SessionRuntime`
+	 * is also built as a literal double in tests, and a required member would break every
+	 * one of them for no behaviour. A host without these abstains from holding.
+	 */
+	holdableChildren?(): HoldChild[];
+	/**
+	 * #417: take the OLDEST undelivered notice out of the outbox as `custom_message`
+	 * boundary drafts. `undefined` = nothing is owed (every member was read or already
+	 * announced), which is a normal exit, not an error.
+	 */
+	takeHeldNotice?(): TakenHoldNotice | undefined;
+	/** #417: persist the `notified` latch for the taken notice (write-once, restart-safe). */
+	commitHeldNotice?(): void;
+	/** #417: put the taken notice back on the normal followUp path, untouched. */
+	releaseHeldNotice?(): void;
+	/**
+	 * #417: the boundary now belongs to the hold, so the `SETTLE_FALLBACK_MS` rescue
+	 * timer must not fire mid-hold and deliver a notice the boundary is about to
+	 * announce itself. No-op when no fallback is armed.
+	 */
+	holdOwnsBoundary?(): void;
+	/**
+	 * #418: the hold is done with the boundary — arm the `SETTLE_FALLBACK_MS` rescue again,
+	 * in the same form `agent_end` arms it.
+	 *
+	 * `holdOwnsBoundary` cancels a timer that would otherwise fire INSIDE the hold. The
+	 * mirror image is just as load-bearing: the hold's exits all reopen the window it was
+	 * covering ("a notice is held, no boundary has arrived"), so the rescue has to come
+	 * back. Without it the only remaining net is `agent_settled`, and a settle the host
+	 * never emits leaves the released notice parked in the outbox until an unrelated
+	 * boundary pushes it.
+	 */
+	holdReturnsBoundary?(): void;
 	/**
 	 * `root-mail-run-boundary-v1` D2: hand this session's run-activity reader to the
 	 * process-wide registry (`src/legion/run-active.ts`) under `nodeId`, so the mail
@@ -933,6 +1242,43 @@ interface FinishedResult {
 	 * the head and the metadata is untouched.
 	 */
 	stripped: boolean;
+}
+
+/**
+ * One abort signal that fires when ANY of its inputs does, plus its own release.
+ *
+ * 6.2.4 / D2: a collect has two independent reasons to stop — the caller gave up
+ * (an explicit `collect`/`wait` signal) and this session is exiting
+ * (`job.collectAbort`). Merging them means the shutdown does not depend on which
+ * call site happened to start the collect first. Listeners are removed by
+ * `release()` when the collect settles, so neither signal grows a listener per
+ * poll.
+ */
+function mergeSignals(...candidates: Array<AbortSignal | undefined>): { signal?: AbortSignal; release: () => void } {
+	const live = candidates.filter((signal): signal is AbortSignal => signal !== undefined);
+	if (live.length === 0) return { release: () => {} };
+	if (live.length === 1) return { signal: live[0], release: () => {} };
+	const controller = new AbortController();
+	let released = false;
+	const forward = (): void => {
+		if (released) return;
+		controller.abort();
+	};
+	for (const signal of live) {
+		if (signal.aborted) {
+			controller.abort();
+			break;
+		}
+		signal.addEventListener("abort", forward, { once: true });
+	}
+	return {
+		signal: controller.signal,
+		release: () => {
+			if (released) return;
+			released = true;
+			for (const signal of live) signal.removeEventListener("abort", forward);
+		},
+	};
 }
 
 export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
@@ -1363,6 +1709,43 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		settleFallbackTimer?.cancel();
 		settleFallbackTimer = undefined;
 	};
+	/**
+	 * Arm the rescue timer — the ONE arming path, shared by both arms of the race.
+	 *
+	 * Extracted (#418) instead of copied: the `agent_end` arm and the hold's exit arm are
+	 * the same promise ("a notice is held and no boundary has arrived yet"), so they must
+	 * not be able to drift in delay, guards or payload. The three guards are the original
+	 * semantics and each is load-bearing:
+	 *
+	 * - `disposed || !parentRunActive` — a teardown or an already-taken boundary is not a
+	 *   race to lose; a `false` here means the notice is parked for the NEXT boundary, which
+	 *   is the correct place for it (`docs/reports/legion-hold.md` §1.7);
+	 * - `outbox.length === 0` — nothing is held, so the common idle-end case allocates no
+	 *   timer at all;
+	 * - `settleFallbackTimer` — never two timers, so a re-arm cannot shorten the delay an
+	 *   already-armed timer promised.
+	 */
+	const armSettleFallback = (): void => {
+		if (disposed || !parentRunActive || outbox.length === 0) return;
+		if (settleFallbackTimer) return;
+		let live = true;
+		const schedule = deps.scheduleSettleFallback ?? defaultNoticeOverflow;
+		settleFallbackTimer = schedule(SETTLE_FALLBACK_MS, () => {
+			if (!live) return;
+			live = false;
+			settleFallbackTimer = undefined;
+			// `agent_settled` won the race, a new run started, or the runtime is gone:
+			// the boundary is not ours to take.
+			if (disposed || !parentRunActive) return;
+			// The settle boundary never arrived (aborted run, torn-down session). Take
+			// the boundary this notice would otherwise never get. `flushOutbox` still
+			// stops after the first `triggerTurn` notice (D2), so this is one waking
+			// message, exactly like a settle.
+			parentRunActive = false;
+			flushOutbox();
+			refreshUi();
+		});
+	};
 
 	/**
 	 * D6: the oldest held batch that can still produce a message.
@@ -1475,6 +1858,42 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	};
 
 	/**
+	 * D5 step 4, extracted (still called from `deliverBatch` right after a real send) so
+	 * the settle hold (#417) writes the SAME latch: one write path for the "notified"
+	 * fact, shared by the followUp send and by the boundary drafts.
+	 *
+	 * Per entry, never per batch:
+	 *  - an artifact id with a projection ⇒ `ledger.markNotified` (write-once: `COALESCE`
+	 *    keeps the first timestamp, so a replay cannot move it — and a restart cannot
+	 *    announce the same result twice, which is #417 rule 5's persistent latch);
+	 *  - no artifact id / no projection ⇒ `deliveredOnce` for this exact round.
+	 *
+	 * Callers must have a DELIVERED notice in hand: a host rejection must reach neither
+	 * write, or the next boundary would retry a send that already landed.
+	 */
+	const recordDelivered = (
+		surviving: readonly DeliverableEntry[],
+		projection: LedgerProjection | undefined,
+	): void => {
+		const at = now();
+		for (const entry of surviving) {
+			const artifactId = entry.input.artifactId;
+			if (artifactId !== undefined && projection) {
+				try {
+					markNotified(projection.db, { artifactId, consumerId: projection.consumerId, at });
+				} catch {
+					// D1e: a ledger failure is a diagnostic, never a delivery outcome. Falling
+					// back to the memory set keeps the “one notice per result” promise on a
+					// broken handle instead of turning the next boundary into a re-send loop.
+					deliveredOnce.add(reportKey(entry.runId, entry.name, entry.round));
+				}
+			} else {
+				deliveredOnce.add(reportKey(entry.runId, entry.name, entry.round));
+			}
+		}
+	};
+
+	/**
 	 * D5: THE single completion exit. Both the join `deliver` sink and the outbox
 	 * flush go through here and nowhere else, so the verdict (P4b/D4: the ledger
 	 * projection) is consulted at the last possible moment — after the join window and
@@ -1500,6 +1919,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		entries: readonly DeliverableEntry[],
 		triggerTurn: boolean,
 		partial: boolean,
+		/**
+		 * #417: format the notice and hand it over instead of sending it. Used by the
+		 * settle hold, which returns the text as a boundary draft in the SAME turn.
+		 * Nothing is recorded on this path: the latch belongs to `commitHeldNotice`,
+		 * so a caller that cannot return the drafts leaves the notice owed.
+		 */
+		asDraft?: (notice: CompletionNotice) => void,
 	): number => {
 		// D10 #4: each entry is judged, and later marked notified, on ITS OWN round — so
 		// two unread rounds of one child both survive, while a repeated delivery inside one
@@ -1517,14 +1943,21 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		// live the batch is held STRUCTURALLY (D4) — not sent, not even as a
 		// followUp: the host cannot retract a message, so anything sent now would
 		// become visible at a moment the projection no longer controls (T0 ≠ T2).
-		if (parentRunActive) {
+		// #417: `asDraft` is the settle hold asking for the notice itself.
+		// The boundary IS the delivery moment then, so the batch must not be queued
+		// for a later followUp (it would be announced twice).
+		if (parentRunActive && !asDraft) {
 			outbox.push({ entries: surviving, triggerTurn, partial, enqueuedAt: now() });
 			armOutboxTimer();
 			return 0;
 		}
 		let notice: CompletionNotice;
 		if (!partial && surviving.length === 1) {
-			notice = formatCompletionNotice(withRenewalProposal(surviving[0]!));
+			// #414: the notice carries the run that dispatched this child (the same
+			// id the grouped shape already prints), so attribution never depends on
+			// the handle alone. It rides beside the entry, not inside it: the
+			// runtime's job table is the authority for this fact.
+			notice = formatCompletionNotice({ ...withRenewalProposal(surviving[0]!), runId: surviving[0]!.runId });
 		} else {
 			// `stillRunning` is derived from the live job table at the moment of
 			// DELIVERY, never stored: a member claimed by `wait`/`collect` while this
@@ -1566,30 +1999,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				...(stillRunning.length > 0 ? { stillRunning } : {}),
 			});
 		}
+		// #417: format-only exit — the hold commits the latch itself (see
+		// `commitHeldNotice`), so nothing is recorded here.
+		if (asDraft) {
+			asDraft(notice);
+			return 1;
+		}
 		if (deliverCompletion({ sendMessage: deps.sendMessage }, notice, triggerTurn)) {
-			// P4b/D4 step 4: record the delivery. This is the ONLY write on the notice side,
-			// and it is per entry, never per batch:
-			//   - an artifact id with a projection ⇒ `ledger.markNotified` (write-once:
-			//     `COALESCE` keeps the first timestamp, so a replay cannot move it);
-			//   - no artifact id / no projection ⇒ `deliveredOnce` for this exact round.
-			// A host rejection returns above and reaches NEITHER write, so the notice stays
-			// deliverable and the next boundary retries it (D4: “false → do not mark”).
-			const at = now();
-			for (const entry of surviving) {
-				const artifactId = entry.input.artifactId;
-				if (artifactId !== undefined && projection) {
-					try {
-						markNotified(projection.db, { artifactId, consumerId: projection.consumerId, at });
-					} catch {
-						// D1e: a ledger failure is a diagnostic, never a delivery outcome. Falling
-						// back to the memory set keeps the “one notice per result” promise on a
-						// broken handle instead of turning the next boundary into a re-send loop.
-						deliveredOnce.add(reportKey(entry.runId, entry.name, entry.round));
-					}
-				} else {
-					deliveredOnce.add(reportKey(entry.runId, entry.name, entry.round));
-				}
-			}
+			// P4b/D4 step 4: record the delivery — the ONLY write on the notice side, and
+			// it is per entry, never per batch (see `recordDelivered`). A host rejection
+			// returns above and reaches neither write, so the notice stays deliverable and
+			// the next boundary retries it (D4: “false → do not mark”).
+			recordDelivered(surviving, projection);
 			return 1;
 		}
 		// Host rejected the send: nothing was marked (D5 step 4), so the notice is still
@@ -1686,6 +2107,139 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		} finally {
 			flushing = false;
 		}
+	};
+
+	// ── #417 settle-hold seam ───────────────────────────────────────────────────
+	// The POLICY (when to wait, what to return, in which order) lives in
+	// `src/extension/hold.ts`, because it has to be testable without a host, a child
+	// or a clock. What lives here is only the state it drives: which children can
+	// still produce a notice, and the ONE outbox item a boundary may announce
+	// in-turn instead of leaving for the next followUp.
+	//
+	// `hold-spike.md` §4 D3 is the shape: take (claim) → commit (persist the
+	// `notified` latch) on delivery, or release (put it back, untouched) on every
+	// other exit. Both halves are needed — a claim without release loses the
+	// notification on a timeout, and a commit without a delivered boundary
+	// announces a result that never reached the transcript.
+	/** The notice a boundary has taken and not yet committed or released. */
+	let heldNotice: QueuedNotice | undefined;
+
+	/**
+	 * Children of this session that can still produce a completion notice. A job that
+	 * is not watched, or is already `awaiting` (its terminal snapshot is buffered and
+	 * parked in `retire`), or is `blocked`/`retired`, has no completion en route — the
+	 * hold would wait for an entry that cannot come. A job its own liveness hook has
+	 * declared dead is skipped for the same reason (the same fourth condition the
+	 * `stillRunning` footer uses).
+	 */
+	const holdableChildren = (): HoldChild[] => {
+		if (disposed) return [];
+		const live: HoldChild[] = [];
+		for (const job of jobs.values()) {
+			if (job.watching !== true || job.state !== "working") continue;
+			if (job.isAlive && !job.isAlive()) continue;
+			live.push({ name: job.name, round: job.round });
+		}
+		return live;
+	};
+
+	/**
+	 * Take the OLDEST undelivered notice out of the outbox as boundary drafts.
+	 *
+	 * Called ONLY when the hold has no live child left. Two gates have to agree for
+	 * that to mean "the outbox is already filled", and they do not: this predicate
+	 * (`state === "working"`) is narrower than the join's (`watching !== false`), so a
+	 * BLOCKED sibling — still reachable for the join — keeps a finished child's entry
+	 * in the join buffer instead of the outbox for up to `flushMs`. Hence the flush
+	 * below: with nothing live left there is nothing left to batch FOR, and the entry
+	 * parked in the window is exactly the notice this boundary exists to reach.
+	 *
+	 * Re-filtered with the same verdict `flushOutbox` applies (D5 step 1): a member
+	 * claimed by `wait`/`collect` after it was queued is not owed any more, and an
+	 * item whose every member is claimed is dropped exactly as the flush would drop it.
+	 *
+	 * The text comes from the SAME formatter the followUp path uses (`deliverBatch`'s
+	 * `asDraft` sink) — a held notice must not be a different notice.
+	 */
+	const takeHeldNotice = (): TakenHoldNotice | undefined => {
+		if (disposed || heldNotice) return undefined;
+		if (holdableChildren().length === 0) join.flushBuffered();
+		const projection = ledgerProjection();
+		while (outbox.length > 0) {
+			const item = outbox.shift()!;
+			// A `triggerTurn:false` line is cosmetic (a launch/queue notice): it asks for
+			// no run, so spending the boundary's ONE continuation on it would be a wake-up
+			// nobody asked for. Leave it to the normal path.
+			if (!item.triggerTurn) {
+				outbox.unshift(item);
+				return undefined;
+			}
+			const surviving = item.entries.filter((entry) =>
+				owesDelivery(entry.runId, entry.name, entry.round, projection, entry.input.artifactId),
+			);
+			if (surviving.length === 0) continue; // every member claimed: dropping it IS the claim
+			heldNotice = { ...item, entries: surviving };
+			let notice: CompletionNotice | undefined;
+			deliverBatch(surviving, item.triggerTurn, item.partial, (formatted) => {
+				notice = formatted;
+			});
+			if (!notice) {
+				// The formatter refused (a `running` snapshot is a lost guard upstream, not a
+				// notice): put the item back untouched and let the normal path deal with it.
+				outbox.unshift(heldNotice);
+				heldNotice = undefined;
+				return undefined;
+			}
+			return {
+				drafts: [
+					{
+						type: "custom_message",
+						customType: SUBAGENT_NOTIFY_TYPE,
+						content: notice.content,
+						display: notice.display,
+						details: notice.details,
+					},
+				],
+				content: notice.content,
+			};
+		}
+		return undefined;
+	};
+
+	/**
+	 * The boundary is really returning these drafts: persist the latch NOW, before the
+	 * host commits the entries. `markNotified` is write-once, so a restart cannot
+	 * announce the same result again (#417 rule 5) — and the memory set stays the
+	 * degraded path when there is no ledger handle, exactly as in `deliverBatch`.
+	 */
+	const commitHeldNotice = (): void => {
+		const item = heldNotice;
+		if (!item) return;
+		heldNotice = undefined;
+		recordDelivered(item.entries, ledgerProjection());
+		// A PAINT must never sit between the write-once latch and the drafts leaving the
+		// handler: a throw here would turn the boundary into a non-delivery exit whose
+		// release is a no-op, i.e. a latched notice nobody ever sees. The board already
+		// contains a paint failure (`createLegionEventBus` catches; a microtask does not).
+		try {
+			refreshUi();
+		} catch {
+			/* cosmetic: the notice is already latched and will land */
+		}
+	};
+
+	/**
+	 * Hand the taken notice back to the normal followUp path, untouched and still the
+	 * OLDEST item. Called before every non-delivery return: the boundary is about to
+	 * end without announcing anything, so `agent_settled`/`SETTLE_FALLBACK_MS` may
+	 * deliver it exactly as they do today. Idempotent when nothing was taken.
+	 */
+	const releaseHeldNotice = (): void => {
+		const item = heldNotice;
+		if (!item) return;
+		heldNotice = undefined;
+		outbox.unshift(item);
+		armOutboxTimer();
 	};
 
 	const stillReachable = (name: string): boolean => jobs.get(name)?.watching !== false;
@@ -2317,45 +2871,54 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// because `track()` on an existing job rewrites `job.runId` and bumps
 			// `job.round` without touching `generation`.
 			const origin = { runId: job.runId, round: job.round };
+			// 6.2.4 / D2: the caller's signal AND the job's own, so a shutdown can stop
+			// the wait on a child it is leaving behind (see
+			// `releaseCrossMachineChildren`).
+			const merged = mergeSignals(signal, job.collectAbort.signal);
 			job.collectPromise = (async () => {
-				const snapshot = await job.collect(signal ? { signal } : undefined);
-				// D4a/F1: stamp the round this result came FROM, before anything can bump
-				// the live one. Every entry built from this snapshot speaks about `origin`,
-				// never about `job.round` (which a `track()` during this collect may have
-				// moved on) — that label is also the `deliveredOnce` key on the degraded
-				// path, so getting it wrong loses the NEXT round's notice.
-				snapshotOrigins.set(snapshot, origin);
-				const current = jobs.get(job.name) === job && job.generation === generation;
-				if (current) {
-					try {
-						await job.persist?.(snapshot);
-					} catch {
-						// Notification still happens; the tool-side persist is the backup.
+				try {
+					const snapshot = await job.collect(merged.signal ? { signal: merged.signal } : undefined);
+					// D4a/F1: stamp the round this result came FROM, before anything can bump
+					// the live one. Every entry built from this snapshot speaks about `origin`,
+					// never about `job.round` (which a `track()` during this collect may have
+					// moved on) — that label is also the `deliveredOnce` key on the degraded
+					// path, so getting it wrong loses the NEXT round's notice.
+					snapshotOrigins.set(snapshot, origin);
+					const current = jobs.get(job.name) === job && job.generation === generation;
+					if (current) {
+						try {
+							await job.persist?.(snapshot);
+						} catch {
+							// Notification still happens; the tool-side persist is the backup.
+						}
 					}
+					// C: a `running` snapshot is a timeout on a live child, not a result.
+					// Caching it would let a later wait/collect hand out a stale
+					// "still working" snapshot as if it were the final answer. Also do not
+					// revive a result after an explicit stop invalidates this generation.
+					//
+					// F2: re-validate AFTER the `persist` await, and include the round. A
+					// `track()` landing during persist does not bump `generation`, so `current`
+					// alone would let this stale round-1 write-back undo the invalidation
+					// `track()` just performed (D7b) — and the next `wait` would serve the
+					// previous round's result.
+					const stillCurrent =
+						jobs.get(job.name) === job &&
+						job.generation === generation &&
+						job.round === origin.round;
+					if (
+						stillCurrent &&
+						!snapshot.blocked &&
+						snapshot.execution.status !== "running"
+					) {
+						// #349: remember as the newest entry and keep the resident text bounded.
+						rememberFinished(job.name, origin.runId, origin.round, snapshot);
+					}
+					return snapshot;
+				} finally {
+					// The merged signal only lives as long as this one collect.
+					merged.release();
 				}
-				// C: a `running` snapshot is a timeout on a live child, not a result.
-				// Caching it would let a later wait/collect hand out a stale
-				// "still working" snapshot as if it were the final answer. Also do not
-				// revive a result after an explicit stop invalidates this generation.
-				//
-				// F2: re-validate AFTER the `persist` await, and include the round. A
-				// `track()` landing during persist does not bump `generation`, so `current`
-				// alone would let this stale round-1 write-back undo the invalidation
-				// `track()` just performed (D7b) — and the next `wait` would serve the
-				// previous round's result.
-				const stillCurrent =
-					jobs.get(job.name) === job &&
-					job.generation === generation &&
-					job.round === origin.round;
-				if (
-					stillCurrent &&
-					!snapshot.blocked &&
-					snapshot.execution.status !== "running"
-				) {
-					// #349: remember as the newest entry and keep the resident text bounded.
-					rememberFinished(job.name, origin.runId, origin.round, snapshot);
-				}
-				return snapshot;
 			})();
 		}
 		return job.collectPromise;
@@ -2509,6 +3072,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				existing.thinking = input.thinking;
 				existing.worktreeBranch = input.worktreeBranch;
 				if (input.worktreeHost) existing.worktreeHost = input.worktreeHost;
+				// A re-follow of a cross-machine child keeps carrying that fact; a local
+				// re-follow must not erase a host an earlier launch established either.
+				if (input.host) existing.host = input.host;
 				// Only a known value overwrites: a re-follow without the handle must
 				// not erase the mode an earlier launch established.
 				if (input.spawnMode !== undefined) existing.spawnMode = input.spawnMode;
@@ -2545,6 +3111,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				state: "working",
 				watching: false,
 				generation: 0,
+				collectAbort: new AbortController(),
 			};
 			if (deps.subscribeSupervisorEvents) {
 				job.unsubscribeRpcEvents = deps.subscribeSupervisorEvents(
@@ -2840,6 +3407,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return [...jobs.values()];
 		},
 
+		async releaseCrossMachineChildren() {
+			if (disposed) return [];
+			const released: string[] = [];
+			for (const job of [...jobs.values()]) {
+				// No host ⇒ a local child. It dies with this process, so the drain and
+				// the retire below still own it exactly as before.
+				if (!job.host) continue;
+				released.push(job.name);
+				// 1. stamp the record/ledger while the facts still exist.
+				try { await job.retire?.({ cause: "session-shutdown" }); } catch { /* the marker is best-effort on the way out */ }
+				// 2. stop waiting on it (ref'd poll timers would keep `pi --print` alive).
+				try { job.collectAbort.abort(); } catch { /* already aborted */ }
+				// 3. forget it, so neither the drain nor the retire loop touches it.
+				jobs.delete(job.name);
+			}
+			if (released.length > 0) refreshUi();
+			return released;
+		},
+
 		statusTui() {
 			return board.getTui?.();
 		},
@@ -2923,26 +3509,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		notifyParentRunEnd() {
-			// Nothing held ⇒ no timer at all (the common idle-end case).
-			if (disposed || !parentRunActive || outbox.length === 0) return;
-			if (settleFallbackTimer) return;
-			let live = true;
-			const schedule = deps.scheduleSettleFallback ?? defaultNoticeOverflow;
-			settleFallbackTimer = schedule(SETTLE_FALLBACK_MS, () => {
-				if (!live) return;
-				live = false;
-				settleFallbackTimer = undefined;
-				// `agent_settled` won the race, a new run started, or the runtime is gone:
-				// the boundary is not ours to take.
-				if (disposed || !parentRunActive) return;
-				// The settle boundary never arrived (aborted run, torn-down session). Take
-				// the boundary this notice would otherwise never get. `flushOutbox` still
-				// stops after the first `triggerTurn` notice (D2), so this is one waking
-				// message, exactly like a settle.
-				parentRunActive = false;
-				flushOutbox();
-				refreshUi();
-			});
+			armSettleFallback();
 		},
 
 		publishRunActivity(nodeId: string) {
@@ -2964,6 +3531,33 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			parentRunActive = false;
 			flushOutbox();
 			refreshUi();
+		},
+
+		holdableChildren,
+
+		takeHeldNotice,
+
+		commitHeldNotice,
+
+		releaseHeldNotice,
+
+		holdOwnsBoundary() {
+			// The settle boundary is HERE; the rescue timer exists only for a boundary that
+			// never arrives. Leaving it armed would let it fire inside a ten-minute hold and
+			// deliver (and latch) the very notice the boundary is waiting to announce.
+			cancelSettleFallback();
+		},
+
+		holdReturnsBoundary() {
+			// #418: the hold is done with the boundary. It cancelled the rescue when it took
+			// over, so the timer has to be armed again in its ORIGINAL form — otherwise the
+			// window between "the hold returned" and "the host settles" has no rescue at all,
+			// and a settle the host never emits parks the notice until something else pushes
+			// it. Same guards as `agent_end`: a delivered hold leaves an empty outbox (no
+			// timer), and the continuation it asked for cancels this timer via
+			// `notifyParentRunStart`. `armSettleFallback` is the one arming path, so the
+			// re-arm cannot drift from the first arm.
+			armSettleFallback();
 		},
 
 		noticeQueueStats(): NoticeQueueStats {

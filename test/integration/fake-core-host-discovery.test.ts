@@ -200,7 +200,14 @@ else if (process.argv.includes("--list-models")) {
 		request: async <T = unknown>(method: HcMethod, params: Record<string, unknown> = {}): Promise<T> =>
 			(await real.request<T>(method, params)) as T,
 	};
-	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-discover-1", pollIntervalMs: 5 });
+	// #423: these cases are about ADMISSION and DISCOVERY (which node/pi/legion a
+	// `{}` entry resolves to). The fake core answers `terminal.run` but its fake
+	// `pi` never writes a transcript, so the start-up gate could only ever wait out
+	// its deadline on a launch that is not under test — the same reason the local
+	// unit harness passes 0 (`test/unit/terminal-supervisor.test.ts`). The gate
+	// itself is covered by `remote-child-fate.test.ts` (integration T2/T3b) and
+	// `test/unit/remote-launch-refusal.test.ts`.
+	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-discover-1", pollIntervalMs: 5, remoteStartupConfirmMs: 0 });
 	const wire = (): WireRequest[] => {
 		if (!existsSync(wirePath)) return [];
 		return readFileSync(wirePath, "utf8")
@@ -555,8 +562,10 @@ test("xm-dispatch D2: an inherited extension that machine cannot load is SKIPPED
 	const handle = await h.supervisor.spawnChild(
 		spawnInput(h, target, { agent: { ...agent(), extensions: missing } }),
 	);
-	// The launch HAPPENED: no refusal, one terminal, and neither `-e` pair survived.
-	const runs = h.wireFor("terminal.run");
+	// The launch HAPPENED: no refusal, one child terminal, and neither `-e` pair
+	// survived. (#409: a cross-machine launch also creates the machine's anchor, so
+	// the child's own request is the one identified by name.)
+	const runs = h.wireFor("terminal.run").filter((params) => params.name !== "lgl-anchor");
 	assert.equal(runs.length, 1, "a skipped extension must not block the launch");
 	const argv = runs[0]?.argv as string[];
 	assert.ok(!argv.includes(missing[0] as string), "the unmappable pair goes, it is not handed to pi");

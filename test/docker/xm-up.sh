@@ -25,7 +25,15 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+# $AGENT is the HOST agent dir (the credential SOURCE); CAGENT is where pi inside
+# the containers reads it. They are not the same path: the containers run with
+# `-e HOME=/root` (see step 3), so a harness that mounted into "$AGENT" only worked
+# on a host whose HOME was /root — on any other host the mounts landed in a
+# directory pi never reads, `/root/.pi/agent/models.json` did not exist, and
+# `pi --list-models` answered "No models available" (the self-check then blamed a
+# settings overwrite). One variable, so a future HOME change touches one line.
 AGENT="${AGENT:-$HOME/.pi/agent}"
+CAGENT="${XM_CONTAINER_AGENT_DIR:-/root/.pi/agent}"
 
 XM_IMAGE="${XM_IMAGE:-pi-legion-xm:latest}"
 XM_NET="${XM_NET:-xm-net}"
@@ -164,12 +172,12 @@ xm_run vol-create docker volume create "$XM_VOL" >/dev/null
 # 数组展开写成 ${arr[@]+"${arr[@]}"}：空数组在 bash 3.2（macOS 自带）下 set -u 会报 unbound。
 CRED_MOUNTS=()
 if [ -f "$AGENT/auth.json" ]; then
-  CRED_MOUNTS+=(-v "$AGENT/auth.json:$AGENT/auth.json:ro")
+  CRED_MOUNTS+=(-v "$AGENT/auth.json:$CAGENT/auth.json:ro")
 fi
 # F7: models-store.json 是 pi 的运行期缓存，**不能**两个容器 rw 挂同一个宿主文件
 # （两边写同一份缓存 = 互相踩）。每个容器一份副本，各挂各的。
-PARENT_MODELS_MOUNT=(-v "$XM_MODELS_DIR/parent/models.json:$AGENT/models.json:ro")
-REMOTE_MODELS_MOUNT=(-v "$XM_MODELS_DIR/remote/models.json:$AGENT/models.json:ro")
+PARENT_MODELS_MOUNT=(-v "$XM_MODELS_DIR/parent/models.json:$CAGENT/models.json:ro")
+REMOTE_MODELS_MOUNT=(-v "$XM_MODELS_DIR/remote/models.json:$CAGENT/models.json:ro")
 if [ -f "$AGENT/models-store.json" ]; then
   cp "$AGENT/models-store.json" "$XM_MODELS_DIR/parent/models-store.json"
   if [ "$XM_MODEL_SCENARIO" = "model-missing" ]; then
@@ -183,8 +191,8 @@ if [ -f "$AGENT/models-store.json" ]; then
     cp "$AGENT/models-store.json" "$XM_MODELS_DIR/remote/models-store.json"
     step "models-store copied per container (parent/remote)"
   fi
-  PARENT_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/parent/models-store.json:$AGENT/models-store.json")
-  REMOTE_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/remote/models-store.json:$AGENT/models-store.json")
+  PARENT_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/parent/models-store.json:$CAGENT/models-store.json")
+  REMOTE_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/remote/models-store.json:$CAGENT/models-store.json")
 else
   step "warn: $AGENT/models-store.json 不存在，容器里模型库可能为空"
 fi
@@ -233,9 +241,9 @@ else
   XM_SETTINGS_PATCH_REMOTE="$XM_SETTINGS_PATCH"
 fi
 xm_run settings-parent docker exec "$XM_PARENT" \
-  node /plugin/test/docker/xm/settings-merge.mjs /root/.pi/agent/settings.json "$XM_SETTINGS_PATCH"
+  node /plugin/test/docker/xm/settings-merge.mjs "$CAGENT/settings.json" "$XM_SETTINGS_PATCH"
 xm_run settings-remote docker exec "$XM_REMOTE" \
-  node /plugin/test/docker/xm/settings-merge.mjs /root/.pi/agent/settings.json "$XM_SETTINGS_PATCH_REMOTE"
+  node /plugin/test/docker/xm/settings-merge.mjs "$CAGENT/settings.json" "$XM_SETTINGS_PATCH_REMOTE"
 
 # ------------------------------------ 5. 共享 bare origin + 两端同名 origin
 # 预检（cross-machine-preflight.ts）要求两端 origin 归一化后同名 → 同一个卷 + 同一路径。

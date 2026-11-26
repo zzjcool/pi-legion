@@ -318,6 +318,40 @@ export class RoutingSupervisor implements LegionSupervisor {
 	}
 
 	/**
+	 * #441-B: the one answer to "can this host see this child's tools?".
+	 *
+	 * `terminal` → `false` (contract D12: that backend folds no tool events, local or
+	 * cross-machine — this is the local-terminal-centurion case the row itself cannot
+	 * express, because a LOCAL terminal child records no `remoteTerminal`); the two
+	 * process-local backends → `true`. Before the first spawn there is no owner, so
+	 * both are asked, exactly like {@link isAlive}.
+	 */
+	observesToolEvents(name: string): boolean {
+		const owner = this.owners.get(name);
+		if (owner === "terminal") return false;
+		if (owner === "inprocess" || owner === "rpc") return true;
+		if (this.terminal?.isAlive(name) === true) return false;
+		return this.inprocess.isAlive(name) || this.rpc.isAlive(name);
+	}
+
+	/**
+	 * #441-B/C: route the container's status word to the ONE backend that can answer.
+	 *
+	 * Only the `terminal` backend hosts a child inside something that reports a
+	 * program status; `rpc`/`inprocess` children answer through their in-flight
+	 * stack instead, so this returns `undefined` for them (not a fact, and the
+	 * detector never treats it as "idle"). Same owner lookup shape as
+	 * {@link lastEventAt}, and the same rule: an absent terminal backend cannot
+	 * answer.
+	 */
+	programState(name: string): Promise<string | undefined> {
+		const owner = this.owners.get(name);
+		if (owner === "terminal") return this.terminalSeam?.programState?.(name) ?? Promise.resolve(undefined);
+		if (owner === "inprocess" || owner === "rpc") return Promise.resolve(undefined);
+		return this.terminal?.isAlive(name) === true ? (this.terminalSeam?.programState?.(name) ?? Promise.resolve(undefined)) : Promise.resolve(undefined);
+	}
+
+	/**
 	 * Forward the stall notice's event age (D2) the same way, so the detector runs
 	 * against whichever backend actually hosts the child.
 	 */
@@ -349,6 +383,22 @@ export class RoutingSupervisor implements LegionSupervisor {
 
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void> {
 		return this.backendFor(name).retire(name, opts);
+	}
+
+	/**
+	 * E2: release every backend's session-scoped transport. Best-effort and
+	 * isolated per backend: one backend failing to close must not leave another's
+	 * `hc connect` attached, which is the state that hangs `pi --print`.
+	 */
+	shutdown(): void {
+		const backends: Array<LegionSupervisor | undefined> = [this.rpc, this.inprocess, this.terminalSeam];
+		for (const backend of backends) {
+			try {
+				backend?.shutdown?.();
+			} catch {
+				/* closing a transport is not a verdict, and this runs on the way out */
+			}
+		}
 	}
 
 	onEvent(

@@ -30,7 +30,9 @@ import {
 	normalizeHost,
 	classifyRemoteStartupProbe,
 	probeRemoteChild,
+	probeRemoteStartupFailure,
 	remoteFateNextStep,
+	remoteStartupFailureMessage,
 	remoteStartupProbeLine,
 	REMOTE_STARTUP_PROBE_TIMEOUT_S,
 	removeRemoteDir,
@@ -38,6 +40,7 @@ import {
 	remoteDirFor,
 	remotePreflight,
 	terminalAddress,
+	terminalProgramEnd,
 	applyRemoteModelFallback,
 	planRemoteModelFallback,
 	remoteModelMissingError,
@@ -55,6 +58,11 @@ import {
 	preflightDelivery,
 	type DeliveryPreflightReport,
 } from "../runs/cross-machine-preflight.ts";
+import {
+	ANCHOR_TERMINAL_NAME,
+	LEGION_ANCHOR_LABEL,
+	anchorLocalAddress,
+} from "../runs/parent-anchor.ts";
 import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
@@ -104,17 +112,60 @@ const ILLEGAL_NAME_CHARS = /[^a-z0-9_-]/g;
 export const SETTLE_POLL_INTERVAL_MS = 1_000;
 
 /**
- * How long a REMOTE launch waits for proof that the child survived start-up
- * (`docs/contracts/remote-child-fate-v1.md` §4).
+ * #460: consecutive transport failures `waitSettled` tolerates before it answers
+ * `unreachable`, on top of the caller's own deadline.
  *
- * The window exists because a remote `pi` that dies during start-up (a missing
- * `--extension`, a model the machine cannot use) exits 1 and NEVER creates its
- * session file: the parent's only observable afterwards is `not_found`, minutes
- * later, with no exit code and no words. Eight seconds is long enough for a
- * healthy child to open its transcript on a slow machine and short enough that
- * a launch still fails while the operator is watching.
+ * Three reads at the production cadence is ~3 s of one dropped `hc` connection —
+ * long enough for the socket to be re-established, short enough that a caller is
+ * told "I cannot see it" instead of being held for the whole turn budget.
  */
-export const REMOTE_STARTUP_CONFIRM_MS = 8_000;
+export const UNREACHABLE_STRIKE_LIMIT = 3;
+
+/**
+ * #460: poll cadence once an outage has ALREADY been announced to the caller.
+ *
+ * The first `unreachable` verdict is answered fast (a few seconds: the caller must
+ * learn the channel is down), but the outage is then established fact — answering
+ * early on every later call is what would turn the watch's immediate re-arm
+ * (`runtime.ts` `rearmLiveWatch`, which is only not a busy loop because the collect
+ * blocks) into a ~3 s retry loop. From the second epoch on, the wait polls at this
+ * cadence and answers at the caller's deadline, i.e. exactly the cost a live child
+ * costs. The issue's "no unbounded retry" is satisfied here, not only per wait.
+ */
+export const UNREACHABLE_SLOW_POLL_MS = 30_000;
+
+/** Hard cap on slow polls for a caller that asked for no timeout at all (`deadline = Infinity`). */
+const UNREACHABLE_SLOW_MAX_POLLS = 8;
+
+/**
+ * #460: the `reason` on a `SettleResult` that carries `unreachable`.
+ *
+ * A stable token (not prose): the orchestrator keys its collect disposition off
+ * it, and its own user-facing text lives in
+ * `SUPERVISION_UNREACHABLE_REASON` there. It must never be confused with
+ * `timeout` — that one means "the child is alive and still working", this one
+ * means "this host cannot see the child at all".
+ */
+export const SUPERVISION_UNREACHABLE_REASON = "supervision unreachable";
+
+/**
+ * How long a REMOTE launch waits for proof that the child STARTED
+ * (`docs/contracts/remote-child-fate-v1.md` §4, revised by #423).
+ *
+ * The window exists because a remote `pi` that never starts leaves the parent
+ * with no observable at all: no exit code, no transcript, no error — only a live
+ * terminal. A missing `--extension`, a model the machine cannot use, and an
+ * interactive prompt the child stopped at ("Trust project folder?", #424) all
+ * look exactly like that, and the parent's next observable used to be
+ * `not_found` minutes later with nothing to act on.
+ *
+ * #423 turned the deadline from a warning into a refusal, so the number is now
+ * the operator's patience as well as the machine's start-up budget: long enough
+ * for a cold `node` + pi first turn on a loaded machine, and bounded by the
+ * issue's 30 s ceiling so a launch still fails while somebody is watching. It is
+ * read once per launch, and a receipt always says how long it waited.
+ */
+export const REMOTE_STARTUP_CONFIRM_MS = 20_000;
 
 /** Poll cadence inside that window. */
 export const REMOTE_STARTUP_CONFIRM_POLL_MS = 500;
@@ -186,6 +237,25 @@ interface HcSendResult {
 	status?: string | null;
 }
 
+/**
+ * #460: what this backend currently knows about a child's supervision.
+ *
+ * `unreachable` is a statement about THIS HOST's observation channel, never about
+ * the child: the `hc` connection dropped (or the heartbeat read threw), so the
+ * last fact we hold may be minutes old. It is deliberately NOT a terminal state —
+ * the address, the record and the worktree all stay, `isAlive` stays true (the
+ * process may well be running over there) and a later successful read returns the
+ * child to `live`.
+ */
+export type TerminalChildState = "live" | "unreachable" | "finished" | "retired";
+
+/** The one supervision read callers/tests may take of a tracked child (#460). */
+export interface TerminalSupervision {
+	state: TerminalChildState;
+	/** Present exactly while `state === "unreachable"`. */
+	unreachable?: { detail: string; since: number; strikes: number; epochs: number };
+}
+
 interface TerminalChildRecord {
 	/** Legion registry key (the orchestrator's node name). */
 	readonly name: string;
@@ -219,10 +289,18 @@ interface TerminalChildRecord {
 	remoteDir?: string;
 	/** The address the core really holds for this terminal (`host/name`). */
 	remoteTerminal?: string;
-	/** The start-up gate timed out without proving the child dead (§4). */
-	startupUnconfirmed?: boolean;
 	tempDir?: string;
-	state: "live" | "finished" | "retired";
+	state: TerminalChildState;
+	/**
+	 * #460: why the supervision channel is down, and for how long.
+	 *
+	 * Only set while `state === "unreachable"`; cleared by the first successful
+	 * read. `strikes` is the CONSECUTIVE transport failures that produced the
+	 * current marker (reset on success), `since` is when the current outage began,
+	 * and `epochs` counts how many waits have already ANSWERED `unreachable` for it
+	 * (0 = not announced yet, so the next answer is still the fast one).
+	 */
+	unreachable?: { detail: string; since: number; strikes: number; epochs: number };
 	/** Last observed turn counter. */
 	turn: number;
 	/** Last observed 7501 status word (`idle`, `working`, `done`, …). */
@@ -242,15 +320,31 @@ export interface TerminalSupervisorOptions {
 	/** Environment read for host detection, parent identity and PATH/HOME (D5). */
 	env?: NodeJS.ProcessEnv;
 	/**
-	 * Value for the `legion.run` label (D6), when the caller knows it.
+	 * Fallback value for the `legion.run` label and the terminal/mirror names (D6/D7/D9),
+	 * used only when a spawn carries no {@link SpawnInput.runId}.
 	 *
-	 * Omitted when unknown: a run id is a fact, and this backend will not derive
-	 * one from a path or a node name. The wiring in `index.ts` has no run id at
-	 * supervisor-construction time, so the label is simply absent there.
+	 * Omitted when unknown: a run id is a fact, and this backend will not derive one
+	 * from a path or a node name. Production builds one supervisor per process,
+	 * BEFORE any run exists, so it passes nothing here — every real launch names its
+	 * run on the spawn itself. This option remains the seam for tests (and for a
+	 * caller that really owns one run for the supervisor's whole lifetime).
 	 */
 	runId?: string;
 	/** Poll cadence for `waitSettled`; tests shrink it, production uses 1 s. */
 	pollIntervalMs?: number;
+	/**
+	 * #460: how many CONSECUTIVE transport failures `waitSettled` tolerates before
+	 * it hands the caller an `unreachable` result instead of polling on.
+	 *
+	 * A transport failure is retried (the connection often recovers on its own, and
+	 * the child never stopped running), but not forever: the issue's "不做" list
+	 * rules out an unbounded retry, and a caller that never hears back cannot tell
+	 * a blip from a dead machine. Defaults to
+	 * {@link UNREACHABLE_STRIKE_LIMIT}; every failure is visible on the record
+	 * (`supervision()`), so the state is readable whether this budget is spent or
+	 * not.
+	 */
+	unreachableStrikeLimit?: number;
 	/**
 	 * Bound on the post-`terminal.run` start-up gate of a REMOTE launch (§4).
 	 *
@@ -285,18 +379,44 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private readonly runId: string | undefined;
 	private readonly pollIntervalMs: number;
 	private readonly remoteStartupConfirmMs: number;
+	/** #460: consecutive transport failures `waitSettled` retries before answering `unreachable`. */
+	private readonly unreachableStrikeLimit: number;
 	private client: HcClient | undefined;
 	/** Parent space label; `null` = not read yet, `undefined` = no space known. */
 	private parentSpace: string | null | undefined = null;
+	/**
+	 * Machine → the anchor terminal already established on it (#409).
+	 *
+	 * Process-scoped on purpose: the anchor is a fact about a CORE, not about one
+	 * launch, so a centurion dispatching N children to one machine asks once. A
+	 * second process asks again (one `terminal.get`) and reuses the same terminal —
+	 * the name, not this cache, is what makes it shared.
+	 */
+	private readonly anchors = new Map<string, string>();
 
 	constructor(options: TerminalSupervisorOptions = {}) {
 		this.env = options.env ?? process.env;
 		this.runId = options.runId;
 		this.pollIntervalMs = options.pollIntervalMs ?? SETTLE_POLL_INTERVAL_MS;
 		this.remoteStartupConfirmMs = options.remoteStartupConfirmMs ?? REMOTE_STARTUP_CONFIRM_MS;
+		this.unreachableStrikeLimit = options.unreachableStrikeLimit ?? UNREACHABLE_STRIKE_LIMIT;
 		this.clientFactory =
 			options.clientFactory ??
 			(() => hcCliClient({ env: this.env, ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}) }));
+	}
+
+	/**
+	 * #414: the run id THIS spawn belongs to — the run that dispatched the child.
+	 *
+	 * The spawn's own value wins: production constructs ONE supervisor before any
+	 * run exists, so the constructor value cannot name the run a child belongs to.
+	 * Absent everywhere returns `undefined` on purpose — the caller then gets the
+	 * legacy shape (`lgl-<handle>`, `<mirrorRoot>/no-run/<handle>`, no run label),
+	 * never an invented run id.
+	 */
+	private runIdFor(input: SpawnInput): string | undefined {
+		const dispatched = typeof input.runId === "string" ? input.runId.trim() : "";
+		return dispatched.length > 0 ? dispatched : this.runId;
 	}
 
 	// ── spawn (D4/D5/D6/D7) ─────────────────────────────────────────────
@@ -342,12 +462,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 			);
 		}
 		const previous = this.children.get(input.name);
-		if (previous && previous.state === "live") {
+		if (previous && (previous.state === "live" || previous.state === "unreachable")) {
 			// Review M8: an address, not just a name. A name whose retire failed stays
 			// live (that is deliberate — the terminal may really be running), so this
 			// refusal is the operator's only clue. `vps/lgl-…` says WHICH machine to
 			// clear; a bare `root.worker-0` says only that something is stuck.
+			//
+			// #460: an `unreachable` child holds its terminal too. Letting a new spawn
+			// take the name would be the accident the issue measured set up again — the
+			// first child may be working over there while the second one runs here.
 			const previousAddress = terminalAddress(previous);
+			if (previous.state === "unreachable") {
+				throw new SubagentError(
+					`child is already registered and its terminal is still held: ${previousAddress} (supervision unreachable: ${previous.unreachable?.detail ?? "no detail"} — the child may still be running there; retry \`collect\`/\`wait\`, or \`stop\` to kill it)`,
+					ErrorCodes.NAME_TAKEN,
+				);
+			}
 			throw new SubagentError(
 				previousAddress === input.name
 					? `child is already registered and alive: ${input.name}`
@@ -356,7 +486,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 			);
 		}
 		const client = await this.ensureClient();
-		const terminalNameForChild = terminalName(this.runId, input.name);
+		const spawnRunId = this.runIdFor(input);
+		const terminalNameForChild = terminalName(spawnRunId, input.name);
 		// Absent/blank = this host (contract D4). Normalized ONCE here: `on`, the
 		// record and every later address all read this one value.
 		const host = normalizeHost(input.host);
@@ -530,7 +661,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 			writeOwnerFile(path.join(tempDir, TEMP_OWNER_FILE));
 
 			if (target !== undefined) {
-				remoteDir = remoteDirFor(target, this.runId, input.name);
+				remoteDir = remoteDirFor(target, spawnRunId, input.name);
 				await ensureRemoteDir(client, target, remoteDir);
 				// m10: from here on, a failure leaves an empty directory behind unless it
 				// is swept. `hc` has no `file.remove`, so this flag is what allows the
@@ -577,6 +708,18 @@ export class TerminalSupervisor implements LegionSupervisor {
 				...buildInput,
 				tempDir,
 				includeTask: false,
+				// #424: a terminal child is launched into a directory LEGION just made (a
+				// fresh worktree of this checkout, or one on the other machine). A TUI `pi`
+				// with no trust decision for that cwd stops at "Trust project folder?"
+				// BEFORE it writes a session file, so the parent sees a live terminal that
+				// never starts (`working` until the stall detector gives up) and a human
+				// only has to press Enter. `--approve` is pi's per-RUN trust: it answers
+				// that question for this one process and does NOT write the trust store,
+				// global settings or any user-level file (unlike "Trust parent folder" or
+				// `defaultProjectTrust: always`), so the security boundary stays where it
+				// was. Forced here, not inherited from the caller: `subagents.rpc.approve`
+				// stays the opt-in for the HEADLESS rpc backend, which has no UI to block.
+				approve: true,
 				...(rewritePath ? { pathRewrite: rewritePath } : {}),
 			});
 			if (target !== undefined && remoteDirPath !== undefined) {
@@ -853,13 +996,67 @@ export class TerminalSupervisor implements LegionSupervisor {
 			}
 		}
 
+		// #410/#432: the LAUNCH DIRECTORY of a LOCAL child is resolved, prepared and
+		// verified HERE — before `terminal.run`, not after it. `terminal.run` cannot
+		// chdir into a path that is absent, and the core reports that as a fact about
+		// the PROGRAM (`spawn_failed: cannot start "<node>": No such file or
+		// directory`), which sends the operator after an interpreter that is right
+		// there. Measured on a real core (`hc 0.1.21`):
+		//
+		//   $ hc run --cwd /nope -- /usr/bin/node -v
+		//   {"error":{"kind":"spawn_failed","message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
+		//
+		// A REMOTE child's cwd is a path on the OTHER machine (D13) and is asked about
+		// there (`remotePreflight`, D6/D9). This is the LOCAL half of that posture:
+		// #410 could only re-explain the core's failure afterwards, and #432 measured
+		// what that leaves — a cwd that is RELATIVE is resolved by the core against
+		// the CORE's own directory (a directory that exists here is `~real` for the
+		// core), so the same launch was still reported as "cannot start <node>".
+		// `preflightLocalLaunch` therefore answers three questions before any
+		// terminal exists: what path does the child really get (absolute), is it a
+		// directory on THIS machine, and what part of it does this launch own.
+		let launchCwd: string;
+		if (target !== undefined) {
+			launchCwd = remoteWorktree?.path ?? target.cwd;
+		} else {
+			try {
+				launchCwd = this.preflightLocalLaunch({
+					cwd: input.cwd,
+					// The one program a local launch carries (`argv[0]` below): named in the
+					// refusal only to say it is NOT the problem.
+					program: process.execPath,
+					terminal: terminalAddress({ terminalName: terminalNameForChild }),
+					// A worktree launch owns the PARENT chain of its tree, never the tree: it
+					// belongs to `git worktree add`, and handing git an existing directory is a
+					// refusal (the same split `ensureRemoteDir` keeps on the remote side).
+					createParent: input.worktree === true,
+				});
+			} catch (error) {
+				// The refusal is this launch's verdict, so nothing of it may survive: the
+				// temp dir (system prompt + owner file) is dropped exactly like the argv
+				// builder's own failure path below. No terminal, no mirror, no record.
+				this.removeTempDir(tempDir);
+				throw error;
+			}
+		}
+
+		// #409: every terminal this backend creates must have a parent, and the address
+		// must be one the TARGET core resolves (see `parent-anchor.ts` for the three
+		// measured spellings). Resolved AFTER the preflights so a launch that is about to
+		// be refused never leaves an anchor on a machine it will not use.
+		const launchParent = await this.resolveLaunchParent(client, host, target?.cwd ?? launchCwd);
+
 		const params = {
 			name: terminalNameForChild,
 			argv,
 			// D6/D11: a remote child starts in the REMOTE directory — its own tree when
 			// one was created for it, the target's checkout otherwise. It is never
 			// `this.cwd` and never a local path that happens to exist here.
-			cwd: target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd,
+			// LOCAL (#432): always the ABSOLUTE path `preflightLocalLaunch` verified —
+			// the core would otherwise resolve a relative value against its OWN
+			// directory, which is how a cwd that exists here failed there as "cannot
+			// start <node>".
+			cwd: launchCwd,
 			// Absent for a remote child (see `childEnv`): the core's own environment is the
 			// only truthful one over there. Local launches always have a value, so the
 			// params this machine produces keep their exact shape.
@@ -868,6 +1065,14 @@ export class TerminalSupervisor implements LegionSupervisor {
 				return env === undefined ? {} : { env };
 			})()),
 			labels: await this.childLabels(input, remote ? host : undefined),
+			// #409: the parent, in the namespace of the core that receives this request.
+			// LOCAL: this process's own terminal (the same value `caller` carries, made
+			// explicit so the record does not depend on the core's default). REMOTE: the
+			// target machine's anchor — the caller's local id is meaningless there
+			// (`no terminal "t1t"`) and a machine-/core-qualified spelling is refused by
+			// the SENDING core (`unknown machine`). Absent only when no parent could be
+			// named, and the reason travels on the handle (#409 req 2).
+			...(launchParent.parent !== undefined ? { parent: launchParent.parent } : {}),
 			// Constraint 5: `caller` is a BARE terminal name in THIS core's
 			// namespace. A remote terminal lives in another one, where that id either
 			// does not exist or names somebody else's terminal — so a remote request
@@ -890,7 +1095,17 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// the case the spike's "cwd missing vs program missing" note makes least
 			// informative, and dropping the machine from the message is the difference
 			// between "look at vps" and "look at ... somewhere".
-			throw this.failure("terminal.run", terminalAddress({ terminalName: terminalNameForChild, host }), error);
+			// #410: a LOCAL launch hands its cwd over, so a `spawn_failed` that is
+			// really about a missing directory says that instead of blaming `node`.
+			// A REMOTE launch never gets this context: its cwd is a path on the OTHER
+			// machine (D13), so asking THIS filesystem about it would answer a
+			// different question than the one the core just failed to.
+			throw this.failure(
+				"terminal.run",
+				terminalAddress({ terminalName: terminalNameForChild, host }),
+				error,
+				target === undefined ? { cwd: launchCwd, program: argv[0] ?? "" } : undefined,
+			);
 		}
 
 		// An address in the reply is the proof the terminal really started. Later
@@ -920,16 +1135,36 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// creates its session file: without this gate the parent's only observable is
 		// `not_found` a collect later. Asked HERE, the same fact fails the launch with
 		// the child's own screen line. Silence is not death, so a deadline only warns.
-		let startupUnconfirmed = false;
 		if (target !== undefined && remoteDir !== undefined && remoteTerminalAddress !== undefined && this.remoteStartupConfirmMs > 0) {
-			startupUnconfirmed = await this.confirmRemoteStartup({
-				client,
-				target,
-				address: remoteTerminalAddress,
-				remoteDir,
-				argv,
-				cwd: typeof params.cwd === "string" ? params.cwd : target.cwd,
-			});
+			// #423: this is now a REFUSAL, not a warning. A launch that cannot prove
+			// the child started has already failed; leaving a `working` record behind
+			// is the failure mode the issue measured (a shell that answered `working`
+			// for 30 minutes and then retired as `execution: success`).
+			try {
+				await this.confirmRemoteStartup({
+					client,
+					target,
+					address: remoteTerminalAddress,
+					remoteDir,
+					argv,
+					cwd: typeof params.cwd === "string" ? params.cwd : target.cwd,
+				});
+			} catch (error) {
+				// The refusal is the launch's verdict, so the evidence it needs (screen,
+				// hc error) has already been captured. What is left is the partially
+				// created state: the mirrored argv dir and the tree this launch made are
+				// unusable by anybody (the child never started), and leaving the tree
+				// behind would make the re-dispatch fail on `git worktree add` — the
+				// other half of req 6.
+				//
+				// #460 req 3 needs nothing extra HERE: the `confirmRemoteStartup` refusal
+				// already killed and removed the terminal it created (#423 req 6), so a
+				// failed launch does not walk away from a live corpse on that path.
+				this.removeTempDir(tempDir);
+				await rollbackRemoteWorktree();
+				await rollbackRemoteDir();
+				throw error;
+			}
 		}
 		// D13: the ownership pair, in one value, so the record and the handle cannot
 		// disagree about which machine a path belongs to.
@@ -946,7 +1181,6 @@ export class TerminalSupervisor implements LegionSupervisor {
 			...(host ? { host } : {}),
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
-			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
 			...(tempDir ? { tempDir } : {}),
 			...worktreeFacts,
 			state: "live",
@@ -969,7 +1203,13 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// cannot find the child's transcript in a later process.
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
-			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
+			// #409: the parent this launch used, in the target core's namespace, and the
+			// reason when there is none. The orchestrator persists both on the child
+			// record (parentRunId travels beside them), so the chain
+			// child terminal → parent terminal → run can be walked from `run.json`
+			// alone.
+			...(launchParent.parent !== undefined ? { parentTerminal: launchParent.parent } : {}),
+			...(launchParent.absent !== undefined ? { parentAbsent: launchParent.absent } : {}),
 			...(launchWarnings.length > 0 ? { warnings: launchWarnings } : {}),
 		};
 	}
@@ -1105,6 +1345,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 * not about the task. A timeout resolves
 	 * `{settled:false, abnormal:false, reason:"timeout"}` — it throws nothing and
 	 * kills nothing.
+	 *
+	 * #460: a TRANSPORT failure of the read is NOT a fact about the child. The
+	 * incident behind the issue: `terminal.get` answered `hc connect exited (code
+	 * 0)`, this method threw, the collect became `execution: failed`, the run was
+	 * re-dispatched — and the original child, still working on the other machine,
+	 * finished its job and opened a second PR. So a failing read now moves the
+	 * record to `unreachable` (address, worktree and run record all kept), retries
+	 * up to `unreachableStrikeLimit` consecutive times, and — if the channel never
+	 * comes back within that budget or the caller's deadline — answers
+	 * `{settled:false, abnormal:false, reason:SUPERVISION_UNREACHABLE_REASON,
+	 * unreachable:{detail,strikes}}`. `abnormal:false` is the load-bearing part: no
+	 * caller may spell this as `failed`/`gone`. A read that succeeds afterwards
+	 * returns the child to `live` and tracking continues where it left off.
+	 *
+	 * Only CONFIRMED death still settles as death: `not_found` (the core no longer
+	 * knows the address), or the terminal itself reporting `finished`.
 	 */
 	async waitSettled(
 		name: string,
@@ -1118,17 +1374,50 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0
 			? Date.now() + timeoutMs
 			: Number.POSITIVE_INFINITY;
+		/** Consecutive read failures; ANY successful read resets it (#460). */
+		let strikes = 0;
+		/** Slow polls spent in THIS wait once the outage was already announced (#460). */
+		let slowPolls = 0;
 		for (;;) {
 			let facts: HcTerminalFacts;
 			try {
 				facts = await this.readTerminal(child);
 			} catch (error) {
 				if (isNotFound(error)) {
+					// Confirmed death: the core does not know this address any more.
 					child.state = "finished";
+					this.clearUnreachable(child);
 					return { settled: false, abnormal: true, reason: "terminal not found" };
 				}
-				throw this.failure("terminal.get", child.terminalName, error);
+				if (child.state === "finished" || child.state === "retired") {
+					// The record already says the child is over (the core reported `finished`,
+					// or this parent retired it while this wait was in flight). A failing read
+					// must not resurrect it: `unreachable` here would make `isAlive` true again,
+					// hold the name forever and paint a dead child as possibly-working.
+					return { settled: false, abnormal: true, reason: `terminal ${child.state}` };
+				}
+				strikes += 1;
+				const detail = describeFailure(error);
+				const announced = (child.unreachable?.epochs ?? 0) > 0;
+				this.markUnreachable(child, detail, strikes);
+				const remainingFromFailure = deadline - Date.now();
+				if (announced) slowPolls += 1;
+				const outOfBudget = remainingFromFailure <= 0 || (announced && slowPolls >= UNREACHABLE_SLOW_MAX_POLLS);
+				// The FIRST epoch answers as soon as the strike budget is spent (the caller has
+				// to learn the channel is down). Later epochs only answer at the caller's own
+				// deadline, at the slow cadence: the outage is known, and a caller that re-arms
+				// on `running` must not be handed a ~3 s retry loop.
+				if (outOfBudget || (!announced && strikes >= this.unreachableStrikeLimit)) {
+					return this.unreachableResult(child, detail, strikes);
+				}
+				const cadence = announced ? UNREACHABLE_SLOW_POLL_MS : this.pollIntervalMs;
+				const interruptedRetry = await this.sleep(Math.min(cadence, remainingFromFailure), signal);
+				if (interruptedRetry) {
+					return { settled: false, abnormal: false, reason: "aborted by parent" };
+				}
+				continue;
 			}
+			strikes = 0;
 			this.applyFacts(child, facts);
 			if (facts.state === "finished") {
 				return {
@@ -1155,7 +1444,77 @@ export class TerminalSupervisor implements LegionSupervisor {
 
 	isAlive(name: string): boolean {
 		const child = this.children.get(name);
-		return child !== undefined && child.state === "live";
+		// #460: `unreachable` is alive for every caller that matters. The process was
+		// never observed to end — only this host's VIEW of it did — so `status` must
+		// still list the child and `stop` must still try to reach its address. This is
+		// exactly the flag that used to answer `false`, which turned "I cannot see it"
+		// into "it is gone" and re-dispatched a living child.
+		return child !== undefined && (child.state === "live" || child.state === "unreachable");
+	}
+
+	/**
+	 * #460: the supervision facts for one child, for callers (and tests) that must
+	 * tell "alive" from "cannot be seen right now".
+	 *
+	 * This is the RECORD-side view: `execution.reason` on the collect/status surface
+	 * is what an operator reads (`SUPERVISION_UNREACHABLE_REASON`), and `stop` works
+	 * off `isAlive`. Nothing in `src/` consumes this accessor yet — a UI that wants
+	 * to paint the outage as its own state (instead of `running` + a long reason)
+	 * reads it here.
+	 *
+	 * `undefined` means this backend tracks no such child. An `unreachable` state
+	 * carries the transport failure, when the outage began and how many waits have
+	 * already reported it, and is cleared by the next successful read.
+	 */
+	supervision(name: string): TerminalSupervision | undefined {
+		const child = this.children.get(name);
+		if (!child) return undefined;
+		return {
+			state: child.state,
+			...(child.unreachable !== undefined ? { unreachable: { ...child.unreachable } } : {}),
+		};
+	}
+
+	/**
+	 * #441-B: this backend observes NO tool events (D12) — the absence is the point,
+	 * so it is answered explicitly instead of leaving callers to infer it from a
+	 * missing method.
+	 */
+	observesToolEvents(_name: string): boolean {
+		return false;
+	}
+
+	/**
+	 * #441-B/C: the child's own program-status word, read on demand with ONE
+	 * `terminal.get`.
+	 *
+	 * The stall detector's question is "is anything in flight", and this backend
+	 * observes no tool events (D12) — but the terminal the child runs in does report
+	 * a program status (`working` while a tool/generation runs, `idle` at the
+	 * prompt, `blocked` on an approval). That word is what lets a 20-minute compile
+	 * stay a compile instead of becoming a stall notice.
+	 *
+	 * Deliberately a PURE READ: it does not fold the answer into the record
+	 * (`applyFacts` would also move `turn`/`state`, and a stall probe must not
+	 * advance this backend's settle bookkeeping). Every failure — no such child, a
+	 * dead terminal, an unreachable core, a reply without the field — is
+	 * `undefined`, because "no fact" is exactly what the caller must be told: it
+	 * stays silent rather than inventing an idle child.
+	 *
+	 * Asked only by the postman, only once a child's L2 radius has already elapsed
+	 * (bounded by the notice cap), never per tick.
+	 */
+	async programState(name: string): Promise<string | undefined> {
+		const child = this.children.get(name);
+		if (!child || child.state !== "live") return undefined;
+		try {
+			const client = await this.ensureClient();
+			const facts = await client.request<HcTerminalFacts>("terminal.get", { terminal: terminalAddress(child) });
+			const state = facts?.status?.state;
+			return typeof state === "string" ? state : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -1187,6 +1546,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const client = await this.ensureClient();
 		const address = terminalAddress(child);
 		try {
+			// #460: `stop` addresses the terminal by the address on the record, which is
+			// exactly what an `unreachable` child still holds. A kill that cannot be
+			// DELIVERED is not a kill that did not happen over there, so the record keeps
+			// its address (the throw below leaves `state` untouched) and the run row keeps
+			// the machine — which is what the orphan sweep kills by (legion#456). Losing
+			// the address here is how a real child became an untraceable orphan.
 			await client.request("terminal.kill", {
 				terminal: address,
 				...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
@@ -1205,12 +1570,36 @@ export class TerminalSupervisor implements LegionSupervisor {
 			/* D11: best effort — a killed terminal that cannot be removed is not an error */
 		}
 		child.state = "retired";
+		this.clearUnreachable(child);
 		// D9: the parent temp dir is ours to remove; the mirrored remote copy is
 		// not (same posture as a child's worktree/session — it stays put).
 		this.removeTempDir(child.tempDir);
 	}
 
 	// ── internals ───────────────────────────────────────────────────────
+
+	/**
+	 * Close the one `hc connect` child this backend owns (defect E2).
+	 *
+	 * The transport is session-scoped by design (one connection for every terminal
+	 * this backend addresses), so nothing else ever closes it — and a ref'd child
+	 * process keeps Node's event loop alive. `pi --print` ends its turn and lets the
+	 * loop drain, so a live `hc connect` after the last child retired was a headless
+	 * run that never exited. Called from `session_shutdown`, AFTER the children have
+	 * been retired (retire needs the transport).
+	 *
+	 * Idempotent and non-throwing: this runs on the way out, and a second close is a
+	 * no-op in `HcCliClient.close()`.
+	 */
+	shutdown(): void {
+		const client = this.client;
+		this.client = undefined;
+		try {
+			client?.close();
+		} catch {
+			/* closing a transport is not a verdict */
+		}
+	}
 
 	private async ensureClient(): Promise<HcClient> {
 		try {
@@ -1243,6 +1632,195 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 */
 	private callerFor(host: string | undefined): string | undefined {
 		return normalizeHost(host) === undefined ? this.caller : undefined;
+	}
+
+	/**
+	 * #432: the LOCAL counterpart of `remotePreflight` — the launch directory,
+	 * resolved and verified BEFORE `terminal.run`.
+	 *
+	 * The remote half of D6/D9 asks the TARGET machine `test -d <cwd>` and refuses
+	 * with `cwd '…' does not exist on <host>`; nothing asked THIS machine the same
+	 * question, so a local launch whose cwd is not a directory here reached the core
+	 * anyway — and the core cannot tell "no directory" from "no program". It words
+	 * both as `spawn_failed: cannot start "<argv[0]>": No such file or directory`,
+	 * which sends the operator after an interpreter that is right there (measured,
+	 * `hc 0.1.21`; #410 mapped that sentence back to the directory only AFTER the
+	 * failure, #432 asks first):
+	 *
+	 *   $ hc run --cwd /nope -- /usr/bin/node -v
+	 *   {"error":{"kind":"spawn_failed","message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
+	 *
+	 * Three facts, in this order:
+	 *
+	 *   1. **The absolute path.** A relative `cwd` is resolved by the CORE against
+	 *      the core's own directory, not against this process's — so a directory that
+	 *      exists here (`real`) is `~real` for the core and the launch dies blaming
+	 *      `node` (#432 measured exactly that on this path). One `path.resolve`
+	 *      here, and the absolute path is what travels on the wire.
+	 *   2. **It is a directory on this machine.** Not a file (`ENOTDIR`), not
+	 *      absent, not a symlink to nothing: `terminal.run` needs somewhere to
+	 *      chdir, and every later `git`/verify command runs there.
+	 *   3. **What this launch owns.** A worktree launch owns its tree's PARENT chain
+	 *      (`git worktree add` creates the leaf and refuses an existing directory —
+	 *      the same split `ensureRemoteDir` keeps on the remote side), so that chain
+	 *      is `mkdir -p`'d. The leaf is never created, and no other launch directory
+	 *      is ever invented: an empty directory is not a checkout, and a child put
+	 *      in one fails every command it was dispatched to run — loudly at best,
+	 *      silently at worst. Everything that is still not a directory after the
+	 *      step above is REFUSED with `cwd does not exist: <path>`, the sentence
+	 *      #432 asks for, naming the program only to say it is not the problem.
+	 *
+	 * Returns the path the caller must put on `terminal.run` (never `opts.cwd`
+	 * verbatim: it may be relative).
+	 */
+	private preflightLocalLaunch(opts: {
+		cwd: string;
+		/** `argv[0]` of this launch — the thing the core would have blamed. */
+		program: string;
+		/** Terminal address, for the refusal's first line. */
+		terminal: string;
+		/** Whether this launch owns the cwd's PARENT chain (a worktree launch). */
+		createParent: boolean;
+	}): string {
+		const cwd = path.resolve(opts.cwd);
+		if (isDirectoryOnDisk(cwd)) return cwd;
+		if (opts.createParent) {
+			// `git worktree add` creates the final directory but not its parents — the
+			// same gap `createRemoteChildWorktree`/`ensureRemoteDir` close over there.
+			try {
+				fs.mkdirSync(path.dirname(cwd), { recursive: true });
+			} catch {
+				/* the refusal below measures the state that matters, not this attempt */
+			}
+			// Creation is not a promise (a file in the way, an unwritable parent, a race
+			// that removed it again): ask the filesystem, never this process's intent.
+			if (isDirectoryOnDisk(cwd)) return cwd;
+		}
+		throw new SubagentError(
+			cwdRefusedBeforeSpawnMessage({
+				operation: "terminal.run",
+				terminal: opts.terminal,
+				cwd,
+				program: opts.program,
+			}),
+			ErrorCodes.START_FAILED,
+			{ cwd, program: opts.program, preflight: "local-cwd" },
+		);
+	}
+
+	/**
+	 * The parent address for one launch, or the reason there is none (#409).
+	 *
+	 * LOCAL: this process's own terminal. `HC_TERMINAL_ID` is an address in THIS
+	 * core's namespace, which is the namespace the request lands in — so it works
+	 * both ways (measured: `terminal.run{caller:"t77"}` stores `parent: "t77"`, and
+	 * an explicit `parent: "t77"` does the same). It is sent explicitly as well as
+	 * through `caller` because #409 asks the request itself to carry it.
+	 *
+	 * REMOTE: the target machine's anchor. Not the caller's id (that core answers
+	 * `no terminal "t1t"`) and not a qualified spelling (the sending core answers
+	 * `unknown machine`), so the only address that works is one that already
+	 * exists over there — see {@link ensureAnchor}.
+	 *
+	 * No caller at all (a headless process: `hc exec`, cron, a bare `pi`) is the
+	 * one case where nothing can be named. That is NOT silently dropped: the reason
+	 * travels to the record and to both renderers as `parent=absent(<reason>)`.
+	 */
+	private async resolveLaunchParent(
+		client: HcClient,
+		host: string | undefined,
+		remoteCwd: string,
+	): Promise<{ parent?: string; absent?: string }> {
+		const caller = this.caller;
+		if (host === undefined) {
+			return caller !== undefined
+				? { parent: caller }
+				: { absent: `no caller terminal (${HC_TERMINAL_ID_ENV} is unset: this process runs outside an hc terminal)` };
+		}
+		return this.ensureAnchor(client, host, remoteCwd);
+	}
+
+	/**
+	 * The anchor terminal on `host`: reuse it when it is live, otherwise create it.
+	 *
+	 * Why a terminal at all: a cross-machine child's parent has to be an address in
+	 * the TARGET core's namespace, and this process owns no terminal there. The
+	 * anchor is one per machine (name {@link ANCHOR_TERMINAL_NAME}, label
+	 * `legion.anchor=<host>`), created the way `hc run` creates a child — no
+	 * explicit parent, but the caller forwarded — so herdr itself qualifies it into
+	 * `<core-id>/<terminal-id>` and the anchor inherits `where` from the terminal
+	 * that asked for it. That is the "default-parent path" in #409's acceptance:
+	 * the chain root → anchor → children is connected end to end, and every child
+	 * below the anchor is parented to a terminal that EXISTS on that machine.
+	 *
+	 * Failure is not fatal: a machine whose core refuses a shell (headless, a
+	 * terminal-less core, a name held by somebody else) still gets its child, with
+	 * `parent=absent(<why>)` on the record — the same posture as the local
+	 * no-caller case.
+	 */
+	private async ensureAnchor(
+		client: HcClient,
+		host: string,
+		remoteCwd: string,
+	): Promise<{ parent?: string; absent?: string }> {
+		const cached = this.anchors.get(host);
+		if (cached !== undefined) return { parent: cached };
+		const address = terminalAddress({ terminalName: ANCHOR_TERMINAL_NAME, host });
+		// 1. An anchor this process (or an earlier one) already made. `terminal.get`
+		//    answers by address, so the machine prefix is required: the bare name is
+		//    unique per core, not across machines (contract D7).
+		const existing = await client
+			.request<HcTerminalFacts>("terminal.get", { terminal: address })
+			.catch(() => undefined);
+		if (existing !== undefined && existing.state !== "finished") {
+			this.anchors.set(host, ANCHOR_TERMINAL_NAME);
+			return { parent: ANCHOR_TERMINAL_NAME };
+		}
+		// 2. A FINISHED anchor still holds the name. `runTerminal` removes the holder on
+		//    its own retry, but the anchor's request is not the child's request, so the
+		//    cleanup is explicit here.
+		if (existing !== undefined) {
+			await client.request("terminal.rm", { terminal: address }).catch(() => {
+				/* the create below reports the real failure */
+			});
+		}
+		// 3. Create it. `argv: []` is `hc`'s own shell for that machine, `keep: true`
+		//    keeps it usable after a lost program, and the caller is forwarded (no
+		//    explicit parent: there is no terminal over there to name yet).
+		try {
+			const run = await client.request<HcTerminalFacts>("terminal.run", {
+				on: host,
+				name: ANCHOR_TERMINAL_NAME,
+				argv: [],
+				...(remoteCwd.length > 0 ? { cwd: remoteCwd } : {}),
+				keep: true,
+				labels: { [LEGION_ANCHOR_LABEL]: host },
+				...(this.caller !== undefined ? { caller: this.caller } : {}),
+			});
+			// The core may shorten a name it was asked for; the address it returns is the
+			// only spelling guaranteed to resolve later, and the TARGET-LOCAL form is the
+			// part after the machine prefix (#409's accepted `--parent t5j` shape).
+			const local = anchorLocalAddress(run, host);
+			if (local === undefined) {
+				return { absent: `no usable anchor address on ${host} (terminal.run answered no address)` };
+			}
+			this.anchors.set(host, local);
+			return { parent: local };
+		} catch (error) {
+			// A concurrent launch (another legion process, or a child of this one) may
+			// have won the name. Its anchor is as good as ours when it says so, so the
+			// refusal is retried as a read before it becomes a verdict.
+			if (isNameTaken(error)) {
+				const holder = await client
+					.request<HcTerminalFacts>("terminal.get", { terminal: address })
+					.catch(() => undefined);
+				if (holder?.state !== "finished" && holder?.labels?.[LEGION_ANCHOR_LABEL] === host) {
+					this.anchors.set(host, ANCHOR_TERMINAL_NAME);
+					return { parent: ANCHOR_TERMINAL_NAME };
+				}
+			}
+			return { absent: `no anchor on ${host} (${describeFailure(error)})` };
+		}
 	}
 
 	/** `HC_BIN` is honoured by the client; `PI_SUBAGENT_CLI`/host argv decide pi. */
@@ -1333,8 +1911,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 */
 	private async childLabels(input: SpawnInput, host: string | undefined): Promise<Record<string, string>> {
 		const labels: Record<string, string> = { [LEGION_ROLE_LABEL]: input.agent.name };
-		if (this.runId !== undefined && this.runId.length > 0) {
-			labels[LEGION_RUN_LABEL] = this.runId;
+		const runId = this.runIdFor(input);
+		if (runId !== undefined && runId.length > 0) {
+			labels[LEGION_RUN_LABEL] = runId;
 		}
 		if (host !== undefined) {
 			labels[LEGION_HOST_LABEL] = host;
@@ -1447,20 +2026,21 @@ export class TerminalSupervisor implements LegionSupervisor {
 		/** The launch argv (task last), quoted back as a reproduce command. */
 		argv: string[];
 		cwd: string;
-	}): Promise<boolean> {
+	}): Promise<void> {
 		const sessionPath = path.posix.join(opts.remoteDir, "session.jsonl");
-		const deadline = Date.now() + this.remoteStartupConfirmMs;
+		const started = Date.now();
+		const deadline = started + this.remoteStartupConfirmMs;
 		let lastError: string | undefined;
-		let lastPid: number | undefined;
 		for (;;) {
 			// `limit: 0` is the cheapest "does this file exist" the core answers: the
 			// reply carries the line count and the text is thrown away.
 			try {
 				await opts.client.request("file.read", { on: opts.target.host, path: sessionPath, limit: 0 });
-				return false;
+				return;
 			} catch (error) {
 				// `not_found` is the answer being watched for; anything else is a machine
-				// problem the gate must not turn into a launch refusal.
+				// problem worth quoting in the receipts (both of them) rather than a
+				// reason of its own.
 				if (!isNotFound(error)) lastError = describeFailure(error);
 			}
 			const alive = await this.startupFacts(opts.client, opts.address).catch((error: unknown) => {
@@ -1470,19 +2050,83 @@ export class TerminalSupervisor implements LegionSupervisor {
 			if (alive?.finished === true) {
 				throw await this.startupDeathError({ ...opts, sessionPath, ...(alive.code !== undefined ? { exitCode: alive.code } : {}) });
 			}
-			if (alive !== undefined) lastPid = alive.pid;
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) break;
 			await this.sleep(Math.min(REMOTE_STARTUP_CONFIRM_POLL_MS, remaining));
 		}
-		// A terminal the core still holds with no pid is the shape "hc accepted the
-		// name and never started the program" — silence for a reason the class alone
-		// cannot tell apart from a slow first turn.
-		const noPid = lastPid === undefined ? " (the core reports no pid for it: nothing may have been started in that terminal)" : "";
-		process.stderr.write(
-			`[pi-legion] host '${opts.target.host}': no transcript at ${sessionPath} after ${this.remoteStartupConfirmMs}ms and the terminal is still alive${noPid}${lastError ? ` (last error: ${lastError})` : ""}; launching anyway — a collect will classify it\n`,
+		// #423 req 1/2/6: the deadline is a REFUSAL with evidence, not a warning.
+		//
+		// Three things happen in this order, and the order matters:
+		//   1. PROBE while the terminal still exists — the screen tail is the only
+		//      place the child's own words survive (`Trust project folder?` was on it),
+		//      and a removed terminal has no screen left to read;
+		//   2. KILL+REMOVE the terminal this launch created. It is a shell nobody will
+		//      ever use, and it holds its NAME in that core: `terminal.run` answers
+		//      `name_taken` for a live holder, so leaving it behind turns the next
+		//      dispatch of the same handle into `NAME_TAKEN` (req 6);
+		//   3. THROW `START_FAILED` with the machine, cwd, terminal, hc's own error and
+		//      the screen. The caller rolls the tree/mirror back, so the name and the
+		//      path are both reusable.
+		const failure = await probeRemoteStartupFailure({
+			client: opts.client,
+			target: opts.target,
+			terminal: opts.address,
+			remoteDir: opts.remoteDir,
+			cwd: opts.cwd,
+			waitedMs: Date.now() - started,
+			...(lastError !== undefined ? { lastError } : {}),
+		});
+		const disposal = await this.discardRemoteTerminal(opts.client, opts.address, opts.target.host);
+		throw new SubagentError(
+			remoteStartupFailureMessage(failure, {
+				disposal: disposal.kind,
+				argv: opts.argv,
+				...(disposal.kind === "kept" && disposal.error !== undefined ? { disposalError: disposal.error } : {}),
+			}),
+			ErrorCodes.START_FAILED,
+			{
+				host: opts.target.host,
+				terminal: opts.address,
+				cwd: opts.cwd,
+				fate: "not-started",
+				...(disposal.kind === "kept" ? { disposalError: disposal.error } : {}),
+			},
 		);
-		return true;
+	}
+
+	/**
+	 * #423 req 6: give the terminal name back after a launch that never started.
+	 *
+	 * `kill` then `rm`, each best-effort, each reported: `hc` answers `name_taken`
+	 * for a LIVE holder, so a terminal left alive here is a name the next dispatch
+	 * of the same handle cannot take. A kill that already removed it is not a
+	 * failure (the core no longer knows the address), and a removal that fails is
+	 * `kept` — the receipt then names the machine and says the name is not free.
+	 */
+	private async discardRemoteTerminal(
+		client: HcClient,
+		address: string,
+		host: string | undefined,
+	): Promise<{ kind: "removed" } | { kind: "kept"; error: string }> {
+		const caller = this.callerFor(host) !== undefined ? { caller: this.callerFor(host) } : {};
+		try {
+			await client.request("terminal.kill", { terminal: address, ...caller });
+		} catch (error) {
+			if (!isNotFound(error)) {
+				return { kind: "kept", error: `terminal.kill: ${describeFailure(error)}` };
+			}
+		}
+		try {
+			await client.request("terminal.rm", { terminal: address, ...caller });
+		} catch (error) {
+			if (!isNotFound(error)) {
+				// Killed but not removed: the core keeps a `finished` terminal, which its
+				// own `terminal.run` retry DOES clear (D7), so this is reported rather
+				// than claimed as a hard conflict.
+				return { kind: "kept", error: `terminal.rm: ${describeFailure(error)}` };
+			}
+		}
+		return { kind: "removed" };
 	}
 
 	/**
@@ -1499,7 +2143,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const code = typeof facts?.exit_code === "number" ? facts.exit_code : undefined;
 		const pid = typeof facts?.pid === "number" ? facts.pid : undefined;
 		return {
-			finished: code !== undefined || facts?.state === "finished",
+			// The same rule recovery uses (`terminalProgramEnd`): a kept terminal stays
+			// `state: "live"` after its program exits, so `state` alone is not "is the
+			// child over". `terminalInferred` suppresses the `missing` answer here on
+			// purpose: a core that lost its registry must not turn this gate into a
+			// launch refusal (the pre-existing rule never read `missing` as death).
+			finished: terminalProgramEnd(facts, { terminalInferred: true }) !== undefined,
 			...(code !== undefined ? { code } : {}),
 			...(pid !== undefined ? { pid } : {}),
 		};
@@ -1568,7 +2217,61 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private applyFacts(child: TerminalChildRecord, facts: HcTerminalFacts): void {
 		child.turn = normalizedTurn(facts.turn);
 		if (typeof facts.status?.state === "string") child.statusState = facts.status.state;
-		if (facts.state === "finished") child.state = "finished";
+		if (facts.state === "finished") {
+			child.state = "finished";
+		} else if (child.state === "unreachable") {
+			// #460: the channel is back. The child was never observed to end, so it
+			// returns to `live` with the reading this call just folded in — tracking
+			// continues from here instead of from a fabricated death.
+			child.state = "live";
+		}
+		this.clearUnreachable(child);
+	}
+
+	/**
+	 * #460: record that THIS HOST lost sight of the child, not that the child ended.
+	 *
+	 * Nothing about the child is touched — `terminalName`, `host`, `remoteTerminal`,
+	 * `worktree*` and `promptTurn` all stay, because a dropped `hc` connection says
+	 * only that the observation channel is down. `state` becomes `unreachable`,
+	 * which `isAlive` still counts as alive (`status` lists the child, `stop` still
+	 * reaches its address) and which a later successful read clears.
+	 */
+	private markUnreachable(child: TerminalChildRecord, detail: string, strikes: number): void {
+		// A record that already ended is never reopened by a failing read: only a live
+		// (or already-unreachable) child can lose its supervision channel.
+		if (child.state === "finished" || child.state === "retired") return;
+		child.state = "unreachable";
+		child.unreachable = {
+			detail,
+			// The outage is dated from its FIRST failure, so an operator reading the
+			// record (or `legion doctor`) sees how long the channel has been down even
+			// while the poll keeps retrying.
+			since: child.unreachable?.since ?? Date.now(),
+			strikes,
+			epochs: child.unreachable?.epochs ?? 0,
+		};
+	}
+
+	/**
+	 * #460: the verdict of a wait that could not read the child.
+	 *
+	 * `abnormal:false` is the load-bearing part — this is NOT a death — and the
+	 * epoch counter is bumped so the NEXT wait for the same outage knows it may not
+	 * answer early again (see `UNREACHABLE_SLOW_POLL_MS`).
+	 */
+	private unreachableResult(child: TerminalChildRecord, detail: string, strikes: number): SettleResult {
+		if (child.unreachable !== undefined) child.unreachable.epochs += 1;
+		return {
+			settled: false,
+			abnormal: false,
+			reason: SUPERVISION_UNREACHABLE_REASON,
+			unreachable: { detail, strikes },
+		};
+	}
+
+	private clearUnreachable(child: TerminalChildRecord): void {
+		child.unreachable = undefined;
 	}
 
 	private requireChild(name: string): TerminalChildRecord {
@@ -1577,9 +2280,45 @@ export class TerminalSupervisor implements LegionSupervisor {
 		return child;
 	}
 
-	/** Wrap a transport failure so callers see one error vocabulary. */
-	private failure(operation: string, terminal: string, error: unknown): Error {
+	/**
+	 * Wrap a transport failure so callers see one error vocabulary.
+	 *
+	 * `cwdContext` is passed by the ONE call site that starts a terminal in a
+	 * directory (LOCAL launches; a remote cwd is another machine's path and
+	 * `remotePreflight` asked about it there, D13): when the core answers
+	 * `spawn_failed`/`bad_cwd` and that directory is not on disk, the failure is
+	 * about the DIRECTORY, not the program, and the message says so
+	 * (`cwdDoesNotExistMessage`). Since #432 this is the SECOND line of defence —
+	 * `preflightLocalLaunch` asks the same question before the core is involved, so
+	 * this mapping only speaks for a cwd that disappeared in between. Every other
+	 * failure keeps the plain `operation failed for terminal '<addr>': <detail>`
+	 * shape, and that includes the honest program case: a cwd that IS there keeps
+	 * the core's own `cannot start "<program>"` (nothing here rewrites it).
+	 */
+	private failure(
+		operation: string,
+		terminal: string,
+		error: unknown,
+		cwdContext?: { cwd: string; program: string },
+	): Error {
 		if (error instanceof SubagentError) return error;
+		if (
+			cwdContext !== undefined &&
+			error instanceof HcRpcError &&
+			CWD_FAILURE_KINDS.has(error.kind) &&
+			!isDirectoryOnDisk(cwdContext.cwd)
+		) {
+			return new SubagentError(
+				cwdDoesNotExistMessage({
+					operation,
+					terminal,
+					detail: `${error.kind}: ${error.message}`,
+					...cwdContext,
+				}),
+				ErrorCodes.START_FAILED,
+				{ cwd: cwdContext.cwd, program: cwdContext.program, kind: error.kind },
+			);
+		}
 		const detail =
 			error instanceof HcRpcError
 				? `${error.kind}: ${error.message}`
@@ -1642,6 +2381,119 @@ function describeFailure(error: unknown): string {
 	if (error instanceof HcRpcError) return `${error.kind}: ${error.message}`;
 	if (error instanceof Error) return error.message;
 	return String(error);
+}
+
+/**
+ * The core's own names for "the program could not be started" (#410).
+ *
+ * A cwd that is not there surfaces as `spawn_failed`, because that is the one
+ * failure the core reports when its own chdir/exec pair fails — and it words it
+ * as a fact about the PROGRAM (`cannot start "<argv[0]>": No such file or
+ * directory (os error 2)`), which sends the operator after a binary that is
+ * right there. Measured on a real core (`hc 0.1.21`):
+ *
+ * ```
+ * $ hc run --cwd /nope -- /usr/bin/node -v
+ * {"error":{"kind":"spawn_failed",
+ *   "message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
+ * ```
+ *
+ * `bad_cwd` is the same situation spelled honestly (the fake core in
+ * `test/helpers/fake-hc-core.mjs` answers it when it can see the directory is
+ * absent, and a future core may do the same). Both kinds are normalized here
+ * when the launch directory really is missing, so the message names the
+ * directory the launch needed.
+ */
+const CWD_FAILURE_KINDS: ReadonlySet<string> = new Set(["spawn_failed", "bad_cwd"]);
+
+/**
+ * Is `dir` a directory ON THIS MACHINE? (never a question about another one)
+ *
+ * A path this process cannot stat is reported as absent on purpose: the caller
+ * asks only to explain a `spawn_failed`, and "I cannot see it either" is the same
+ * sentence the operator needs. A path that exists but is a FILE is `false` too,
+ * because a terminal cannot start in one (`ENOTDIR`).
+ */
+function isDirectoryOnDisk(dir: string): boolean {
+	try {
+		return fs.statSync(dir).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * #432: the refusal for a LOCAL launch whose launch directory is not there,
+ * decided BEFORE the core is asked.
+ *
+ * Same fact as {@link cwdDoesNotExistMessage}, one step earlier: #410 learned it
+ * from the core's `spawn_failed`, this asks the filesystem first, so no terminal,
+ * no temp dir and no half-launch is created for a launch that cannot work. The
+ * first line keeps the shape the issue asks for (`cwd does not exist: <path>`),
+ * and the second line is the point of both messages: the program is NAMED only
+ * to say it is not the problem — the core's own sentence would have said
+ * `cannot start "<node>"`, which is a fact about the wrong thing entirely.
+ *
+ * `spawn_failed` is deliberately absent: nothing was spawned, so quoting the
+ * core's vocabulary here would be a lie about where this verdict came from. The
+ * post-hoc message (a cwd that vanished between this check and `terminal.run`)
+ * keeps it, because there the core really did say it.
+ */
+function cwdRefusedBeforeSpawnMessage(input: {
+	operation: string;
+	terminal: string;
+	cwd: string;
+	program: string;
+}): string {
+	const lines = [
+		`${input.operation} failed for terminal '${input.terminal}': cwd does not exist: ${input.cwd}`,
+		`  refused before the core was asked to spawn: ${input.program} is not the problem, and was never tried`,
+	];
+	const parent = path.dirname(input.cwd);
+	if (!isDirectoryOnDisk(parent)) {
+		lines.push(`  its parent directory is missing or is not a directory: ${parent}`);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * #410: the refusal for a spawn whose LAUNCH DIRECTORY is what is missing —
+ * learned from the core, so the core's own word comes first.
+ *
+ * This is the post-hoc half of #432: the preflight ({@link cwdRefusedBeforeSpawnMessage})
+ * answers the same question before `terminal.run`, and this one only speaks when
+ * a directory vanished between that check and the core's spawn (a race, a `git`
+ * that removed a tree, a concurrent cleanup).
+ *
+ * The shape issue #410 asks for is `spawn_failed: cwd does not exist: <path>` —
+ * the core's own word first, then the fact it could not report. The program is
+ * named as a NOTE, because that is the one thing the core's sentence gets wrong:
+ * it blames the interpreter, which exists (`isDirectoryOnDisk` and the
+ * operator's own `hc run … -- <node> -v` both agree).
+ *
+ * When the parent is ALSO missing, that is appended as its own line: it is the
+ * difference between "someone removed the tree" (the parent is fine, `git
+ * worktree add` can rebuild it) and "this launch could never have started here"
+ * (an unwritable or non-directory parent). The state is measured at error time,
+ * not inferred from this backend's own mkdir attempt, so the sentence stays true
+ * even when the creation was skipped or raced.
+ */
+function cwdDoesNotExistMessage(input: {
+	operation: string;
+	terminal: string;
+	detail: string;
+	cwd: string;
+	program: string;
+}): string {
+	const lines = [
+		`${input.operation} failed for terminal '${input.terminal}': spawn_failed: cwd does not exist: ${input.cwd}`,
+		`  the program is not the problem: ${input.program} (the core said: ${input.detail})`,
+	];
+	const parent = path.dirname(input.cwd);
+	if (!isDirectoryOnDisk(parent)) {
+		lines.push(`  its parent directory is missing or is not a directory: ${parent}`);
+	}
+	return lines.join("\n");
 }
 
 /**

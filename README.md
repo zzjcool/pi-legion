@@ -556,6 +556,7 @@ another process's worth of memory.
 | `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` | Same as `inheritExtensions: false`, for every child. `1` forces inheritance back on. |
 | `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra paths every child loads explicitly. |
 | `PI_LEGION_CHILD_MCP=0` | **No MCP in children.** Neither `builtin:mcp` nor `builtin:tool-search` is loaded, so no child opens an MCP connection. `0`/`false`/`off`/`no`/`none` disable it; anything else (including unset) leaves MCP on. |
+| `PI_LEGION_CHILD_DIAGNOSTICS=1` | **Echo in-process children's diagnostics to the host console.** Off by default: they are written to `<runDir>/diagnostics.log` only, because an in-process child shares the host's TTY and a warn line lands above the user's input box (#468). Real extension failures still surface — as ONE summary line per child run |
 
 The child-guard is appended unconditionally and is not subject to either knob —
 a child without it breaks the prompt/format contract no matter what the card
@@ -648,6 +649,9 @@ container, read-only mount).
 | `PI_LEGION_VERIFY_CONCURRENCY` | 2 | Machine-wide limit on concurrent acceptance / legion-verify commands, using slot lock files. `0` = unlimited. |
 | `PI_LEGION_VERIFY_QUEUE_MAX_MS` | 1800000 | Overall queue-wait cap. After it expires the command runs without a slot. Queue wait does not count toward the command timeout. |
 | `PI_LEGION_VERIFY_LOCK_DIR` | `$TMPDIR/pi-legion-verify-<uid>` | Slot directory. Set it to scope the limit more narrowly. |
+| `PI_LEGION_LIVE_MIRROR` | on | `0`/`off`/`false` disables the cross-machine transcript mirror. The pump copies a remote child's `session.jsonl` into its local `sessionFile` incrementally, which is what makes the panel readable and `quiet` real (#411). When off, `subagent status` prints `mirror=off`. |
+| `PI_LEGION_LIVE_MIRROR_INTERVAL_MS` | 5000 | Mirror cadence (floor 500). |
+| `PI_LEGION_LIVE_MIRROR_MAX_BYTES` | 4194304 | How many trailing bytes of the mirror are kept (floor 4096). The head is trimmed on a line boundary. |
 
 The child restores the host `NODE_OPTIONS` when its extension loads, so bash
 commands it runs (`tsc`, `npm test`) keep the default heap.
@@ -692,6 +696,16 @@ Cross-machine delivery — a centurion that runs on another `hc` machine and
 delivers through the one shared `origin` — is a three-step setup (one shared
 remote → `subagents.crossMachine` → one `subagent` call):
 [docs/runbooks/cross-machine-centurion-demo.md](docs/runbooks/cross-machine-centurion-demo.md).
+
+A cross-machine child outlives the session that launched it, so a new session in
+the same directory **re-attaches** it at start: the child is listed by `status`
+again and its completion notice arrives by itself — `recover` is not something a
+user needs to know about. Adoption is evidence-based (the program must still be
+running there, or its transcript must be growing), never steals a child another
+live session holds, is bounded (3s per child, 20 children, 5s for the whole
+start pass), and prints **one** line; per-child detail goes to
+`.pi-subagents/reattach-live-children.log`. Turn it off with
+`subagents.reattachLiveChildren: false`.
 
 ## Supported kinds
 

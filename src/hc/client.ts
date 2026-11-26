@@ -45,6 +45,14 @@ export const HC_METHODS = [
 	"hello",
 	"terminal.run",
 	"terminal.get",
+	// #423: the only way to read a terminal's TEXT. `terminal.get`'s `screen` field
+	// is not it — measured on hc 0.1.21, that field answers the literal word
+	// `"exact"` (a mode), so every receipt built from it quoted nothing. `read` is a
+	// pure read (`{terminal} | {terminal, lines}` → `{text, how, complete}`), so it
+	// belongs on this side of the boundary exactly like `terminal.get`: the refusal
+	// to expose write-side lifecycle (`tail/send/kill/rm`-adjacent power) is
+	// untouched, and `attach` (which takes the operator's keyboard) stays out.
+	"terminal.read",
 	"terminal.send",
 	"terminal.wait",
 	"terminal.interrupt",
@@ -262,6 +270,15 @@ export class HcCliClient implements HcClient {
 		child.once("error", (error: Error) => {
 			this.onExit(`hc connect failed to start: ${error.message}`);
 		});
+		// WRITE-END ERRORS ARE CONNECTION FACTS, NOT HOST CRASHES (#447). A core that
+		// exits between the spawn and the write — or that dies while a call is in
+		// flight — makes `stdin` emit `EPIPE`. An unhandled stream `error` is an
+		// `uncaughtException`, so a broken MACHINE would take the whole session down
+		// instead of costing one bounded probe. Report it as a dead connection
+		// (`exitReason` + every pending call rejected) and reap the child.
+		child.stdin?.on("error", (error: Error) => {
+			this.onWriteError(error);
+		});
 		child.once("exit", (code, signal) => {
 			const how = signal ? `signal ${signal}` : `code ${String(code)}`;
 			this.onExit(`hc connect exited (${how})`);
@@ -343,6 +360,22 @@ export class HcCliClient implements HcClient {
 		this.exitReason = reason;
 		this.child = undefined;
 		this.failAll(new Error(reason));
+	}
+
+	/**
+	 * The write end is dead (`EPIPE` and friends). Same terminal state as an exit:
+	 * pending calls reject and later requests fail fast — but the child may still be
+	 * alive (a core that closed stdin), so reap it instead of leaking a process.
+	 */
+	private onWriteError(error: Error): void {
+		if (this.exitReason !== undefined) return;
+		const child = this.child;
+		this.onExit(`hc connect stdin failed: ${error.message}`);
+		try {
+			child?.kill("SIGTERM");
+		} catch {
+			/* already gone */
+		}
 	}
 
 	private failAll(error: Error): void {

@@ -500,6 +500,9 @@ export function parseSubagentSettings(
 	setIf(out, "inprocess", parseInProcessLimits(input.inprocess, filePath));
 	setIf(out, "rpc", parseRpcSettings(input.rpc, filePath));
 	setIf(out, "crossMachine", parseCrossMachine(input.crossMachine, filePath));
+	// #445 §5: the switch that turns the session-start re-attach pass off. Absent =
+	// on, because the behaviour it replaces ("my tasks are gone") is the surprising one.
+	setIf(out, "reattachLiveChildren", requiredBoolean(input.reattachLiveChildren, "reattachLiveChildren", filePath));
 
 	// THE WHITELIST: every key read above must be assigned, or it is silently
 	// discarded. `presets` and `agentOverridesByProvider` are the newest keys and
@@ -1222,6 +1225,9 @@ export function resolveSubagentSettings(
 	if (project.joinMode !== undefined) out.joinMode = project.joinMode;
 	if (project.joinFlushMs !== undefined)
 		out.joinFlushMs = project.joinFlushMs;
+	// #445: project wins, and an absent project key leaves the user value alone.
+	if (project.reattachLiveChildren !== undefined)
+		out.reattachLiveChildren = project.reattachLiveChildren;
 
 	if (project.scoutGuard) {
 		out.scoutGuard = { ...(user.scoutGuard ?? {}), ...project.scoutGuard };

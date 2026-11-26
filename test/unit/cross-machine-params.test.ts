@@ -24,7 +24,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type HcClient, type HcMethod } from "../../src/hc/client.ts";
-import { TerminalSupervisor, HERDR_SPACE_LABEL, LEGION_HOST_LABEL } from "../../src/supervisor/terminal-supervisor.ts";
+import { TerminalSupervisor, HERDR_SPACE_LABEL, LEGION_HOST_LABEL, LEGION_RUN_LABEL, terminalName } from "../../src/supervisor/terminal-supervisor.ts";
 import {
 	assertLocalWorktree,
 	normalizeHost,
@@ -202,10 +202,17 @@ test("D2: with a host, `on` carries it and the child record keeps it", async () 
 		// A named host always carries a resolved target (S1): the backend refuses a
 		// bare name rather than sending this machine's argv to another machine.
 		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
-		const params = h.client.paramsFor("terminal.run")[0];
+		// #409: the child's own request is the LAST one — the anchor probe/creation
+		// for a cross-machine launch comes first (`parent-anchor.ts`).
+		const params = h.client.paramsFor("terminal.run").at(-1);
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on"]);
+		// #409: `parent` is the TARGET-LOCAL anchor address. Not the caller id (that
+		// core answers `no terminal "…"`) and not a machine-qualified spelling (the
+		// sending core refuses it), so the anchor's name is the one address both
+		// cores agree on.
+		assert.equal(params.parent, "lgl-anchor");
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on", "parent"]);
 		assert.equal(childRecord(h.supervisor, "root.centurion-0").host, "vps");
 	} finally {
 		h.cleanup();
@@ -225,11 +232,15 @@ test("D2: a remote request sends `on` and never `caller`", async () => {
 	const h = harness(callerEnv());
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
-		const params = h.client.paramsFor("terminal.run")[0];
+		const params = h.client.paramsFor("terminal.run").at(-1);
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.caller, undefined, "a parent terminal id does not exist on the other machine");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on"]);
+		// #409: the parent is the machine's ANCHOR — an address that exists there —
+		// never this process's caller id. The anchor's own creation is the one request
+		// that DOES carry `caller` (the default-parent path, see the #409 test file).
+		assert.equal(params.parent, "lgl-anchor");
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on", "parent"]);
 		// S5/D6: and no `env` key at all — see the dedicated test below.
 	} finally {
 		h.cleanup();
@@ -240,10 +251,13 @@ test("D2: the LOCAL request keeps `caller` exactly as before", async () => {
 	const h = harness(callerEnv());
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root));
-		const params = h.client.paramsFor("terminal.run")[0];
+		const params = h.client.paramsFor("terminal.run").at(-1);
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.caller, TERMINAL_ID);
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "caller", "cwd", "env", "labels", "name"]);
+		// #409: and the same address as an explicit `parent` — a local launch's parent
+		// is the terminal this process runs in, which is an address of THIS core.
+		assert.equal(params.parent, TERMINAL_ID);
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "caller", "cwd", "env", "labels", "name", "parent"]);
 	} finally {
 		h.cleanup();
 	}
@@ -357,6 +371,18 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 				`a parent-absolute argv survived: ${arg} is in none of ${REMOTE_CWD}, ${target.mirrorRoot}, ${REMOTE_LEGION_ROOT}`,
 			);
 		}
+		// #424: this child lands in a worktree created on THAT machine moments ago, so
+		// its argv must answer pi's `Trust project folder?` prompt for this run. It is
+		// not a path, so D6 must carry it through unchanged — and the start-up probe,
+		// which runs the child's own argv minus the task, must carry it too.
+		assert.equal(argv.includes("--no-approve"), false);
+		assert.equal(
+			argv.filter((arg) => arg === "--approve").length,
+			1,
+			`remote argv must carry exactly one --approve (#424): ${argv.join(" ")}`,
+		);
+		assert.match(String(execs[3]!.line), /'--approve'/);
+
 		// The package's own `-e` entry (present in every child's argv) went through
 		// `pathMap`, not through a basename sweep that would hand the child a path
 		// to nothing.
@@ -379,13 +405,68 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		const labels = run.labels as Record<string, string>;
 		assert.deepEqual(labels, { "legion.role": "centurion", [LEGION_HOST_LABEL]: "vps" });
 		assert.equal(HERDR_SPACE_LABEL in labels, false, "a parent space id is meaningless over there");
-		assert.deepEqual(h.client.paramsFor("terminal.get"), [], "no parent terminal read for a remote child");
+		// #409: the ONE `terminal.get` a remote launch issues is the anchor probe. No
+		// read of THIS process's caller terminal is made for a remote child — that id
+		// means nothing on the other machine.
+		assert.deepEqual(
+			h.client.paramsFor("terminal.get").map((params) => params.terminal),
+			[terminalAddress({ terminalName: "lgl-anchor", host: "vps" })],
+		);
 
 		// D9: the record remembers the remote dir (the parent temp dir stays local).
 		const record = childRecord(h.supervisor, input.name) as { remoteDir?: string; tempDir?: string; host?: string };
 		assert.equal(record.remoteDir, remoteDir);
 		assert.equal(record.host, "vps");
 		assert.ok(record.tempDir && !record.tempDir.startsWith(REMOTE_CWD), "the parent temp dir is not migrated");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: a spawn-carried runId names the remote dir, the terminal and the run label", async () => {
+	// The issue's collision: `<mirrorRoot>/no-run/<name>` and `lgl-<name>` are
+	// machine-wide, so two same-named children of different runs share both. The
+	// spawn body is the channel that can carry the dispatching run id (production
+	// builds one supervisor before any run exists); everything below is derived
+	// from that one fact.
+	const h = harness(callerEnv());
+	const target = hostTarget();
+	try {
+		const runId = "r-7c1d2e3f";
+		const input = spawnInput(h.root, { host: "vps", hostTarget: target, runId });
+		const handle = await h.supervisor.spawnChild(input);
+		const remoteDir = remoteDirFor(target, runId, input.name);
+		assert.equal(remoteDir, "/srv/remote/.pi-subagents-mirror/r-7c1d2e3f/root.centurion-0");
+		// Same name, another run → another directory. Neither is the machine-wide
+		// `no-run` segment that made two sessions share one transcript.
+		const otherDir = remoteDirFor(target, "r-9a8b7c6d", input.name);
+		assert.notEqual(remoteDir, otherDir);
+		assert.doesNotMatch(remoteDir, /\/no-run\//);
+		assert.doesNotMatch(otherDir, /\/no-run\//);
+
+		// 1) the directory the launch creates on that machine
+		const mkdir = h.client
+			.paramsFor("machine.exec")
+			.find((params) => Array.isArray(params.argv) && (params.argv as unknown[])[0] === "mkdir");
+		assert.ok(mkdir, "the remote dir must be created");
+		assert.deepEqual(mkdir!.argv, ["mkdir", "-p", remoteDir]);
+
+		// 2) the transcript the child writes lives in it
+		const run = h.client.paramsFor("terminal.run").at(-1)!;
+		const argv = run.argv as string[];
+		assert.equal(argv[argv.indexOf("--session") + 1], `${remoteDir}/session.jsonl`);
+		// The startup probe uses the same argv, so it cannot point somewhere else.
+		const probe = h.client.paramsFor("machine.exec").at(-1)!;
+		assert.match(String(probe.line), new RegExp(`${remoteDir}/session.jsonl`));
+
+		// 3) the terminal name (visible in `hc ls` on that machine) and the label
+		assert.equal(run.name, terminalName(runId, input.name));
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], runId);
+
+		// 4) the facts come back on the handle/record, so a later process reads them
+		// instead of recomputing a name it might get wrong.
+		assert.equal(handle.remoteDir, remoteDir);
+		assert.equal(handle.remoteTerminal, `vps/${terminalName(runId, input.name)}`);
 	} finally {
 		h.cleanup();
 	}
