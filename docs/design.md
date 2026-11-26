@@ -545,6 +545,8 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 | `vexillatio` | 宿主会话（utility child 自身不注册） | 只派 read-only utility agent（`scout`），永远 leaf |
 | `legion_mail` / `legion_tree` / `legion_phase` | **子进程**（`registerTools: true`，root 为 `false`） | 发信 / 看子树 / 请求阶段迁移 |
 
+职责边界（`dispatch-boundary-v1`，两条管道各管一种子节点）：`subagent` 只派**命令链**角色（worker / centurion）——`utility: true` 的目标在 `launch` 上被 `INVALID_PARAMS` 硬拒，拒绝发生在任何持久副作用（run 目录 / ledger / spawn）之前，混批（worker + scout）整批拒绝，文案点名 `vexillatio` 并给出等价调用；`vexillatio` 独占**只读侦察**（scout），所有非 utility 会话可用，utility 子自身永不注册（hard leaf，无深度预算）。
+
 `subagent` 的参数里两个值得记住的点：`section` 是真实存在的 diagnose 过滤参数（等价 `/legion doctor [section]`）；`phases` / `start` 只对 root 派发 centurion 有意义（§3.4.2）。
 
 ---

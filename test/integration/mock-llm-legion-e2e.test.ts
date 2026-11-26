@@ -77,7 +77,7 @@ const multiChildScript: MockScript = {
 			when: { promptIncludes: "spawn" },
 			then: {
 				type: "tool_call",
-				name: "subagent",
+				name: "vexillatio",
 				arguments: { agent: "scout", task: "SCOUT_OK" },
 			},
 		},
@@ -91,7 +91,7 @@ test("e2e: mock-llm multi-spawn + railway connectors, vanish, lockstep scroll", 
 	try {
 		writeMockPiHome({ dir: homeDir, baseUrl: mock.baseUrl });
 		const first = await chat(mock.baseUrl, [{ role: "user", content: "spawn three scouts" }]);
-		assert.equal(first.choices[0]?.message.tool_calls?.[0]?.function.name, "subagent");
+		assert.equal(first.choices[0]?.message.tool_calls?.[0]?.function.name, "vexillatio");
 		const call = first.choices[0]?.message.tool_calls?.[0];
 		const settled = await chat(mock.baseUrl, [
 			{ role: "user", content: "spawn three scouts" },

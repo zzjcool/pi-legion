@@ -77,7 +77,7 @@ Three roles ship with the package:
 | --- | --- | --- | --- |
 | `centurion` | Team lead: freeze the contract, dispatch children, drive the phase machine, deliver a reviewable result. Holds the worktree. | pi defaults | 30 min |
 | `worker` | Implementation: write code and run tests against a frozen plan, report a verdict. | read/edit/write/grep/find/ls/bash/codemode | 45 min |
-| `scout` | Read-only recon: produce a fact list, no plan, no implementation. | read/grep/find/ls/bash/codemode | 10 min |
+| `scout` | Read-only recon: produce a fact list, no plan, no implementation. Dispatched by `vexillatio`, never by `subagent`. | read/grep/find/ls/bash/codemode | 10 min |
 
 `worker` cannot dispatch nested agents (`maxSubagentDepth: 1`). Anything a worker
 needs to escalate is a `verdict ok:false`, not another layer of children — one
@@ -181,12 +181,15 @@ subagent({
 })
 ```
 
-The centurion plans the work, writes the squad contract, dispatches ordinary
-roles such as `worker` and `scout`, and coordinates the squad
-through its phases. For a single leaf task, dispatch an ordinary role directly:
+The centurion plans the work, writes the squad contract, dispatches command-chain
+roles such as `worker`, and coordinates the squad
+through its phases. Two tools, one child kind each: `subagent` launches the
+command chain (`worker` / `centurion`) and **refuses** a utility role, while
+`vexillatio` owns read-only recon (`scout`). For a single leaf task:
 
 ```text
-subagent({ agent: "scout", task: "Map the export code path and report relevant files and risks." })
+subagent({ agent: "worker", task: "<task card with acceptance criteria>" })
+vexillatio({ task: "Map the export code path and report relevant files and risks.", agent: "scout" })
 ```
 
 No manual child-process launch is needed. Use `/legion` to inspect the tree;

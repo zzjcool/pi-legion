@@ -1,30 +1,42 @@
 ---
 name: pi-legion
-description: "Use the subagent tool to delegate to a loaded role; use centurion for recursive squads and /legion to inspect the tree. Cross-machine dispatch adds host + cwd to the same call. Pi Legion v2 runs children in-process by default (rpc only for a worktree-owning centurion) and records their shared tree state in legion.db."
+description: "Use the subagent tool to delegate to a command-chain role (worker / centurion); read-only recon (scout) goes through vexillatio. Use centurion for recursive squads and /legion to inspect the tree. Cross-machine dispatch adds host + cwd to the same call. Pi Legion v2 runs children in-process by default (rpc only for a worktree-owning centurion) and records their shared tree state in legion.db."
 ---
 
 # Pi Legion
 
-Use the `subagent` tool to delegate to a matching loaded role. Prefer the
-specific role that fits the task; use a `centurion` when the task needs a
-recursive team, a frozen squad contract, and a tree-shaped delivery. Do not
-launch child processes manually.
+Use the `subagent` tool to delegate to a matching loaded command-chain role.
+Prefer the specific role that fits the task; use a `centurion` when the task needs
+a recursive team, a frozen squad contract, and a tree-shaped delivery. Read-only
+recon is `vexillatio`'s, not `subagent`'s. Do not launch child processes
+manually.
 
 ## Dispatch
 
+Two tools, one child kind each: `subagent` launches the **command chain**
+(`worker` / `centurion`) and refuses a utility role; `vexillatio` owns read-only
+recon (`scout`).
+
 ```text
-subagent({ agent: "scout", task: "<question list>" })
 subagent({ agent: "worker", task: "<task card>" })
 subagent({ agent: "centurion", task: "<目标 + 验收清单>" })
 subagent({ tasks: [
   { agent: "worker", task: "<lane A>" },
   { agent: "worker", task: "<lane B>" },
 ] })
+vexillatio({ task: "<question list>", agent: "scout" })
+vexillatio({ tasks: [
+  { agent: "scout", task: "<recon lane A>" },
+  { agent: "scout", task: "<recon lane B>" },
+] })
 ```
 
 The loaded roles are the roster injected into this session's system prompt —
 read it there and call a role by name, there is no action that lists them. This
-package bundles only three of them — `centurion`, `worker`, and `scout`.
+package bundles only three of them — `centurion`, `worker`, and `scout`. The
+`utility: true` one (`scout`) goes through `vexillatio`, not `subagent`: a
+`subagent` launch naming a utility role is refused with INVALID_PARAMS, and the
+refusal carries the equivalent `vexillatio(...)` call to copy.
 
 That is the dispatch path: Pi Legion starts children as `AgentSession`s inside
 the parent process under a tree-aware supervisor; only a worktree-owning

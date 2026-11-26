@@ -100,7 +100,7 @@ test("child-done picks role-specific verdict", () => {
 	}
 });
 
-test("spawn-scout issues subagent tool call", () => {
+test("spawn-scout issues a vexillatio tool call", () => {
 	const ctx = resolveContext(
 		{ messages: [{ role: "user", content: "spawn a scout please" }] },
 		"spawn-scout",
@@ -108,7 +108,9 @@ test("spawn-scout issues subagent tool call", () => {
 	const actions = pickActions(resolveScenario("spawn-scout"), ctx);
 	assert.equal(actions[0]?.type, "tool_call");
 	if (actions[0]?.type === "tool_call") {
-		assert.equal(actions[0].name, "subagent");
+		// dispatch-boundary-v1 D1: read-only recon is `vexillatio`'s; `subagent` refuses
+		// a utility target, so a fixture teaching it would teach a call that cannot work.
+		assert.equal(actions[0].name, "vexillatio");
 		assert.equal(
 			(actions[0].arguments as { agent?: string }).agent,
 			"scout",

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -207,6 +208,23 @@ async function waitFor(
 	return predicate();
 }
 
+/**
+ * How many run directories `<cwd>/.pi-subagents/runs` holds.
+ *
+ * `dispatch-boundary-v1` D1 requires the refusal to land BEFORE the first persistent
+ * side effect, and a run directory is that side effect: `createRootLegion` mints
+ * `runs/<runId>/` (run.json + legion.db). Counting them is the observable form of
+ * "nothing was recorded" — a spawn counter alone would stay at zero even if a
+ * refused call had left an empty tree on disk.
+ */
+function runDirCount(cwd: string): number {
+	try {
+		return readdirSync(path.join(cwd, ".pi-subagents", "runs")).length;
+	} catch {
+		return 0;
+	}
+}
+
 test("vexillatio dispatches a utility agent, strips lineage, and returns its collected output", async () => {
 	await withSandbox(
 		{
@@ -385,22 +403,120 @@ test("vexillatio rejects task verification commands instead of ignoring them", a
 	});
 });
 
-test("subagent remains compatible with misconfigured utility roles and enforces leaf identity", async () => {
+test("subagent refuses a utility target before any side effect (dispatch-boundary-v1 D1)", async () => {
 	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const before = runDirCount(cwd);
 		const result = await invoke(pi, "subagent", {
 			agent: "scout",
 			task: "Inspect this repository and report.",
 			async: false,
 			worktree: false,
 		}, context(cwd));
-		assert.match(result.content[0]?.text ?? "", /scout-0/);
+		const text = result.content.map((part) => part.text ?? "").join("\n");
+		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
+		// The refusal is the interface to "one tool per child kind": it has to name the
+		// offending ROLE, the OWNING tool, and ONE call the model can copy verbatim.
+		assert.match(text, /`scout` is a utility agent \(utility: true\)/);
+		assert.match(text, /dispatched by `vexillatio`, not `subagent`/);
+		assert.match(text, /vexillatio\(\{ task: "…", agent: "scout" \}\)/, "a pasteable single recon call");
+		assert.match(
+			text,
+			/vexillatio\(\{ tasks: \[\{ agent: "scout", task: "…" \}\] \}\)/,
+			"a pasteable parallel recon call",
+		);
+		assert.match(text, /`subagent` launches the command chain \(worker \/ centurion\) only\./);
+		// D1's side-effect order: nothing was spawned, no run directory, no ledger — the
+		// refusal lands before `createRootLegion` mints any of them.
+		assert.equal(supervisor.spawns.length, 0, "no child is spawned");
+		assert.equal(runDirCount(cwd), before, "no run directory is created");
+		assert.equal(
+			existsSync(path.join(cwd, ".pi-subagents", "runs")),
+			false,
+			"the store is not even materialised (no run.json, no legion.db)",
+		);
+	});
+});
+
+test("subagent refuses a mixed worker+scout batch as a WHOLE, before the worker starts", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const before = runDirCount(cwd);
+		const result = await invoke(pi, "subagent", {
+			tasks: [
+				{ agent: "worker", task: "Implement the small task." },
+				{ agent: "scout", task: "Inspect the repository." },
+			],
+			async: true,
+			worktree: false,
+		}, context(cwd));
+		const text = result.content.map((part) => part.text ?? "").join("\n");
+		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
+		// Which step is at fault is part of an actionable refusal.
+		assert.match(text, /^tasks\[\] step 2: /, `the refusal names the offending step:\n${text}`);
+		assert.match(text, /`scout` is a utility agent/);
+		assert.match(text, /vexillatio/);
+		// "Start the worker, then report" is the failure mode this refusal exists to
+		// prevent: a launched child cannot be un-spawned.
+		assert.equal(supervisor.spawns.length, 0, "zero spawns — the healthy sibling does not start");
+		assert.equal(supervisor.spawns.some((spawn) => spawn.input.agent.name === "worker"), false);
+		assert.equal(runDirCount(cwd), before, "no run directory survives the refusal");
+	});
+});
+
+test("subagent launches the command chain unchanged: worker and centurion are not utility", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const worker = await invoke(pi, "subagent", {
+			agent: "worker",
+			task: "Implement the small task.",
+			async: false,
+			worktree: false,
+		}, context(cwd));
+		assert.match(worker.content[0]?.text ?? "", /worker-0/);
+		assert.equal((worker.details as { error?: string } | undefined)?.error, undefined);
+
+		// A centurion inside a live tree is FORCED onto a worktree (#214), so the sandbox
+		// needs a real checkout with one commit (`createChildWorktree` runs
+		// `git worktree add … HEAD`) for the launch to reach the supervisor at all —
+		// that is the pre-existing rule this test must not disturb.
+		execFileSync("git", ["init", "-q", cwd]);
+		execFileSync(
+			"git",
+			["-C", cwd, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "--no-gpg-sign", "--allow-empty", "-m", "init"],
+			{ stdio: "ignore" },
+		);
+		const centurion = await invoke(pi, "subagent", {
+			agent: "centurion",
+			task: "Lead the small squad.",
+			async: false,
+		}, context(cwd));
+		assert.match(centurion.content[0]?.text ?? "", /centurion-0/);
+		assert.equal((centurion.details as { error?: string } | undefined)?.error, undefined);
+
+		assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.agent.name), ["worker", "centurion"]);
+		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_UTILITY_CHILD, undefined);
+		assert.equal(supervisor.spawns[1]?.input.env?.PI_SUBAGENT_UTILITY_CHILD, undefined);
+	});
+});
+
+test("vexillatio defaults a bare task to scout (the other half of the boundary)", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const result = await invoke(pi, "vexillatio", {
+			task: "Inspect the test repository and report facts.",
+			timeoutMs: 10_000,
+		}, context(cwd));
+		assert.match(result.content[0]?.text ?? "", /── scout-0 ──/);
+		assert.equal((result.details as { error?: string } | undefined)?.error, undefined);
 		assert.equal(supervisor.spawns.length, 1);
-		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_CHILD, "1");
+		assert.equal(supervisor.spawns[0]?.input.agent.name, "scout");
 		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_UTILITY_CHILD, "1");
-		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_ALLOW_NESTED, undefined);
-		assert.equal(supervisor.spawns[0]?.input.allowNestedSubagents, undefined);
+		// D2: the utility child stays a hard leaf — its allowlist must not grow
+		// `vexillatio` back (it moved here from the retired subagent-utility path).
 		const toolsIndex = supervisor.spawns[0]?.args.indexOf("--tools") ?? -1;
-		assert.equal(supervisor.spawns[0]?.args[toolsIndex + 1], "read,grep,find,ls,legion_mail,legion_tree,legion_phase", "utility roles must not inherit vexillatio");
+		assert.equal(
+			supervisor.spawns[0]?.args[toolsIndex + 1],
+			"read,grep,find,ls,legion_mail,legion_tree,legion_phase",
+			"utility roles must not inherit vexillatio",
+		);
+		assert.equal(supervisor.spawns[0]?.input.allowNestedSubagents, undefined);
 	});
 });
 
@@ -494,37 +610,40 @@ test("vexillatio tasks launch distinct same-role children and return each output
 	});
 });
 
-test("vexillatio continues name allocation after subagent launches the same utility", async () => {
+test("vexillatio continues name allocation across consecutive recon batches", async () => {
 	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
-		const first = await invoke(pi, "subagent", {
-			agent: "scout",
+		// dispatch-boundary-v1 D1 retired the cross-tool form of this case
+		// (`subagent` used to launch the same utility first); name allocation is now
+		// vexillatio-only, and consecutive batches must still continue the counter.
+		const first = await invoke(pi, "vexillatio", {
 			task: "Inspect the first area.",
-			async: false,
-			worktree: false,
+			agent: "scout",
+			timeoutMs: 10_000,
 		}, context(cwd));
-		assert.match(first.content[0]?.text ?? "", /scout-0/);
+		assert.match(first.content[0]?.text ?? "", /── scout-0 ──/);
 
 		const second = await invoke(pi, "vexillatio", {
 			task: "Inspect the second area.",
 			agent: "scout",
+			timeoutMs: 10_000,
 		}, context(cwd));
 		assert.match(second.content[0]?.text ?? "", /── scout-1 ──/);
 		assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.name), ["scout-0", "scout-1"]);
 	});
 });
 
-test("vexillatio avoids a live same-name subagent and returns on collect timeout", async () => {
+test("vexillatio avoids a live same-name sibling and returns on collect timeout", async () => {
 	const supervisor = new FakeSupervisor({ immediateTimeout: true });
 	await withSandbox(
 		{},
 		async ({ pi, cwd }) => {
-			const first = await invoke(pi, "subagent", {
-				agent: "scout",
+			const first = await invoke(pi, "vexillatio", {
 				task: "Inspect the first area.",
-				async: true,
-				worktree: false,
+				agent: "scout",
+				timeoutMs: 50,
 			}, context(cwd));
-			assert.match(first.content[0]?.text ?? "", /scout-0/);
+			assert.match(first.content[0]?.text ?? "", /── scout-0 ──/);
+			assert.match(first.content[0]?.text ?? "", /execution: running/);
 
 			const second = await invoke(pi, "vexillatio", {
 				task: "Inspect the second area.",
