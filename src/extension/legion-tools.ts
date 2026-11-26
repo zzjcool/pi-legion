@@ -345,7 +345,7 @@ export class LegionPostman {
 	private async deliverChildren(children: readonly LegionNode[]): Promise<void> {
 		for (const child of children) {
 			// #384 review m6: an IN-PROCESS child that is blocked in its own
-			// `wait`/`collect` holds its inbox, and this postman runs in the same process —
+			// `wait` holds its inbox, and this postman runs in the same process —
 			// so it must stand aside exactly like the root one does (§1.1). A child on RPC
 			// lives in another process, where this registry is invisible: there the §3.1
 			// lease is what keeps the message from being delivered twice.
@@ -358,7 +358,7 @@ export class LegionPostman {
 	}
 
 	private async deliverRootInbox(): Promise<void> {
-		// #384 review round 3: a blocked `wait`/`collect` from this node owns its inbox.
+		// #384 review round 3: a blocked `wait` from this node owns its inbox.
 		// Delivering now would push the text into the host's followUp queue (measured:
 		// ~200ms after the write) and leave the tool's poll staring at an empty PENDING
 		// set for the whole wait — the mail would still arrive only at the turn boundary,

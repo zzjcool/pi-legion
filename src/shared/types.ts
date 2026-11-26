@@ -454,17 +454,17 @@ export interface ChildRecord {
 	 * (`docs/contracts/result-ledger-v1.md` §3 D1). Travels with `outputFile` and is
 	 * absent under exactly the same conditions (running snapshot / empty output /
 	 * failed write / no ledger row). Kept beside the path because the artifact id is
-	 * what the ledger is keyed on: a later process's `collect` reads it back from here
+	 * what the ledger is keyed on: a later process's `wait` reads it back from here
 	 * (`Orchestrator.cachedCollect`) instead of re-deriving a round it cannot know.
 	 */
 	artifactId?: string;
 	/**
 	 * Acceptance criteria declared by the agent, copied here at launch so a
-	 * `collect` in a later process (each tool call is a fresh process) can still
+	 * `wait` in a later process (each tool call is a fresh process) can still
 	 * surface them without re-reading the agent definition.
 	 */
 	pendingCriteria?: AcceptanceCriterion[];
-	/** Snapshotted at launch so a later collect can honour design §5.3. */
+	/** Snapshotted at launch so a later wait can honour design §5.3. */
 	onBlocked?: OnBlockedPolicy;
 	/** Snapshotted at launch; missing `{"ok":…}` on success becomes rejected. */
 	completionGuard?: boolean;
@@ -475,7 +475,7 @@ export interface ChildRecord {
 	/**
 	 * Machine that ran this child; absent = this host.
 	 *
-	 * Persisted so a later `collect`/`resume` in another process can tell a local
+	 * Persisted so a later `wait`/`resume` in another process can tell a local
 	 * child from a cross-machine one instead of assuming every record is local.
 	 */
 	host?: string;
@@ -503,7 +503,7 @@ export interface ChildRecord {
 	 * The address the core actually holds for that child's terminal (`host/name`).
 	 *
 	 * Persisted because the core may shorten the name it was asked for: a later
-	 * `collect` in another process then asks about the terminal that exists instead
+	 * `wait` in another process then asks about the terminal that exists instead
 	 * of one it guessed from the record.
 	 */
 	remoteTerminal?: string;
@@ -1068,7 +1068,7 @@ export interface SubagentsSettings {
 	/**
 	 * Master switch (default true). `false` stops new launches, system-prompt
 	 * roster injection, and the bash dispatch guard. Already-running children
-	 * are untouched: control actions (status/collect/wait/…) stay available.
+	 * are untouched: control actions (status/wait/…) stay available.
 	 * Project `.pi/settings.json` wins over the user file.
 	 */
 	enabled?: boolean;

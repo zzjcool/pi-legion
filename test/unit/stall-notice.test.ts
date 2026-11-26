@@ -354,7 +354,7 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 	assert.match(body, /steer reaches a child at a turn boundary/);
 	// D5: `extend` must be distinguishable from the other three actions.
 	assert.match(body, /defers only this L2 reminder/);
-	assert.match(body, /does not extend a collect\/wait budget/);
+	assert.match(body, /does not extend a wait budget/);
 	assert.match(body, /is not `continue`/);
 });
 
@@ -427,7 +427,7 @@ test("D8 chain: card loopNoticeMs → card timeoutMs → DEFAULTS.turnTimeoutMs"
 	// 3. only `loopNoticeMs`.
 	assert.equal(resolveLoopRadiusMs({ loopNoticeMs: 5 * MINUTE }), 5 * MINUTE);
 	// 4. both → the explicit reminder wins, which is the point of the field: raising
-	//    `timeoutMs` (a collect/wait budget) must not silently push the reminder back.
+	//    `timeoutMs` (a wait budget) must not silently push the reminder back.
 	assert.equal(resolveLoopRadiusMs({ loopNoticeMs: 5 * MINUTE, timeoutMs: 45 * MINUTE }), 5 * MINUTE);
 	// An EXPLICIT 0 is the off switch, not a hole to fall through into `timeoutMs`.
 	assert.equal(resolveLoopRadiusMs({ loopNoticeMs: 0, timeoutMs: 45 * MINUTE }), undefined);

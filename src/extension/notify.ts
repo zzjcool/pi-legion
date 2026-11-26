@@ -736,7 +736,7 @@ export function completionDeliveryOptions(
  * Inject the notice into the parent session.
  *
  * Returns false when the runtime rejected the send (session gone, shutdown).
- * The child's session file is still on disk; the parent can `collect` later.
+ * The child's session file is still on disk; the parent can `wait` later.
  */
 export function deliverCompletion(
 	pi: SendMessageApi,

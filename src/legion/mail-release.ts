@@ -1,5 +1,5 @@
 /**
- * #384 — hand a node its mail while it is BLOCKED in `wait`/`collect`.
+ * #384 — hand a node its mail while it is BLOCKED in `wait`.
  *
  * `legion_mail` reaches a parent through `notice()` → `pi.sendMessage({ deliverAs:
  * "followUp" })`, and the host only takes a followUp when the current turn is
@@ -40,7 +40,7 @@ import {
 /** Contract §2: at most this many mails ride out on one preemption. */
 const MAIL_RELEASE_LIMIT = 100;
 
-/** Contract §1: how often a blocked `wait`/`collect` looks at the inbox. */
+/** Contract §1: how often a blocked `wait` looks at the inbox. */
 const MAIL_PREEMPT_POLL_MS = 250;
 
 /**
@@ -332,7 +332,7 @@ export function redeliverMail(db: DatabaseSync, messageIds: readonly number[]): 
  * `finally`; a ledger that closed under us is not the caller's problem.
  *
  * The timer is deliberately NOT `unref`'d (#384 CI): the poll is the only thing
- * that can end a blocked `wait`/`collect` early, so a process whose event loop
+ * that can end a blocked `wait` early, so a process whose event loop
  * holds nothing else would otherwise drain and leave the tool's promise pending
  * forever — node reports that as `Promise resolution is still pending but the
  * event loop has already resolved`. It lives exactly as long as the blocking

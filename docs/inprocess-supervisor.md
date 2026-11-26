@@ -81,7 +81,7 @@ Never fall back across columns: in-process limits are read from
 ### Renewing a budget casualty (#270)
 
 An agent's `timeoutMs` is the parent's **wait** budget, not a kill switch: when
-it elapses, `collect`/`wait` stop waiting and report `running`, and the child
+it elapses, `wait` stops waiting and reports `running`, and the child
 keeps running (the watch re-arms). Nothing in pi or pi-legion terminates a child
 at that deadline — verified against pi 1.4: no CLI flag, no settings key, and no
 timeout is passed in a child's argv.
@@ -114,7 +114,7 @@ same sentence grows that counter without doing any work. With no progress the
 notice says so instead of offering the command, and once the budget is spent it
 tells you to split the task.
 
-`wait`/`collect` timeouts never produce a proposal: those return while the child
+`wait` timeouts never produce a proposal: those return while the child
 is still alive, which is the opposite situation.
 
 ### Launch admission queue (#266)
@@ -147,7 +147,7 @@ another process. An `idle` child (turn ended, not yet collected) **still holds
 its slot**, exactly as before.
 
 Known limit: the queue is in memory, so a process restart drops it. The leftover
-`queued` records in `run.json` are inert — `collect`/`steer` on one says
+`queued` records in `run.json` are inert — `wait`/`steer` on one says
 `never started: the launch queue was lost …` instead of `unknown child`, and
 `stop` cleans it up.
 

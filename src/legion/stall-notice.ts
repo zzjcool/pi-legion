@@ -343,7 +343,7 @@ export function stallNoticeChildNames(body: string): string[] {
  * receipt means "call wait again" — this one only moves the L2 reminder.
  */
 const EXTEND_FOOTER =
-	'`subagent({action:"extend", name, ms?})` defers only this L2 reminder: it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`.';
+	'`subagent({action:"extend", name, ms?})` defers only this L2 reminder: it does not extend a wait budget, does not restart or revive the child, and is not `continue`.';
 
 function silenceLine(announcement: StallAnnouncement): string {
 	return `- ${announcement.childName}: no event for ${formatStallDuration(announcement.elapsedMs)} with nothing in flight (threshold ${formatStallDuration(announcement.thresholdMs)}). The child is not inside a turn, so steer cannot land here; abort can.`;

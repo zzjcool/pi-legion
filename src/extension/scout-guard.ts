@@ -311,7 +311,7 @@ export function registerScoutGuard(pi: ExtensionAPI, deps: ScoutGuardDeps = {}):
 
 function isDispatchCall(toolName: string, input: unknown): boolean {
 	// vexillatio only launches utility agents. subagent defaults to launch;
-	// status/collect/wait/stop and the other control actions are not dispatches.
+	// status/wait/stop and the other control actions are not dispatches.
 	// tool_call cannot see the tool result, so the launch call itself is the
 	// dispatch signal — waiting would block this tool_call.
 	if (toolName === "vexillatio") return true;

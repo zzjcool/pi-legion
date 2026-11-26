@@ -1,7 +1,7 @@
 /**
  * One name, one scope (#312).
  *
- * Child names are resolved in four different places — `status`, `collect`,
+ * Child names are resolved in four different places — `status`, `wait`,
  * `stop`, `continue` — and before this module each one had its own idea of what
  * a name means:
  *
@@ -247,7 +247,7 @@ function readRunOrNull(
 /**
  * Resolve one name, paying for the run registry only when the answer needs it (#344).
  *
- * Every control call (`collect` / `status` / `steer` / `abort` / `continue`)
+ * Every control call (`status` / `wait` / `steer` / `abort` / `continue`)
  * used to start with `store.listRuns()` — a `readdir` plus a
  * `JSON.parse` per run — even when it already knew the run it was scoped to.
  * The scan is O(runs) and the scope is usually free, so the order is inverted

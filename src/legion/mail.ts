@@ -500,7 +500,7 @@ export function transitionDelivery(
  *
  * The postman used to send first and record `ACCEPTED` afterwards, which left the row
  * `PENDING` for the whole awaited send call. A recipient blocked in its own
- * `wait`/`collect` polls the same row (#384) and would take it inside that window, so
+ * `wait` polls the same row (#384) and would take it inside that window, so
  * the text reached the child twice: once as the postman's followUp and once as the
  * tool result. The claim is a CONDITIONAL update, so the loser gets `false` and skips
  * its own send: the ledger decides who delivers, not the ordering of two async sites.

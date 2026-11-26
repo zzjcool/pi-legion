@@ -484,7 +484,7 @@ export function acquireAdmissionQueue<T = unknown>(
 /**
  * Read the queue a **different** instance created, without creating one.
  *
- * The control-action paths (`subagent stop`/`status`/`collect`) build their own
+ * The control-action paths (`subagent stop`/`status`/`wait`) build their own
  * Orchestrator (`index.ts` has five `new Orchestrator` sites), so an instance
  * that never launched anything must still be able to see — and dequeue from — the
  * queue its sibling owns (§13.6 / §6.1). `acquireAdmissionQueue` cannot be used

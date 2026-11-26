@@ -51,7 +51,7 @@ const VexillatioParams = Type.Object({
 });
 ```
 
-**只有 launch 语义**（无 status/collect/wait/steer/retire——用 `subagent` 工具的既有控制动作管理同名子节点；见 2.6）。
+**只有 launch 语义**（无 status/wait/steer/retire——用 `subagent` 工具的既有控制动作管理同名子节点；见 2.6）。
 
 **先于下列步骤的前置校验**：`tasks[]` 条目带 `name` → 硬拒（`INVALID_PARAMS`），消息为 ``tasks[] step <i> cannot include `name`; vexillatio allocates one handle per step itself.``。命名权归 vexillatio（§2.6 `<role>-N` 接续父节点既有 children），接受该字段等于把「调用方指定的 handle 静默失效」搬进工具人通道。
 

@@ -436,7 +436,7 @@ headless 父进程打完 launch 就退出时，child 可能还在远端跑；新
 `…/.pi-subagents-mirror/no-run/<handle>/session.jsonl`。后果有两种，都很像「child 没干活」：
 
 - 上一轮残留的转录让新的**启动确认**提前通过；
-- `collect` 读回时拿到的是**上一轮**那份（特别短）的转录。
+- `wait` 读回时拿到的是**上一轮**那份（特别短）的转录。
 
 master 的 `xm-dispatch` 报告（「已知遗留」）把它记为既有风险，本卡不改交付通道。遇到时：
 

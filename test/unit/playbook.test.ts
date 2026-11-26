@@ -325,7 +325,7 @@ test("ops-verbs-v2: the `action` description stays inside its 950-character budg
  *
  * The criterion, written down so it is reviewable rather than implied:
  *   1. a backticked token  — `` `retire` ``
- *   2. a slash-separated action list — `status/collect/…/retire)`
+ *   2. a slash-separated action list — `status/wait/…/stop)`
  *   3. an explicit call shape — `action: "retire"`
  *
  * English uses of the verb are deliberately NOT matched: `stop` really does retire
