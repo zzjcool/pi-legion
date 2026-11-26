@@ -370,9 +370,12 @@ test("non-legion children can control utility agents dispatched through vexillat
 			assert.match(status.content[0]?.text ?? "", /scout-0/);
 
 			const collected = await invoke(pi, "subagent", {
-				action: "collect",
+				action: "wait",
 				name: "scout-0",
 			}, context(cwd));
+			// A2/D5: the utility child's handles are released at dispatch, so the parent's
+			// runtime never tracks it — this is the path `wait`'s STORE fallback exists for
+			// (it replaced the deleted `collect`, whose only reach was `run.json`).
 			assert.equal((collected.details as { error?: string } | undefined)?.error, undefined);
 			assert.match(collected.content[0]?.text ?? "", /utility output for scout/);
 		},

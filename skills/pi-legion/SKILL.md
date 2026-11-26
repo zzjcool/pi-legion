@@ -82,7 +82,7 @@ Manual walkthrough: `docs/runbooks/cross-machine-centurion-demo.md`.
 A remote child that dies at start-up answers with the exit code, the last screen
 text and a `Command (run on '<host>' to reproduce):` line — paste that command
 instead of guessing. An `execution: unknown (transcript not retrieved from host '…')`
-is this machine's blind spot, not the child's fate: the collect's read-back block
+is this machine's blind spot, not the child's fate: the result's read-back block
 carries the remote path and the `hc exec --on <host> -- cat <path>` line that fetches
 it — use that before reporting a failure.
 
@@ -193,11 +193,10 @@ protect against intentional writes. Pi Legion runs `kind: pi` roles only; the
 
 ## Later control
 
-Steer, inspect, collect, resume, or stop children with the `subagent` tool:
+Steer, inspect, wait for, resume, or stop children with the `subagent` tool:
 
 ```text
 subagent({ action: "status", name: "worker-0" })
-subagent({ action: "collect", name: "worker-0" })
 subagent({ action: "wait", all: true })
 subagent({ action: "wait", name: "worker-0" })
 subagent({ action: "steer", name: "worker-0", message: "Focus on the parser tests." })
@@ -219,4 +218,4 @@ machine-recorded state.
 `pi --print` and JSON mode wait for live async children during session
 shutdown, up to each child's turn timeout. That keeps a just-spawned child
 from being retired before its first assistant message. To put the child's
-result in the same print turn, use `wait`, `collect`, or `async: false`.
+result in the same print turn, use `wait` or `async: false`.

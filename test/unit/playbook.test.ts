@@ -108,7 +108,7 @@ test("playbook describes event-driven waits and graceful stop", () => {
 });
 
 test("playbook explains timeout and steering semantics", () => {
-	assert.match(PARENT_PLAYBOOK, /collect timeout with a live child is a progress signal/);
+	assert.match(PARENT_PLAYBOOK, /`wait` timeout with a live child is a progress signal/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /live RPC child/);
 	assert.match(PARENT_PLAYBOOK, /session JSONL/);
 	assert.match(PARENT_PLAYBOOK, /Do not tell a child to message or prompt the parent/);
@@ -273,9 +273,9 @@ test("D2: the tool description does not embed the playbook — one text, one inj
  * any edit to either.
  */
 const FROZEN_EXTEND =
-	"extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a collect/wait budget or the child's own timeout, and never restarts, revives or steers it.";
+	"extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a wait budget or the child's own timeout, and never restarts, revives or steers it.";
 const FROZEN_RECOVER =
-	"recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `collect`; a still-live child is only reported. `/legion status` lists what is recoverable.";
+	"recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `wait`; a still-live child is only reported. `/legion status` lists what is recoverable.";
 
 test("ops-verbs-v2 D3/D2: `extend` and `recover` are the frozen text, verbatim", async () => {
 	const harness = playbookHarness();

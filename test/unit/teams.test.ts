@@ -1394,7 +1394,7 @@ test("agent_settled without abort leaves async children running", async () => {
 	}
 });
 
-test("index collect abort returns promptly without retiring the RPC child", async () => {
+test("index wait abort returns promptly without retiring the RPC child", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "worker.md": WORKER_FILE },
@@ -1407,8 +1407,8 @@ test("index collect abort returns promptly without retiring the RPC child", asyn
 		if (!name) throw new Error("worker child did not spawn");
 		const controller = new AbortController();
 		const pending = harness.tool.execute(
-			"collect-abort",
-			{ action: "collect", name },
+			"wait-abort",
+			{ action: "wait", name },
 			controller.signal,
 			undefined,
 			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
@@ -1419,9 +1419,9 @@ test("index collect abort returns promptly without retiring the RPC child", asyn
 		assert.equal(
 			harness.supervisor.calls.some((call) => call.method === "retire"),
 			false,
-			"collect abort must not retire",
+			"wait abort must not retire",
 		);
-		assert.equal(harness.supervisor.isAlive(name), true, "collect abort leaves the child running");
+		assert.equal(harness.supervisor.isAlive(name), true, "wait abort leaves the child running");
 	} finally {
 		await harness.cleanup();
 	}

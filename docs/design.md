@@ -322,7 +322,7 @@ CREATE TABLE nodes (
 
 - **session 文件保留**：retire 只停会话，不删 transcript —— 它是 resume 的唯一凭据。
 - **worktree 保留**：retire 后目录留在 `runs/<runId>/worktrees/<name>`，hygiene 也明确不删带 `worktrees/` 的 run 目录。
-- **父退出**：root 会话正常关闭时 `shutdownRetire` 会回收**自己这一支**的 children（`index.ts` 的 shutdown 路径）；异常死亡留下的行由 orphan 扫描收敛为 `failed` + `node_abandoned`（`LegionPostman.scanOrphans`），并由启动卫生再扫一遍。子会话的交付语义绑定在父的 collect 上，不存在「父死子继续交付」。
+- **父退出**：root 会话正常关闭时 `shutdownRetire` 会回收**自己这一支**的 children（`index.ts` 的 shutdown 路径）；异常死亡留下的行由 orphan 扫描收敛为 `failed` + `node_abandoned`（`LegionPostman.scanOrphans`），并由启动卫生再扫一遍。子会话的交付语义绑定在父取结果（`wait`）上，不存在「父死子继续交付」。
 - **ESC 不级联**：父 turn 被中断只返回 `interrupted`，子 agent 继续跑（`esc-no-retire-v3`）；「杀掉父 tab 子进程继续完成任务」的 herdr 结论已作废。
 - **名字释放**：回收后名字可复用（注册表按 owner 判活）。
 
@@ -355,7 +355,7 @@ frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/ag
 
 | 键 | 默认 | 含义 |
 | --- | --- | --- |
-| `subagents.enabled` | `true` | 总开关；关闭后拒绝新 launch，但控制类动作（status/collect/wait/…）仍可用 |
+| `subagents.enabled` | `true` | 总开关；关闭后拒绝新 launch，但控制类动作（status/wait/…）仍可用 |
 | `subagents.legion.maxDepth` | `4` | 血缘深度上限 |
 | `subagents.legion.maxChildrenPerNode` | `8` | 单节点直接子节点上限 |
 | `subagents.legion.maxActiveNodes` | `30` | 全树活跃节点上限 |
@@ -482,7 +482,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 **路径 A：postman tick。** `LegionPostman`（`src/extension/legion-tools.ts`）每 2s（`POSTMAN_INTERVAL_MS`）跑一轮：刷新心跳 → stall 检测 → 确认已 ACCEPTED 的投递 → 给子节点投递 → 给 root 投递 → 轮询 usage → 收队/失败安全网 → orphan 扫描 → 自身 phase 超时。投递前先跑 `discardIfStaleNotice`，把过时通知转 `OBSOLETE` 并写 `mail_bounced`。
 
-**路径 B：阻塞工具抢占（`#384`）。** 父会话卡在 `wait`/`collect` 里时，followUp 只会在 turn 边界进；所以阻塞期间由工具自己把邮箱取走：`beginMailHold(nodeId)` 冻结 postman（同进程可见），`takePendingMail` 逐条 claim + 转 `ACCEPTED`，把文本并入工具结果（`renderReleasedMail`，单次上限 100 条，250ms 轮询）。工具结果被丢弃时 `redeliverMail` 以 `Redelivered: ` 前缀重新入队（不消耗发件人配额）。hold 在阻塞调用的每条退出路径上 `endMailHold` 释放。
+**路径 B：阻塞工具抢占（`#384`）。** 父会话卡在 `wait` 里时，followUp 只会在 turn 边界进；所以阻塞期间由工具自己把邮箱取走：`beginMailHold(nodeId)` 冻结 postman（同进程可见），`takePendingMail` 逐条 claim + 转 `ACCEPTED`，把文本并入工具结果（`renderReleasedMail`，单次上限 100 条，250ms 轮询）。工具结果被丢弃时 `redeliverMail` 以 `Redelivered: ` 前缀重新入队（不消耗发件人配额）。hold 在阻塞调用的每条退出路径上 `endMailHold` 释放。
 
 **两条路径靠同一个租约互斥**：先 claim 到的那条投，另一条拿不到；RPC 子进程看不到内存里的 hold 注册表，因此跨进程只能靠租约。
 
@@ -541,7 +541,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 | 工具 | 可用者 | 作用 |
 | --- | --- | --- |
-| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 12 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `status` / `collect` / `wait` / `stop` / `diagnose` / `extend` / `recover` |
+| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 11 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `status` / `wait` / `stop` / `diagnose` / `extend` / `recover` |
 | `vexillatio` | 宿主会话（utility child 自身不注册） | 只派 read-only utility agent（`scout`），永远 leaf |
 | `legion_mail` / `legion_tree` / `legion_phase` | **子进程**（`registerTools: true`，root 为 `false`） | 发信 / 看子树 / 请求阶段迁移 |
 
@@ -574,8 +574,8 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 - 执行结果由 `parseSessionFile` + `deriveOutcome`（`src/shared/session.ts`）从 session jsonl 推导；backend 只负责给 settle 信号（`SettleResult`）。
 - 中断（ESC / `abort`）保留子会话：`abort` 只打断当前 turn，`stop` 才拆会话（`#313`/`#314`）。
-- `wait`/`collect` 超时不是失败：返回结构化 `decisions`（`extend` / `steer_again` / `stop` / `force_stop`），由父级选。
-- 验收（acceptance）：`deriveOutcome` 之外再看 `acceptance.level`。`attested` 是 agent 自评；只有 `verification-output` 证据且带显式 `command` 的 required 条件，才会由 `src/runs/acceptance.ts` 真跑并升级为 `verified` 或判 `rejected`——**且只对终态 collect**：`collect` 超时返回的 `running` 是「child 还活着」的快照、不是结果，`finishCollect` 对 `execution.status === "running"` 不调 `applyVerification`（`D393-5`），快照不得在仍在写入的 worktree 里跑命令（deadline 已过，`Math.max(5_000, …)` 几乎必超时，只会制造伪 `rejected`/伪 `verified`）；aborted / blocked collect 同样不跑（各自经 `abortedSnapshot` / `blockedResult` 返回）。没有 `command` 的条件保持 `attested` 并列为 pending，交给父 agent 确认——平台不猜命令。跑不跑只看「有没有 `command`」，不看 child 自述的 `ok`：child 自报 `ok: false` 时命令照样跑，全绿只升级 `level`、`status` 保持 child 自报值（不静默翻案），命令报错才判 `rejected`（#393）。
+- `wait` 超时不是失败：返回结构化 `decisions`（`extend` / `steer_again` / `stop` / `force_stop`），由父级选。
+- 验收（acceptance）：`deriveOutcome` 之外再看 `acceptance.level`。`attested` 是 agent 自评；只有 `verification-output` 证据且带显式 `command` 的 required 条件，才会由 `src/runs/acceptance.ts` 真跑并升级为 `verified` 或判 `rejected`——**且只对终态结果**：`wait` 超时返回的 `running` 是「child 还活着」的快照、不是结果，`finishCollect` 对 `execution.status === "running"` 不调 `applyVerification`（`D393-5`），快照不得在仍在写入的 worktree 里跑命令（deadline 已过，`Math.max(5_000, …)` 几乎必超时，只会制造伪 `rejected`/伪 `verified`）；aborted / blocked 的快照同样不跑（各自经 `abortedSnapshot` / `blockedResult` 返回）。没有 `command` 的条件保持 `attested` 并列为 pending，交给父 agent 确认——平台不猜命令。跑不跑只看「有没有 `command`」，不看 child 自述的 `ok`：child 自报 `ok: false` 时命令照样跑，全绿只升级 `level`、`status` 保持 child 自报值（不静默翻案），命令报错才判 `rejected`（#393）。
 - 失败要能被定位：rpc 启动失败由 `enrichFailureWithAutoDoctor` 附 doctor 片段；in-process 的失败由 `appendInprocessModelHint`（`src/extension/spawn-hints.ts`，纯函数）按**根因**追加 Fix 段，顺序是：先 `hasHintSection`（已有 `Hint:` / `--- Legion auto-doctor` 的消息一律不再追加）→ 凭证词表（`No API key found for` / `Authentication failed for` / `No matching provider is authenticated`）给 `/login <provider>` 的建议 → 否则命中 `inprocess model resolve failed` 才给 `models.json` / `PI_LEGION_CHILD_EXTENSIONS`。凭证优先于标记：一个「解析失败但真因是没登录」的错误必须拿到登录建议，而不是去改声明文件。渲染点是 launch 与 utility 共用的，所以 rpc 的同类失败（自带 `Hint:` 的除外）也会拿到同一段凭证建议——文案本身对两种后端都成立，幂等闸保证不叠第二段。其余 in-process 失败码（`kind` 不是 pi、inprocess+worktree、`NAME_TAKEN`、`BUDGET_EXCEEDED`）**刻意不加 hint**：它们的文案已经自带可执行修法（`set worktree: false`、`raise subagents.inprocess.…`），再贴一段只是噪声。普通 `Error` 的文案逐字不变。
 
 ---

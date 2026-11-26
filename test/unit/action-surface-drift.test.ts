@@ -54,7 +54,6 @@ const LIFECYCLE_ORDER = [
 	"abort",
 	"resume",
 	"status",
-	"collect",
 	"wait",
 	"stop",
 	"diagnose",
@@ -114,7 +113,7 @@ function readmeActionNames(markdown: string): string[] {
 
 /**
  * The `subagent` row of the `docs/design.md` §9.3 table: the 作用 cell lists the
- * actions AND states the count (`12 个动作`). Both are returned — a table can keep
+ * actions AND states the count (`11 个动作`). Both are returned — a table can keep
  * every name right and still lie about how many there are.
  */
 function designActionTable(markdown: string): { readonly names: string[]; readonly count: number } {
@@ -259,6 +258,16 @@ test("D1: the drift comparison is not vacuous — a dropped, extra or doubled ac
 	);
 	// Order is not what the SET check cares about (the order pins live above).
 	assert.doesNotThrow(() => assertSameActionSet("same set, other order", [...canonical].reverse(), canonical));
+});
+
+test("collect-merge-v1 D1: the surface is 11 actions and no longer offers `collect`", () => {
+	// The COUNT is a governance anchor (like `LIFECYCLE_ORDER` above): the set
+	// assertions are computed from `ACTION_NAMES`, so only a literal number here says
+	// "exactly one action was deleted, not two." The registered schema and the
+	// `Actions:` line are proven `collect`-free by the equality tests above.
+	assert.equal(ACTION_NAMES.length, 11, "collect-merge-v1 took the surface from 12 to 11");
+	assert.equal(ACTION_NAMES.filter((action) => (action as string) === "collect").length, 0, "`collect` is not an action");
+	assert.equal(Object.keys(ACTION_SPECS).includes("collect"), false, "no orphan spec survives the deletion");
 });
 
 test("D1: ACTION_SPECS covers exactly ACTION_NAMES and names only real schema fields", async () => {

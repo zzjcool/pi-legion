@@ -192,9 +192,14 @@ function trackCollect(fixture: Harness, sessionFile: string): SessionRuntime {
 }
 
 /**
- * The `collect` context `controlAction` would build, cut down to what `collectChild`
+ * The context the internal collect seam needs, cut down to what `collectChild`
  * reads. It carries NO ledger seam on purpose: since D3b the handler cannot record a
  * read at all — it only names the artifact in `details.ledgerReads`.
+ *
+ * No `action`/`params` fields: `collectChild` reads neither, and since
+ * `collect-merge-v1` the `collect` ACTION no longer exists (`wait` carries the
+ * model-facing wait/collect verb) — this file still drives the RETAINED internal
+ * seam directly, which is what its D3b assertions are about.
  */
 function collectFixture(
 	fixture: Harness,
@@ -202,8 +207,6 @@ function collectFixture(
 	orchestrator: Orchestrator,
 ): Parameters<typeof collectChild>[0] {
 	return {
-		action: "collect",
-		params: { action: "collect", name: CHILD },
 		name: CHILD,
 		supervisor: fixture.supervisor,
 		onBudgetRefused: () => ({ ok: false, message: "no budget" }),
@@ -316,12 +319,13 @@ test("P4a: a collect that bails before delivering declares NOTHING (persistChild
 		} as unknown as Orchestrator;
 
 		const result = await collectChild(collectFixture(fixture, runtime, failingOrchestrator));
-		assert.match(textOf(result), /collect failed/, "the tool call failed, so the snapshot reached nobody");
+		assert.match(textOf(result), /no result: store unreachable/, "the tool call failed, so the snapshot reached nobody");
+		assert.doesNotMatch(textOf(result), /collect/, "the answer names no deleted action");
 		assert.equal((result.details as { error?: string }).error, "NOT_FOUND");
 		assert.deepEqual(declaredReads(result), [], "a bail declares no read");
 
 		const settled = await settle(result, runtime, legionOf(fixture.db));
-		assert.match(textOf(settled), /collect failed/, "settling a failure changes nothing");
+		assert.match(textOf(settled), /no result: store unreachable/, "settling a failure changes nothing");
 
 		const artifactId = `${fixture.runId}/${CHILD}/r1`;
 		assert.ok(artifactById(fixture.db, artifactId), "positive control: the artifact the snapshot named exists");

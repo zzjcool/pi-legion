@@ -123,7 +123,7 @@ test("toggle: status distinguishes session override from settings", () => {
 		}),
 		[
 			"Subagents are disabled — session override (settings unchanged; /reload restores them).",
-			"No new launches; the roster and the bash dispatch guard are off from the next turn. Existing children are untouched — status/collect/wait keep working.",
+			"No new launches; the roster and the bash dispatch guard are off from the next turn. Existing children are untouched — status/wait keep working.",
 			"2 children still running; they finish and notify normally.",
 		].join("\n"),
 	);

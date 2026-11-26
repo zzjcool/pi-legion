@@ -108,6 +108,7 @@ import { renderSpawnResult } from "./src/extension/spawn-render.ts";
 import { appendInprocessModelHint } from "./src/extension/spawn-hints.ts";
 import {
 	ACTION_NAMES,
+	ACTION_SPECS,
 	inertParamsFor,
 	inertParamsMessage,
 	type ActionName,
@@ -315,7 +316,7 @@ const TaskItem = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
+				"Commands the extension runs itself in the child worktree when the child's result is delivered; first non-zero exit rejects the verdict. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 });
@@ -339,7 +340,7 @@ const SubagentParams = Type.Object({
 	action: Type.Optional(
 		Type.Union(
 			ActionLiterals,
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a collect/wait budget or the child's own timeout, and never restarts, revives or steers it. recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `collect`; a still-live child is only reported. `/legion status` lists what is recoverable." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a wait budget or the child's own timeout, and never restarts, revives or steers it. recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `wait`; a still-live child is only reported. `/legion status` lists what is recoverable." },
 		),
 	),
 	agent: Type.Optional(
@@ -390,7 +391,7 @@ const SubagentParams = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; a non-zero exit rejects the child's verdict as `rejected (attested)`, while an all-green run only raises the level to `verified` and leaves the status the child reported. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
+				"Verification commands the extension runs itself in the child worktree when the child's result is delivered (launch only). Each must exit 0; a non-zero exit rejects the child's verdict as `rejected (attested)`, while an all-green run only raises the level to `verified` and leaves the status the child reported. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 	phases: Type.Optional(
@@ -433,7 +434,7 @@ const SubagentParams = Type.Object({
 	name: Type.Optional(
 		Type.String({
 			description:
-				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On wait: REQUIRED unless all:true (mutually exclusive with all). On other control actions (stop/collect/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
+				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On wait: REQUIRED unless all:true (mutually exclusive with all). On other control actions (stop/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
 		}),
 	),
 	all: Type.Optional(
@@ -444,18 +445,18 @@ const SubagentParams = Type.Object({
 	runId: Type.Optional(
 		Type.String({
 			description:
-				'control actions (status/collect/stop/continue/resume/steer/abort): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
+				'control actions (status/stop/continue/resume/steer/abort): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "status", name: "worker-0", runId: "r-4fd626ee" }).',
 		}),
 	),
 	timeoutMs: Type.Optional(
 		Type.Number({
-			description: "wait: per-child timeout in ms; event-driven completion returns early (default: the smallest role `timeoutMs` among the targets, else 900000 (15m))",
+			description: "wait: per-child timeout in ms; event-driven completion returns early (default: the smallest role `timeoutMs` among the targets, else 900000 (15m)). A `name` this session's runtime does not track (resolved from the run store) is read at its role's turn budget instead — this value does not bound that read.",
 		}),
 	),
 	ms: Type.Optional(
 		Type.Number({
 			description:
-				'extend only: the new long-running reminder radius in ms (positive integer). Omit to keep the radius already in force. It is a REMINDER setting — it never changes a collect/wait budget or the child\'s own timeoutMs. Example: subagent({ action: "extend", name: "worker-0", ms: 1800000 }).',
+				'extend only: the new long-running reminder radius in ms (positive integer). Omit to keep the radius already in force. It is a REMINDER setting — it never changes a wait budget or the child\'s own timeoutMs. Example: subagent({ action: "extend", name: "worker-0", ms: 1800000 }).',
 		}),
 	),
 	force: Type.Optional(
@@ -3422,6 +3423,13 @@ async function controlAction(input: {
 			// helper (`artifactBytesLookup`) so `collect` and `wait` cannot disagree about
 			// how big a text was.
 			...(input.legion ? { fullBytesOf: artifactBytesLookup(input.legion) } : {}),
+			// A2/D5 (`collect-merge-v1` 附录 A): `wait` resolves targets from THIS session's
+			// runtime only, so a child that lives solely in the run store — a `/reload`ed
+			// session reading its own earlier child, or a `vexillatio` utility child whose
+			// handles were released at dispatch — used to answer `unknown child`. The store
+			// half is answered with `collect`'s own machinery; no new parameter, no new
+			// action, and it runs ONLY on the path that answers NOT_FOUND today.
+			storeTarget: (name) => waitStoreTarget({ caller: input, name, store, cwd }),
 		});
 	}
 
@@ -3632,22 +3640,8 @@ async function controlAction(input: {
 	});
 	const hit = scope.hit;
 	if (hit.kind === "elsewhere") {
-		// #312: never guess between two same-named nodes, whichever action asked.
-		if (hit.candidates.length > 1) {
-			return fail(ambiguousChildMessage(action, params.name, hit.candidates), ErrorCodes.NOT_FOUND);
-		}
-		// `collect`/`continue` are defined over this session's direct children only,
-		// so a same-named node elsewhere is a refusal that names the candidates —
-		// not the old silent adoption of whatever `pickChildByName` preferred.
-		//
-		// Only when a scope EXISTS: a session with no run of its own has no direct
-		// children to protect, and #209-3 keeps that path reaching a foreign/
-		// restarted run's persisted record (the pre-existing contract tests build
-		// exactly that store, with no launch in this session at all). The bug #312
-		// describes needs a session run whose name resolution was overridden.
-		if (directRunId !== undefined && STRICT_SCOPE_ACTIONS.has(action)) {
-			return fail(notDirectChildMessage(action, params.name, hit.candidates), ErrorCodes.NOT_FOUND);
-		}
+		const refusal = scopeRefusal(action, params.name, directRunId, hit.candidates);
+		if (refusal) return refusal;
 	}
 	// `steer`/`abort` keep their pre-#312 reach (one unambiguous record
 	// outside this session's run stays addressable); the scope run is still tried
@@ -3669,6 +3663,72 @@ async function controlAction(input: {
 	// the same NOT_FOUND (above) and never silently "extends" a name nobody has.
 	if (action === "extend") return extendStallNotice(input, params);
 
+	const orchestrator = childOrchestratorFor(input, found, store, cwd);
+
+	const ctx: ChildContext = {
+		...input,
+		name: params.name,
+		found,
+		orchestrator,
+	};
+
+	if (action === "steer") return steerChild(ctx);
+	if (action === "abort") return abortChild(ctx);
+	if (action === "continue" || action === "resume") return reviveChild(ctx);
+
+	return fail(`unhandled action: ${action}`, ErrorCodes.INVALID_PARAMS);
+}
+
+/**
+ * #312: what a name deserves when it resolved to a node OUTSIDE this session's own
+ * run — `undefined` when the action may act on it.
+ *
+ * One copy of the rule, shared by every action that resolves a name here and by
+ * `wait`'s store fallback ({@link waitStoreTarget}, `collect-merge-v1` D5):
+ *
+ *   1. two or more same-named nodes elsewhere is an AMBIGUITY — no action guesses
+ *      through it, whichever one asked;
+ *   2. a STRICT-scope action ({@link STRICT_SCOPE_ACTIONS}) refuses even a unique
+ *      one, naming every candidate so the caller can pass `runId` or go through
+ *      the parent;
+ *   3. only when a scope EXISTS: a session with no run of its own has no direct
+ *      children to protect, and #209-3 keeps that path reaching a foreign/
+ *      restarted run's persisted record (the pre-existing contract tests build
+ *      exactly that store, with no launch in this session at all). The bug #312
+ *      describes needs a session run whose name resolution was overridden.
+ *
+ * `steer`/`abort` keep their pre-#312 reach (one unambiguous record outside this
+ * session's run stays addressable); the scope run is still tried first, so the
+ * common case never depends on the fallback.
+ */
+function scopeRefusal(
+	action: string,
+	name: string,
+	directRunId: string | undefined,
+	candidates: readonly ChildScopeCandidate[],
+): AgentToolResult<unknown> | undefined {
+	if (candidates.length > 1) {
+		return fail(ambiguousChildMessage(action, name, candidates), ErrorCodes.NOT_FOUND);
+	}
+	if (directRunId !== undefined && STRICT_SCOPE_ACTIONS.has(action)) {
+		return fail(notDirectChildMessage(action, name, candidates), ErrorCodes.NOT_FOUND);
+	}
+	return undefined;
+}
+
+/**
+ * The orchestrator every post-resolution branch needs, restored from `run.json`.
+ *
+ * Extracted verbatim from `controlAction` so `wait`'s store fallback
+ * ({@link waitStoreTarget}) builds the SAME collaborators `collect` did instead of
+ * a second, drifting copy.
+ */
+function childOrchestratorFor(
+	input: Parameters<typeof controlAction>[0],
+	found: ChildContext["found"],
+	store: RunStore,
+	cwd: string,
+): Orchestrator {
 	const orchestrator = new Orchestrator({
 		supervisor: input.supervisor,
 		uiProxy: input.uiProxy,
@@ -3692,27 +3752,79 @@ async function controlAction(input: {
 		onBudgetRefused: input.onBudgetRefused,
 	});
 	orchestrator.restore(found.run);
+	return orchestrator;
+}
 
+/**
+ * A2/D5 (`collect-merge-v1` 附录 A): the STORE half of `wait`'s target resolution.
+ *
+ * `wait` has always resolved targets from THIS session's runtime (live jobs, then the
+ * finished cache) and **never** read the run store, so two real reads answered
+ * `unknown child` after `collect` was removed:
+ *
+ *   1. **`/reload` / a new session reading its own earlier child** — the record is in
+ *      `run.json`, no job and no cache slot exists here;
+ *   2. **a `vexillatio` utility child** — its handles are released at dispatch, so the
+ *      parent's runtime never held it.
+ *
+ * Both are answered with `collect`'s own machinery: the same {@link resolveScopedChild}
+ * the `status` / `stop` / `steer` / `abort` paths use, the same
+ * {@link scopeRefusal} rule, and the retained {@link collectChild} seam (which is what
+ * makes "settled ⇒ answer now" and "still running ⇒ read the current turn's last
+ * snapshot" true for free).
+ *
+ * Deliberately narrow: it returns `undefined` for a name that resolves nowhere, so
+ * `waitAction` answers its own `unknown child` (message, code and store lookup
+ * unchanged), and it reads no `runId` — `wait` does not have that scope
+ * (`collect-merge-v1` 非目标 3 / D2).
+ */
+async function waitStoreTarget(input: {
+	/** The calling `controlAction` input: supervisor, settings, legion identity, runtime. */
+	caller: Parameters<typeof controlAction>[0];
+	name: string;
+	store: RunStore;
+	cwd: string;
+}): Promise<AgentToolResult<unknown> | undefined> {
+	const { caller, name, store, cwd } = input;
+	// Scope = this session's own run, or the run the runtime tracks the name under. The
+	// explicit `runId` is intentionally NOT consulted: `wait` never read it and D2 keeps
+	// it that way (a caller who needs to name a run uses `wait`'s runtime path or
+	// `status`/`stop`).
+	const directRunId = scopeRunIdFor({
+		sessionRunId: caller.legion?.runId,
+		trackedRunId: caller.runtime.get(name)?.runId,
+	});
+	const scope = resolveScopedChild({
+		name,
+		directRunId,
+		readRun: (runId) => store.readRun(runId),
+		listRuns: () => store.listRuns(),
+	});
+	if (scope.hit.kind === "elsewhere") {
+		const refusal = scopeRefusal("wait", name, directRunId, scope.hit.candidates);
+		if (refusal) return refusal;
+	}
+	const found =
+		scope.found ??
+		findChildAcrossStores({ name, cwd, callerCwd: caller.callerCwd, ownRoot: store.rootDir });
+	// Nobody has this name: the ordinary `unknown child` answer is the caller's, with
+	// the store list it already prints (#270) — an empty store is not a hit.
+	if (!found) return undefined;
+
+	const orchestrator = childOrchestratorFor(caller, found, store, cwd);
 	const ctx: ChildContext = {
-		...input,
-		name: params.name,
+		...caller,
+		name,
 		found,
 		orchestrator,
 	};
-
-	if (action === "steer") return steerChild(ctx);
-	if (action === "abort") return abortChild(ctx);
-	if (action === "collect")
-		return collectChild(
-			ctx,
-			input.signal,
-			mailSeamOf(input.legion),
-			artifactBytesLookup(input.legion),
-			verificationLookup(input.legion),
-		);
-	if (action === "continue" || action === "resume") return reviveChild(ctx);
-
-	return fail(`unhandled action: ${action}`, ErrorCodes.INVALID_PARAMS);
+	return collectChild(
+		ctx,
+		caller.signal,
+		mailSeamOf(caller.legion),
+		artifactBytesLookup(caller.legion),
+		verificationLookup(caller.legion),
+	);
 }
 
 /** A resolved child plus the collaborators every control action needs. */
@@ -3823,13 +3935,20 @@ function scopeRunIdFor(input: {
 /**
  * Actions that may only ever act on this session's own direct child (#312).
  *
- * `extend` belongs here for a different reason than the other three: its state lives
+ * `extend` belongs here for a different reason than the revive pair: its state lives
  * in THIS session's postman, which only knows `getChildren(db, this.node)`. A record
  * resolved from another run would be answered "not a child of this node" a moment
  * later, so the strict refusal — which names the candidates — is the honest answer
  * the description promises.
+ *
+ * `wait` joined with `collect-merge-v1` (附录 A D5): its STORE fallback
+ * ({@link waitStoreTarget}) reads `run.json` exactly like `collect` did, and the
+ * contract restores `collect`'s three #312 assertions against `wait`. The set is only
+ * consulted from {@link scopeRefusal}, i.e. on the resolution path — `wait`'s ordinary
+ * runtime path (live jobs / finished cache) never gets here, so nothing that works
+ * today starts refusing.
  */
-const STRICT_SCOPE_ACTIONS = new Set(["collect", "continue", "resume", "extend"]);
+const STRICT_SCOPE_ACTIONS = new Set(["continue", "resume", "extend", "wait"]);
 
 /**
  * stall-notice D5 — `subagent({action:"extend", name, ms?})`.
@@ -3880,7 +3999,7 @@ export function extendStallNotice(
 		: `${result.loopRadiusMs}ms`;
 	return ok(
 		`Extended the stall-notice clock for ${result.childName}: the next long-running reminder is due ${radius} from now. ` +
-			"This defers the REMINDER only — it does not extend a collect/wait budget (that is the role's timeoutMs), " +
+			"This defers the REMINDER only — it does not extend a wait budget (that is the role's timeoutMs), " +
 			"does not restart or revive the child, and is not `continue` or `steer`.",
 	);
 }
@@ -3900,7 +4019,38 @@ function ambiguousChildMessage(
 	return (
 		`${name} is ambiguous: ${candidates.length} nodes carry that name and none of them is a direct child of this session, so \`${action}\` will not guess.\n` +
 		describeChildScopeCandidates(candidates) +
-		"\nPass `runId` to name the run that holds the one you mean."
+		"\n" +
+		(readsRunId(action)
+			? "Pass `runId` to name the run that holds the one you mean."
+			: noRunIdScopeHint(action))
+	);
+}
+
+/**
+ * Does this action read `runId` at all? Derived from the frozen spec table, so a
+ * wording can never promise a field its action ignores.
+ */
+function readsRunId(action: string): boolean {
+	const spec = Object.hasOwn(ACTION_SPECS, action)
+		? ACTION_SPECS[action as ActionName]
+		: undefined;
+	return spec?.params.includes("runId") ?? false;
+}
+
+/**
+ * The way out for an action with NO cross-run locator (`wait`, A2/A1 review).
+ *
+ * `wait` never reads `runId` (collect-merge-v1 非目标 3) and `runId` is multi-consumer,
+ * so the inert gate does not refuse it either — it is silently ignored. Telling the
+ * model to "pass `runId`" would therefore be an instruction it cannot follow: it would
+ * reissue the same refused call forever. The field is named ONLY where it really works
+ * (`status` reads, `stop` retires), which is the one escape hatch that exists.
+ */
+function noRunIdScopeHint(action: string): string {
+	return (
+		`\`${action}\` resolves names in this session's scope only and has no cross-run locator. ` +
+		"To act on one of them, read it with `status` or retire it with `stop` — both take the `runId` listed above — " +
+		"or address it through its parent's scope."
 	);
 }
 
@@ -3910,18 +4060,24 @@ function ambiguousChildMessage(
  * `collect` used to reach into whatever run `pickChildByName` preferred, which
  * is how a parent chasing its own FAILED `worker-0` was handed another run's
  * SUCCESSFUL one — the silent wrong node. The candidates are named so the caller
- * can either pass `runId` or go through the node's parent instead.
+ * can either pass `runId` (for an action that reads it) or go through the node's
+ * parent instead.
  */
 function notDirectChildMessage(
 	action: string,
 	name: string,
 	candidates: readonly ChildScopeCandidate[],
 ): string {
-	return (
+	const head =
 		`${name} is not a direct child of this session, so \`${action}\` cannot act on it. ` +
 		`${candidates.length} node(s) carry that name:\n` +
 		describeChildScopeCandidates(candidates) +
-		`\n\`${action}\` only acts on this session's direct children; pass \`runId\`, or address the node through its parent's scope, to reach a grandchild.`
+		"\n";
+	return (
+		head +
+		(readsRunId(action)
+			? `\`${action}\` only acts on this session's direct children; pass \`runId\`, or address the node through its parent's scope, to reach a grandchild.`
+			: noRunIdScopeHint(action))
 	);
 }
 
@@ -4074,8 +4230,30 @@ export async function abortChild(
 /**
  * Wait for the child's current turn and derive its outcome from the session.
  *
+ * collect-merge-v1 D1: this is RETAINED INTERNAL CAPABILITY, not a dead branch. The
+ * `collect` ACTION is gone (the model-facing read verb is `wait`, which renders its
+ * finished snapshots through the same `renderCollect`), so nothing in `controlAction`
+ * dispatches here any more. The seam stays because it is the collect-shaped path the
+ * `mailPreemptedCollect` bail and the `result-ledger-v1` D3b "delivery declares the
+ * read" contract are asserted against directly (`ledger-read-marking`,
+ * `wait-mail-preempt`) — deleting it would drop that coverage, not the action.
+ *
  * Exported alongside `waitAction` for the index-layer unit tests.
  */
+/**
+ * The model-facing text for a collect-seam failure.
+ *
+ * `wait` now routes a store-only target through this seam (A2/D5), so a plain
+ * `wait({name})` can answer with this line: it must not name the deleted `collect`
+ * action, and it must not wrap a miss the error already explains
+ * (`unknown child: …`) in a second, different-looking failure. One neutral wrapper,
+ * the real reason once — the code (`NOT_FOUND`) carries the rest.
+ */
+function collectFailureText(error: unknown): string {
+	const reason = (error instanceof Error ? error.message : String(error)).replace(/^Error: /, "");
+	return `no result: ${reason}`;
+}
+
 export async function collectChild(
 	ctx: ChildContext,
 	signal?: AbortSignal,
@@ -4238,7 +4416,11 @@ export async function collectChild(
 		if (!foreignJob) ctx.runtime.release(ctx.name);
 		return deliver(collected);
 	} catch (error) {
-		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
+		// A2/D5: `wait` routes a store-only target through this seam, so this answer is
+		// model-facing on a plain `wait({name})` too. It therefore names no deleted action
+		// and does not restate a miss the error already explains (`unknown child: …`):
+		// one neutral wrapper, the real reason once, the same NOT_FOUND code.
+		return fail(collectFailureText(error), ErrorCodes.NOT_FOUND);
 	} finally {
 		// #384: never leave a 250ms timer behind a finished collect.
 		stopPolling?.();
@@ -4850,7 +5032,7 @@ async function launchFamily(input: {
 
 	if (isAsync && session.handles.length > 0) {
 		session.results.push(
-			"↳ async: a completion message is queued when each child finishes. It wakes this session when idle; otherwise it is delivered after the current turn. Use wait or collect for results. Do not tell children to message the parent.",
+			"↳ async: a completion message is queued when each child finishes. It wakes this session when idle; otherwise it is delivered after the current turn. Use wait for results. Do not tell children to message the parent.",
 		);
 	}
 
@@ -5347,7 +5529,7 @@ async function collectInline(session: LaunchSession, signal?: AbortSignal): Prom
 				await session.orchestrator.retire(name);
 			}
 		} catch (error) {
-			session.results.push(`✗ ${name}: collect failed: ${String(error)}`);
+			session.results.push(`✗ ${name}: ${collectFailureText(error)}`);
 		}
 	}
 }
@@ -5787,7 +5969,7 @@ async function launchUtilityFamily(input: {
 				await handle.retire().catch(() => {});
 				input.runtime.release(handle.name);
 			}
-			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
+			return `✗ ${handle.name}: ${collectFailureText(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
 	const holdNodeId = legion?.nodeId;
@@ -7463,6 +7645,16 @@ export async function waitAction(input: {
 	 * caller — then the render omits the line instead of guessing one.
 	 */
 	verificationOf?: (name: string) => VerificationSummary | null | undefined;
+	/**
+	 * A2/D5 (`collect-merge-v1` 附录 A): the STORE half of target resolution, asked ONLY
+	 * on the path that would answer `unknown child` — a name this session's runtime does
+	 * not track and the finished cache cannot answer. Returns the answer (built with
+	 * `collect`'s own machinery) or `undefined` when the name exists nowhere.
+	 *
+	 * Absent = today's behaviour byte for byte: the index-layer tests call `waitAction`
+	 * directly with a runtime and no store seam (I1).
+	 */
+	storeTarget?: (name: string) => Promise<AgentToolResult<unknown> | undefined>;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, signal, runtime, agents, allAgents = agents, store, cwd, fullBytesOf, verificationOf } = input;
 	const jobs = runtime.activeJobs();
@@ -7506,6 +7698,13 @@ export async function waitAction(input: {
 				void probe.catch(() => undefined);
 				targets = { ok: true, names: [params.name] };
 			} else {
+				// A2/D5 (`collect-merge-v1` 附录 A): the runtime does not know this name, but
+				// the RUN STORE might (a reloaded session's own child, a `vexillatio` utility
+				// child released at dispatch). The injected seam answers those with `collect`'s
+				// own machinery and returns `undefined` when the name exists nowhere — then the
+				// miss is the same NOT_FOUND this line always answered.
+				const fromStore = input.storeTarget ? await input.storeTarget(params.name) : undefined;
+				if (fromStore) return fromStore;
 				return unknownChild(params.name, store, cwd);
 			}
 		} else {

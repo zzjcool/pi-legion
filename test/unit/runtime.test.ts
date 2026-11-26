@@ -6379,7 +6379,7 @@ test("D4: a read result buffered in the JOIN WINDOW is filtered at the flush (no
 
 test("D3b: a collect that bails before delivering leaves the notice owed (persist failure)", async () => {
 	// `collectChild` can bail AFTER the seam answered — persisting the child can fail,
-	// which the tool turns into `fail("collect failed: …")` — and then the text never
+	// which the tool turns into `fail("no result: …")` — and then the text never
 	// reaches the parent. P4c: no rollback is needed for this any more, because nothing
 	// was ever taken: the read is declared by `deliver` (the one return that renders the
 	// snapshot) and this path returns before it, so the artifact stays `undelivered` and
@@ -6421,7 +6421,7 @@ test("D3b: a collect that bails before delivering leaves the notice owed (persis
 	const text = (result.content as Array<{ text?: string }>)
 		.map((part) => part.text ?? "")
 		.join("\n");
-	assert.match(text, /collect failed/, "the tool call failed, so the snapshot reached nobody");
+	assert.match(text, /no result: store unreachable/, "the tool call failed, so the snapshot reached nobody");
 
 	runtime.notifyParentSettled();
 	await waitFor(() => messages.length === 1, "the unread notice is the only route left, and it arrives");

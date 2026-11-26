@@ -151,20 +151,22 @@ function indexHarness() {
 	};
 }
 
-test("#344 collect: an explicit runId hit is resolved WITHOUT scanning the registry", async () => {
+test("#344 status: an explicit runId hit is resolved WITHOUT scanning the registry", async () => {
 	const harness = indexHarness();
 	try {
 		const { runId } = await harness.launchChild("worker-0");
 		const spy = spyListRuns();
-		let collected: { text: string; details?: { error?: string } };
+		let resolved: { text: string; details?: { error?: string } };
 		try {
-			collected = await harness.invoke({ action: "collect", name: "worker-0", runId });
+			// An explicit `runId` names the run, so scope resolution can answer from one
+			// `readRun` — the registry scan is only the FALLBACK (see the case below).
+			resolved = await harness.invoke({ action: "status", name: "worker-0", runId });
 		} finally {
 			spy.restore();
 		}
-		assert.equal(collected.details?.error, undefined, "the collect itself still has to work");
+		assert.equal(resolved.details?.error, undefined, "the status itself still has to work");
 		assert.equal(spy.calls, 0, "a known runId must not pay for `listRuns`");
-		assert.match(collected.text, /worker-0/);
+		assert.match(resolved.text, /worker-0/);
 	} finally {
 		await harness.cleanup();
 	}
