@@ -361,7 +361,7 @@ test("#450 C/D: status reads every store, marks foreign rows, and never merges t
 
 // ── E: list all:true ────────────────────────────────────────────────────────
 
-test("#450 E: `list all:true` appends every store's live children; plain `list` is the roster alone", async () => {
+test("#450 E: `status` sweeps every store's live children and marks a foreign row's store", async () => {
 	await inTempHome(async ({ root, home }) => {
 		const cwd = path.join(home, "agents");
 		const foreignCwd = path.join(home, "code", "anotify");
@@ -379,15 +379,11 @@ test("#450 E: `list all:true` appends every store's live children; plain `list` 
 
 		const harness = indexHarness({ root, cwd });
 		try {
-			const plain = await harness.invoke({ action: "list" });
-			assert.doesNotMatch(plain.text, /Status ·/, "without `all` the answer is the roster alone");
-			assert.doesNotMatch(plain.text, /cent-0/, "and no child of any store is listed");
-			assert.match(plain.text, /worker \[/, "the roster itself is unchanged");
-
-			const all = await harness.invoke({ action: "list", all: true });
-			assert.ok(all.text.startsWith(`${plain.text}\n\n`), "the roster comes first, unchanged");
-			const overview = all.text.slice(plain.text.length + 2);
-			assert.match(overview, /^Status · 2 live children/, "then the same renderer `status` uses");
+			// Step 2a removed the `list` action, so this coverage moved to `status`, which
+			// has always been the renderer's other caller. What is asserted is unchanged:
+			// one surface, every store on the scan surface, `store=` on a foreign row only.
+			const overview = (await harness.invoke({ action: "status" })).text;
+			assert.match(overview, /^Status · 2 live children/, "every store's live children are counted");
 			assert.match(overview, /cent-0 — state=working/);
 			assert.match(overview, /^store=~\/code\/anotify$/m, "a foreign row carries its store");
 			assert.doesNotMatch(
