@@ -58,6 +58,47 @@
 
 默认走 (a)。
 
+---
+
+## 附录 A — review 后的修正（FROZEN 后追加，以本附录为准）
+
+### A1 D2 的机制描述写错了
+
+正文说 `wait({name, runId})` 会被 inert-param 闸门**拒绝**。**错**：`runId` 是多消费者参数
+（`continue/steer/abort/resume/status/stop/extend` 都读），不在拒绝表里，所以它被**静默忽略**
+（既有 `test/unit/inert-params.test.ts:154` 钉的正是这个行为）。结论不变（用 `name`），但理由要说对。
+
+### A2 「`wait` 是 `collect` 的超集」**不成立**——必须补上，否则这是能力回退
+
+实测：`wait` **只查本会话 runtime，从不读 run store**。因此两类 `collect` 用法无等价物：
+
+1. **`/reload`、会话重启后读自己之前的子**：子只存在 store 里，`wait` 给 `NOT_FOUND`；
+2. **`vexillatio` 的 utility 子**：返回即 release，runtime 里没了；`collect` 能从 store 读，`wait` 不能。
+
+实测证据（worker 贴的原始红灯）：vexillatio 用例把 `collect` 换 `wait` 后，输出从
+`utility output for scout` 变成 `NOT_FOUND`。
+
+**决定（D5）：`wait` 的目标解析必须与 `collect` 对齐——miss 时回退到 `resolveScopedChild`（同一个
+resolver，`status`/`stop`/`collect` 都在用）。** 这是纯内部一致化：
+
+- 不加新参数、不加新动作、不改 `wait` 的既有行为；
+- 仅在**今天返回 `NOT_FOUND` 的那条路径**上多做一次 store 查询；
+- store 里找到且已结算的子 → **立即返回缓存结果**（`wait` 对 runtime 里已结算的 job 已经这么做了）；
+- store 里找到但仍在跑的子（不在本会话 runtime）→ 与 `collect` 一致：读当前 turn 的最后快照。
+
+同时：被删掉的 3 条断言按 `c69f722^` **恢复**（它们是 `collect` 在 reload / utility 两条路径上的
+真实覆盖，不是“只证明 collect 存在”）。
+
+### A3 所有权扩充：一处用户可见文案
+
+`src/extension/slash.ts:386` 的用户可见文案仍写 `status/collect/wait`，且 `test/unit/toggle.test.ts:126`
+逐字 pin 它。现在 `collect` 不是动作了——**授权仅改这处文案**（零逻辑改动）+ 同步那条 pin。
+
+### A4 遗留（本轮不改）
+
+`src/shared/types.ts:1071`、`src/extension/scout-guard.ts:314` 的注释里提到 `collect`（作为内部概念存在歧义），
+`test/docker/xm/scenarios/launch.json:48` 的 fixture。均为注释/测试夹具，另计。
+
 ## D3 — 文档与文案同步
 
 | 文件 | 改什么 |
