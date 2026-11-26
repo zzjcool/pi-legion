@@ -130,15 +130,18 @@ function truncateReason(text: string): string {
 }
 
 /**
- * demo-findings F2 / D2: what an INTERRUPTED turn gets instead of a verdict.
+ * demo-findings F2 / D2 (+ appendix A2): what an ABORTED turn gets instead of a
+ * verdict. `interrupted` is exactly `execution.status === "aborted"` — the parent
+ * killed this round — and nothing else: `unknown`, `failed` and `truncated` keep
+ * their own judgement.
  *
  * The commands still run — the parent's own verify is the one measurement of the
  * worktree that exists, and skipping it leaves the parent with nothing. What must
- * not survive is the verdict: a turn that was stopped, failed or aborted and wrote
- * nothing cannot be "rejected" for its work, which is the same self-contradiction
- * `unknown` exists for ("a verdict about work that was not measured"). The tail
- * keeps the parent's measurement visible: it DID run, and its answer still says
- * something about the tree even though it says nothing about this turn.
+ * not survive is the verdict: an aborted turn that wrote nothing cannot be
+ * "rejected" for its work, which is the same self-contradiction `unknown` exists
+ * for ("a verdict about work that was not measured"). The tail keeps the parent's
+ * measurement visible: it DID run, and its answer still says something about the
+ * tree even though it says nothing about this turn.
  */
 const INTERRUPTED_VERIFY_FAILED_REASON =
 	"turn was interrupted, so its work was not assessed — the parent's verify still ran and failed";
@@ -326,12 +329,15 @@ export async function applyVerification(
 		run?: VerifyRunner;
 		timeoutMs?: number;
 		/**
-		 * demo-findings F2 / D2: the turn behind this collect did not complete
-		 * (`execution.status !== "success"` — the call site knows, this module must
-		 * never re-derive it).
+		 * demo-findings F2 / D2 (+ appendix A2): the parent ABORTED this collect's
+		 * turn — i.e. `execution.status === "aborted"` at the call site, which is the
+		 * only place that knows it. This module must never re-derive it, and the
+		 * predicate is not "anything incomplete": `unknown` (the cross-machine
+		 * path's own answer, D14) and `failed` / `truncated` keep their existing
+		 * judgement untouched.
 		 *
 		 * The commands still run; only the VERDICT changes. A red command is not a
-		 * verdict about an interrupted turn's work (`rejected` would claim work nobody
+		 * verdict about an aborted turn's work (`rejected` would claim work nobody
 		 * measured was assessed), and a green one cannot make such a turn `verified`.
 		 * Both answers are `unknown` and say which one happened.
 		 *
@@ -415,8 +421,8 @@ export async function applyVerification(
 		}
 		const output = `${result.stdout}\n${result.stderr}`.trim();
 		if (result.code === 0) continue;
-		// demo-findings F2 / D2: a red command on an INTERRUPTED turn is a fact about
-		// the tree, not a rejection of work that was never assessed.
+		// demo-findings F2 / D2: a red command on an ABORTED turn is a fact about the
+		// tree, not a rejection of work that was never assessed.
 		if (opts.interrupted) {
 			return {
 				...acceptance,

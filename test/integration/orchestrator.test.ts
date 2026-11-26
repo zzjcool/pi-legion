@@ -421,15 +421,19 @@ test("required verification command promotes an attested RPC verdict to verified
 });
 
 /**
- * demo-findings F2 / D2, through the real collect path: the demo's exact shape.
+ * demo-findings F2 / D2 (+ appendix A2), through the real collect path: the demo's
+ * exact shape.
  *
- * A turn is aborted mid-flight (`(no output)`), the parent's configured `verify`
+ * A turn is ABORTED mid-flight (`(no output)`), the parent's configured `verify`
  * still runs — the user ruling keeps that — and the answer must not be `rejected`:
- * nothing about that turn's work was measured. The same red command on a COMPLETED
- * turn stays `rejected`, which is the other direction of the same branch.
+ * nothing about that turn's work was measured. The other three cases pin what D2
+ * does NOT touch: a completed turn stays `rejected`, and `failed` / `truncated`
+ * turns keep their existing judgement (appendix A2: the predicate is exactly
+ * `aborted`, never "anything incomplete").
  */
-test("demo-findings D2: an interrupted turn keeps the verify but is never `rejected`", async () => {
+test("demo-findings D2: an aborted turn keeps the verify but is never `rejected`", async () => {
 	const h = harness();
+	let exitCode = 1;
 	const calls: string[] = [];
 	const orchestrator = new Orchestrator({
 		supervisor: h.supervisor,
@@ -439,7 +443,7 @@ test("demo-findings D2: an interrupted turn keeps the verify but is never `rejec
 		sleep: async () => {},
 		verifyRunner: async (command) => {
 			calls.push(command);
-			return { code: 1, stdout: "", stderr: "1 failing" };
+			return { code: exitCode, stdout: exitCode === 0 ? "green" : "", stderr: exitCode === 0 ? "" : "1 failing" };
 		},
 	});
 	const agentWithVerify = agent({
@@ -448,28 +452,59 @@ test("demo-findings D2: an interrupted turn keeps the verify but is never `rejec
 			criteria: [{ id: "tests", must: "tests pass", evidence: ["verification-output"], severity: "required", command: "npm test" }],
 		},
 	});
-	try {
-		// The aborted turn: pi ends the turn with `stopReason: error` and an abort
-		// message, which `deriveOutcome` classifies as `aborted` — never `success`.
-		const aborted = await orchestrator.launch({ agent: agentWithVerify, task: "sleep, then write the file", worktree: false });
-		h.supervisor.settle(aborted.name, { text: "", stopReason: "error", errorMessage: "Operation aborted" });
-		const interrupted = await orchestrator.collect(aborted.name);
-		assert.equal(interrupted.execution.status, "aborted", "premise: this collect's turn did not complete");
-		assert.deepEqual(calls, ["npm test"], "the parent's verify still RUNS — it is never skipped");
-		assert.equal(interrupted.acceptance.status, "unknown", "a turn with no output cannot be `rejected` for its work");
-		assert.equal(interrupted.acceptance.level, "attested");
-		assert.match(interrupted.acceptance.reason ?? "", /not assessed/);
-		assert.match(interrupted.acceptance.reason ?? "", /still ran and failed/);
-
-		// The other direction: the same red command, on a turn that DID complete.
+	/** Launch one child, settle its turn with `turn`, collect it. */
+	const oneRound = async (turn: FakeTurn) => {
 		calls.length = 0;
-		const done = await orchestrator.launch({ agent: agentWithVerify, task: "finish normally", worktree: false });
-		h.supervisor.settle(done.name, { text: '{"ok":true,"reason":"finished"}' });
-		const completed = await orchestrator.collect(done.name);
-		assert.equal(completed.execution.status, "success", "premise: this turn completed");
-		assert.deepEqual(calls, ["npm test"]);
-		assert.equal(completed.acceptance.status, "rejected", "a completed turn is still judged by the verify");
-		assert.match(completed.acceptance.reason ?? "", /^verification failed/);
+		const handle = await orchestrator.launch({ agent: agentWithVerify, task: "t", worktree: false });
+		h.supervisor.settle(handle.name, turn);
+		const collected = await orchestrator.collect(handle.name);
+		return { collected, ran: [...calls] };
+	};
+	/** pi ends an aborted turn with `stopReason: error` and an abort message. */
+	const ABORTED: FakeTurn = { text: "", stopReason: "error", errorMessage: "Operation aborted" };
+	try {
+		// (1) aborted + a RED verify: nothing about this turn was measured.
+		const red = await oneRound(ABORTED);
+		assert.equal(red.collected.execution.status, "aborted", "premise: the parent aborted this turn");
+		assert.deepEqual(red.ran, ["npm test"], "the parent's verify still RUNS — it is never skipped");
+		assert.equal(red.collected.acceptance.status, "unknown", "a turn with no output cannot be `rejected` for its work");
+		assert.equal(red.collected.acceptance.level, "attested");
+		assert.match(red.collected.acceptance.reason ?? "", /not assessed/);
+		assert.match(red.collected.acceptance.reason ?? "", /still ran and failed/);
+
+		// (2) aborted + a GREEN verify: still `unknown`, still nothing verified.
+		exitCode = 0;
+		const green = await oneRound(ABORTED);
+		assert.equal(green.collected.execution.status, "aborted");
+		assert.deepEqual(green.ran, ["npm test"]);
+		assert.equal(green.collected.acceptance.status, "unknown", "a green command does not measure an aborted turn");
+		assert.equal(green.collected.acceptance.level, "attested", "and it certainly must not say `verified`");
+		assert.match(green.collected.acceptance.reason ?? "", /not assessed/);
+		assert.match(green.collected.acceptance.reason ?? "", /still ran and passed/, "the verify DID run and pass — say so");
+
+		// (3) COMPLETED turn + the same red verify: rejected, unchanged.
+		exitCode = 1;
+		const completed = await oneRound({ text: '{"ok":true,"reason":"finished"}' });
+		assert.equal(completed.collected.execution.status, "success", "premise: this turn completed");
+		assert.deepEqual(completed.ran, ["npm test"]);
+		assert.equal(completed.collected.acceptance.status, "rejected", "a completed turn is still judged by the verify");
+		assert.match(completed.collected.acceptance.reason ?? "", /^verification failed/);
+
+		// (4) `failed` is NOT `aborted` (appendix A2): its own judgement stands.
+		const failed = await oneRound({ text: '{"ok":true,"reason":"finished"}', stopReason: "error", errorMessage: "provider exploded" });
+		assert.equal(failed.collected.execution.status, "failed", "premise: a provider failure, not an abort");
+		assert.deepEqual(failed.ran, ["npm test"]);
+		assert.equal(failed.collected.acceptance.status, "rejected", "a failed turn keeps the pre-D2 judgement");
+		assert.match(failed.collected.acceptance.reason ?? "", /^verification failed/);
+		assert.doesNotMatch(failed.collected.acceptance.reason ?? "", /not assessed/);
+
+		// (5) `truncated` is not `aborted` either — same pre-D2 answer.
+		const truncated = await oneRound({ text: '{"ok":true,"reason":"finished"}', stopReason: "length" });
+		assert.equal(truncated.collected.execution.status, "truncated", "premise: the turn hit the length ceiling");
+		assert.deepEqual(truncated.ran, ["npm test"]);
+		assert.equal(truncated.collected.acceptance.status, "rejected", "a truncated turn keeps the pre-D2 judgement");
+		assert.match(truncated.collected.acceptance.reason ?? "", /^verification failed/);
+		assert.doesNotMatch(truncated.collected.acceptance.reason ?? "", /not assessed/);
 	} finally {
 		h.cleanup();
 	}

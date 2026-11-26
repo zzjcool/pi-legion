@@ -7,8 +7,12 @@
  *   - F1/D1: `accepted (verified)` must not sit next to "these gate the verdict".
  *     The banner follows `AcceptanceResult.status`, not the presence of a required
  *     pending criterion (`pendingCriteria` never influenced `status`).
- *   - F2/D2: an interrupted turn (`execution.status !== "completed"`) keeps its
- *     verify — but its verdict can never be `rejected` about work nobody measured.
+ *   - F2/D2: an ABORTED turn (`execution.status === "aborted"` — appendix A2
+ *     narrowed the predicate) keeps its verify — but its verdict can never be
+ *     `rejected` about work nobody measured. `applyVerification` receives that fact
+ *     as an explicit `interrupted` argument; the call-site predicate itself
+ *     (and what it must NOT swallow: `unknown` / `failed` / `truncated`) is pinned
+ *     at the collect level in `test/integration/orchestrator.test.ts`.
  *   - F3/D3: `verification: STALE` and the stale nudge each say WHEN to commit
  *     (before entering verifying). The render line lives in `index.ts`; the nudge
  *     is pinned where it is actually sent (`legion-done-gate-order.test.ts`).

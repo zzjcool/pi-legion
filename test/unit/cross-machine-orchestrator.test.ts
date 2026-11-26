@@ -448,15 +448,13 @@ test("S3/B1: `host` + `verify` runs the command on THAT machine — never in thi
 			// The budget is the collect deadline's remainder (the pre-S3 semantics); the
 			// remote runner clamps it to hc's ceiling and announces that.
 			assert.ok((remote[0]!.timeoutMs ?? 0) > 0 && (remote[0]!.timeoutMs ?? 0) <= 900_000, `budget ${remote[0]!.timeoutMs}`);
-			// demo-findings F2 / D2: this harness settles the child WITHOUT a transcript,
-			// so `deriveOutcome` answers `unknown` ("no messages in session") — a turn that
-			// is not `success` is not a completed turn. The remote verify still runs and its
-			// answer is still recorded, but the collect must not promote it to `verified`:
-			// nothing about THIS turn was measured. The host + command assertions above are
-			// what prove the answer came from that machine.
-			assert.equal(collected.execution.status, "unknown", "the harness turn is not a completed turn (D2 premise)");
-			assert.equal(collected.acceptance.level, "attested", "an interrupted/unmeasured turn is never `verified` (D2)");
-			assert.match(String(collected.acceptance.reason), /still ran and passed/, "the parent's verify DID run — D2 says so");
+			// demo-findings appendix A2: this turn is `unknown` (the harness writes no
+			// transcript), NOT `aborted` — so it is not D2's interrupted turn and keeps
+			// the pre-D2 answer verbatim, `on host '<host>'` included. This case is the
+			// guard against widening the `interrupted` predicate back to every
+			// incomplete status.
+			assert.equal(collected.acceptance.level, "verified");
+			assert.match(String(collected.acceptance.reason), /on host '/);
 		} finally {
 			h.cleanup();
 		}
