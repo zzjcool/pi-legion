@@ -247,8 +247,8 @@ function readRunOrNull(
 /**
  * Resolve one name, paying for the run registry only when the answer needs it (#344).
  *
- * Every control call (`collect` / `status` / `steer` / `abort` / `retire` /
- * `continue`) used to start with `store.listRuns()` — a `readdir` plus a
+ * Every control call (`collect` / `status` / `steer` / `abort` / `continue`)
+ * used to start with `store.listRuns()` — a `readdir` plus a
  * `JSON.parse` per run — even when it already knew the run it was scoped to.
  * The scan is O(runs) and the scope is usually free, so the order is inverted
  * here: read the ONE run the scope names, and fall back to the registry only

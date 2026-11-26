@@ -1218,6 +1218,15 @@ test("index stop action retires multiple RPC children and persists their retired
 		releaseFirstRetire();
 		const stopped = await stopPending;
 		assert.match(stopped, /Stopped 2 children/);
+		// tool-surface-ops-verbs-v2 rework: the facts the deleted `retire` receipt
+		// carried are still there — one outcome and one resume credential PER child.
+		// Deleting an action merged two wordings; it did not license dropping data.
+		assert.equal(
+			stopped.match(/Session kept for resume: /g)?.length,
+			2,
+			`every stopped child keeps its resume pointer: ${stopped}`,
+		);
+		assert.equal(stopped.match(/execution: \S+/g)?.length, 2, `every stopped child keeps its outcome: ${stopped}`);
 		assert.equal(harness.sentMessages.length, 0, "stop cancels every completion watcher before retiring the first child");
 		assert.deepEqual(
 			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),

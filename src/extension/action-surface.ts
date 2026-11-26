@@ -31,7 +31,6 @@ export const ACTION_NAMES = [
 	"steer",
 	"abort",
 	"resume",
-	"retire",
 	"status",
 	"collect",
 	"wait",
@@ -50,7 +49,7 @@ export interface ActionSpec {
 	 * Two groups are deliberately absent: `action` itself, and the resolution
 	 * fields `cwd` / `hostCwd` / `host` / `agentScope` — `execute` reads all of
 	 * them for EVERY action before dispatch (`cwdIsRemote`, the store, the
-	 * catalog), so repeating them thirteen times would say nothing and, worse,
+	 * catalog), so repeating them twelve times would say nothing and, worse,
 	 * would make them look single-consumer. `name` / `all` / `runId` / `message` /
 	 * `model` are genuinely read by several actions and ARE listed per action —
 	 * which is exactly how {@link PARAM_OWNER_ACTIONS} tells a single consumer
@@ -79,9 +78,6 @@ export const ACTION_SPECS: Readonly<Record<ActionName, ActionSpec>> = {
 	},
 	resume: {
 		params: ["name", "message", "model", "runId"],
-	},
-	retire: {
-		params: ["name", "runId"],
 	},
 	status: {
 		params: ["name", "all", "runId"],

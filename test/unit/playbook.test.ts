@@ -258,6 +258,107 @@ test("D2: the tool description does not embed the playbook — one text, one inj
 });
 
 // ---------------------------------------------------------------------------
+// tool-surface-ops-verbs-v2 D2/D3 — `recover`/`extend` keep only their compressed
+// prose, and the field stays inside its character budget
+// ---------------------------------------------------------------------------
+
+/**
+ * The two paragraphs `docs/contracts/tool-surface-ops-verbs-v2.md` freezes (D3,
+ * D2), copied character for character.
+ *
+ * They are literals here on purpose. The contract's finding was that `extend`
+ * (307) + `recover` (413) had grown to 720 of the field's 1,186 characters, so
+ * the rewrite had to be ONE text everywhere — a test that re-read the Markdown
+ * would still pass if both copies were edited together, while this one fails on
+ * any edit to either.
+ */
+const FROZEN_EXTEND =
+	"extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a collect/wait budget or the child's own timeout, and never restarts, revives or steers it.";
+const FROZEN_RECOVER =
+	"recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `collect`; a still-live child is only reported. `/legion status` lists what is recoverable.";
+
+test("ops-verbs-v2 D3/D2: `extend` and `recover` are the frozen text, verbatim", async () => {
+	const harness = playbookHarness();
+	try {
+		const description = harness.actionDescription();
+		assert.notEqual(
+			description.indexOf(FROZEN_EXTEND),
+			-1,
+			"`extend` must be the contract's text, character for character",
+		);
+		assert.notEqual(
+			description.indexOf(FROZEN_RECOVER),
+			-1,
+			"`recover` must be the contract's text, character for character",
+		);
+		// Each frozen marker appears exactly once. Stated precisely, because the FIRST
+		// version of this comment over-claimed: these two assertions guarantee (i) the
+		// frozen paragraph is present character for character and (ii) no SECOND
+		// `extend = ` / `recover = ` block was added beside it. They do NOT promise the
+		// surrounding prose cannot grow a contradicting sentence — review injected one
+		// ("… still never changes the child's own timeout") that reused neither marker,
+		// stayed inside the 950-character budget, and left all three tests green.
+		// Closing that hole is a different guard (semantic, or a whole-field snapshot);
+		// this comment must not claim it is here.
+		assert.equal(description.split("extend = ").length - 1, 1, "`extend` is described exactly once");
+		assert.equal(description.split("recover = ").length - 1, 1, "`recover` is described exactly once");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("ops-verbs-v2: the `action` description stays inside its 950-character budget", async () => {
+	// The budget is the contract's own acceptance number, not a warning level: the
+	// field was 1,186 characters before the two paragraphs were compressed, and this
+	// must fail the moment the prose starts growing back.
+	const harness = playbookHarness();
+	try {
+		const length = harness.actionDescription().length;
+		assert.ok(length <= 950, `the \`action\` description must stay <= 950 chars, got ${length}`);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+/**
+ * The shapes that make `retire` read as an ACTION NAME in a schema description.
+ *
+ * The criterion, written down so it is reviewable rather than implied:
+ *   1. a backticked token  — `` `retire` ``
+ *   2. a slash-separated action list — `status/collect/…/retire)`
+ *   3. an explicit call shape — `action: "retire"`
+ *
+ * English uses of the verb are deliberately NOT matched: `stop` really does retire
+ * a child, so `force`'s own description says "hard-retire … graceful retire", and
+ * the `action` description says a finished child reports as "already retired". Those
+ * describe behaviour that still exists. Flagging them would make the guard either
+ * red on correct text or so vague it proves nothing.
+ */
+const RETIRE_ACTION_SHAPES = /`retire`|\/retire\b|action: *"retire"/;
+
+test("ops-verbs-v2: NO parameter description names a `retire` action", async () => {
+	// Acceptance assertion 2, widened after review. The first version read only
+	// `properties.action.description`, and `runId`'s description kept saying
+	// "control actions (…/retire)" — a model-visible instruction to call a removed
+	// action, three fields away from the one string that was being checked. A guard
+	// scoped to the field that happens to be named in the contract is not a guard.
+	const harness = playbookHarness();
+	try {
+		const properties = harness.properties();
+		assert.ok(
+			Object.keys(properties).length > 10,
+			"the schema must still declare its fields — an empty map would pass vacuously",
+		);
+		const offending = Object.entries(properties)
+			.filter(([, spec]) => RETIRE_ACTION_SHAPES.test(spec.description ?? ""))
+			.map(([field]) => field);
+		assert.deepEqual(offending, [], "no parameter description may name a `retire` action");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ---------------------------------------------------------------------------
 // tool-surface-dedup-v1 B3 — the gate that actually injects the playbook
 // ---------------------------------------------------------------------------
 
@@ -316,6 +417,10 @@ function playbookHarness() {
 		/** The `action` field's description exactly as the model receives it. */
 		actionDescription(): string {
 			return tool?.parameters?.properties?.action?.description ?? "";
+		},
+		/** Every declared parameter's description, exactly as the model receives it. */
+		properties(): Record<string, { description?: string }> {
+			return tool?.parameters?.properties ?? {};
 		},
 		/**
 		 * Drive `before_agent_start` the way the host does. `selectedTools` is passed

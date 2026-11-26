@@ -230,6 +230,13 @@ export {
 	formatBlockedPrompt,
 } from "./extension/blocked.ts";
 export type { BlockedDecision, BlockedFollowUp } from "./extension/blocked.ts";
+/**
+ * `formatAlreadyRecycled` outlives its caller: the `retire` action that used it was
+ * deleted (tool-surface-ops-verbs-v2 D1), so the tool surface no longer reaches it.
+ * It stays on this list on purpose — the contract of this file is "safe to depend
+ * on", and dropping an export from a published surface is a breaking change with its
+ * own release, not a side effect of removing an action.
+ */
 export {
 	canUseCachedCollect,
 	formatAlreadyRecycled,

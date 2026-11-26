@@ -140,7 +140,7 @@ test("D3: only an explicitly provided value counts as provided", () => {
 test("D3: multi-consumer params, the resolution fields and the documented exclusions stay permissive", () => {
 	// `name`/`all`/`runId`/`message`/`model` are read by several actions.
 	const control = { name: "worker-0", runId: "r-1", message: "go on", model: "p/m" };
-	for (const action of ["continue", "steer", "abort", "resume", "retire", "status", "collect"] as const) {
+	for (const action of ["continue", "steer", "abort", "resume", "status", "collect"] as const) {
 		assert.deepEqual(inertParamsFor(action, control), [], `${action} reads the control fields`);
 	}
 	assert.deepEqual(inertParamsFor("stop", { name: "worker-0", all: true, force: true }), []);

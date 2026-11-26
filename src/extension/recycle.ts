@@ -2,6 +2,19 @@
 
 import type { TaskState } from "../shared/types.ts";
 
+/**
+ * The `already retired` receipt the deleted `retire` action used to answer with.
+ *
+ * RETENTION NOTE (tool-surface-ops-verbs-v2 D1): the `retire` action and the
+ * `retireChild` that called it are gone, so **no production caller reaches this
+ * function any more**. It stays — deliberately, not by oversight — because
+ * `src/api.ts` re-exports it as part of the published `pi-legion/api` surface
+ * ("everything re-exported below … is safe to depend on"), and deleting an export
+ * from that surface is a breaking change that needs its own major release, not a
+ * side effect of dropping an action. `stop` now reports the same facts through
+ * `retiredRecordNote` (`index.ts`: execution + `Session kept for resume: …`).
+ * Do not add an internal caller back: one verb, one receipt.
+ */
 export function formatAlreadyRecycled(
 	name: string,
 	sessionFile: string,
