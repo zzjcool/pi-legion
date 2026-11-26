@@ -13,6 +13,22 @@ import {
 } from "../../src/extension/playbook.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
+test("the playbook carries the dispatch discipline, not only the launch mechanics", () => {
+	// An audit of one fan-out found three scouts independently re-running the SAME probe
+	// (the env question was written into all three cards) while the playbook said nothing
+	// about task cards, handed-over facts, or how to correct a wrong conclusion. Launch
+	// mechanics alone leave the cheapest waste in the system unpinned.
+	assert.match(PARENT_PLAYBOOK, /Task cards carry the FACTS/);
+	assert.match(PARENT_PLAYBOOK, /confirmed — do not re-verify/);
+	assert.match(PARENT_PLAYBOOK, /name the probes that belong to another child/);
+	assert.match(PARENT_PLAYBOOK, /do not re-dispatch the same question to a new child/);
+	assert.match(
+		PARENT_PLAYBOOK,
+		/must list the probes it ran and the entry points it did not/,
+		"a negative conclusion is the one shape a fresh child cannot self-check",
+	);
+});
+
 test("playbook text describes the backend-neutral launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /subagent\(\{ agent:/);
 	assert.match(PARENT_PLAYBOOK, /matching role/);

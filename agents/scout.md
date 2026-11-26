@@ -42,6 +42,10 @@ acceptance:
       must: 每条结论都带文件路径和行号证据，未验证的明确标注「待验证」
       evidence: [facts, open-questions]
       severity: required
+    - id: negative-claims-have-probes
+      must: 断言「不存在 / 不可达 / 没有这个字段」时，必须列出跑过的探针与没试过的入口；缺一项就降级为「待验证」
+      evidence: [facts, open-questions]
+      severity: required
 kind: pi
 steer: true
 maxSubagentDepth: 1
@@ -67,6 +71,7 @@ maxSubagentDepth: 1
 产出一份 Markdown 报告（末尾附 verdict JSON），包含：
 
 1. **事实清单**：每条带 `文件路径:行号` 证据。
+   **负面结论**（「不存在 / 不可达 / 没这个字段」）额外要求：列出你**跑过的探针**（命令/URL）与**没试过的入口**；两者缺一，就把结论写成「待验证」而不是「不存在」。
 2. **关键数据流/调用链**：谁调用谁，参数形状。
 3. **风险与坑**：已有的防护、已知的坑（注释、测试里能看到的历史教训）。
 4. **待验证问题**：列出你没确认的点。

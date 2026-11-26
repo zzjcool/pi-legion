@@ -481,7 +481,7 @@ const SubagentParams = Type.Object({
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children across this machine's stores — with `all:true` the retired/finished children are listed below it too (omit `name` for the overview, no `all` needed). list: with `all:true` the roster is followed by every store's live children (a record from another store carries `store=<label>`).",
+			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children across this machine's stores — with `all:true` this session's retired/finished children are listed below it too (omit `name` for the overview, no `all` needed). A record from another store carries `store=<label> · <runId> · <age>`: a same-named row from a neighbouring checkout can never pass for this session's child.",
 		}),
 	),
 	runId: Type.Optional(
@@ -6498,6 +6498,7 @@ async function launchUtilityFamily(input: {
 	// covers the collect batch ONLY — launches before it and the abort flush after it
 	// keep today's behaviour — and `finally` hands the inbox back on every exit path (a
 	// leak would park this node's mail for the rest of the process).
+	const settledReads: string[] = [];
 	const collectHandles = (): Promise<string[]> => Promise.all(handles.map(async (handle) => {
 		try {
 			const result = await handle.orchestrator.collect(handle.name, {
@@ -6511,6 +6512,9 @@ async function launchUtilityFamily(input: {
 			} else {
 				await handle.retire();
 				input.runtime.release(handle.name);
+				// P4a (§3 D3): the finished text below goes out verbatim, so this name's
+				// artifact is READ. Declared here, written once the text is returned.
+				if (result.artifactId) settledReads.push(result.artifactId);
 			}
 			const lines = [
 				`── ${handle.name} ──`,
@@ -6572,16 +6576,24 @@ async function launchUtilityFamily(input: {
 		});
 	}
 	results.push(...collected);
+	const details: Record<string, unknown> = {
+		runId,
+		handles: handles.map(({ name, agent, sessionFile, spawnMode }) => ({ name, agent, sessionFile, spawnMode })),
+		async: false,
+		...(stillRunning.size > 0
+			? { stillRunning: handles.filter(({ name }) => stillRunning.has(name)).map(({ name }) => name) }
+			: {}),
+		...ledgerReadsDetails(settledReads),
+	};
+	// The blocking-success path used to leave no read-side record at all: "success never
+	// notifies twice" rested on `release()` deleting the job BEFORE the watch could fire,
+	// not on the ledger predicate. Any reordering (or a throwing release) would re-deliver
+	// a result the parent already holds. Declaring the reads moves that guarantee onto the
+	// ledger, where `wait` already keeps it.
+	markLedgerReads(ledgerReadSeamOf(legion), details);
 	return {
 		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
-		details: {
-			runId,
-			handles: handles.map(({ name, agent, sessionFile, spawnMode }) => ({ name, agent, sessionFile, spawnMode })),
-			async: false,
-			...(stillRunning.size > 0
-				? { stillRunning: handles.filter(({ name }) => stillRunning.has(name)).map(({ name }) => name) }
-				: {}),
-		},
+		details,
 	};
 }
 
@@ -7397,6 +7409,30 @@ export interface StatusChildEntry {
 	unsupervised?: UnsupervisedVerdict;
 }
 
+/**
+ * #450/#463: the value of a foreign row's `store=` line.
+ *
+ * A bare label answered "which store" but not "is this mine": a 16-day-old row from a
+ * neighbouring checkout rendered exactly like a child of this session, and a name the
+ * session had itself already retired could therefore look "adopted" by another store.
+ * The run id and the age make that impossible to misread, and they are added ONLY for
+ * foreign rows, so a single-store session's block stays byte-identical.
+ */
+function foreignStoreLabel(
+	label: string,
+	run: { runId: string; createdAt?: string } | undefined,
+	now: number,
+): string {
+	if (!run) return label;
+	const parts = [label, run.runId];
+	const created = Date.parse(run.createdAt ?? "");
+	if (Number.isFinite(created)) {
+		const days = Math.max(0, Math.floor((now - created) / 86_400_000));
+		parts.push(days === 0 ? "today" : `${days}d old`);
+	}
+	return parts.join(" · ");
+}
+
 /** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
 export function renderStatusOverview(children: StatusChildEntry[], now: number = Date.now()): string {
 	// #456: an orphaned record counts as orphaned in the header even when the
@@ -7586,8 +7622,10 @@ function renderScanOverview(input: {
 		// #463: the run dir a record's `owner.json` lives in — keyed by the RECORD, so a
 		// reused name cannot borrow the marker of another run (#312).
 		const runIdByKey = new Map<string, string>();
+		const runById = new Map<string, (typeof runs)[number]>();
 		for (const run of runs) {
 			for (const child of run.children) runIdByKey.set(factsKey(child), run.runId);
+			runById.set(run.runId, run);
 		}
 		const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
 			const cached = factsByName.get(factsKey(child));
@@ -7639,7 +7677,9 @@ function renderScanOverview(input: {
 				...(inFlightTools ? { inFlightTools } : {}),
 				...(orphan ? { orphan } : {}),
 				live,
-				...(surfaceStore.label ? { store: surfaceStore.label } : {}),
+				...(surfaceStore.label
+					? { store: foreignStoreLabel(surfaceStore.label, runById.get(runIdByKey.get(factsKey(child)) ?? ""), input.now) }
+					: {}),
 			});
 		}
 	}
@@ -8116,9 +8156,9 @@ export function buildWaitTimeoutDetails(
 /**
  * D4 (polish round): the byte cap a `wait` body is previewed at.
  *
- * The completion notice previews at `PREVIEW_CHARS` (4 000 **chars**, `notify.ts`) and the
- * finished cache keeps a `FINISHED_OUTPUT_HEAD_CHARS` (4 000 chars) head — neither is a
- * byte cap, and neither is exported to this module. The sentence this preview has to make
+ * The completion notice previews at `PREVIEW_BYTES` (4 000 **bytes**, `notify.ts`) and the
+ * finished cache keeps a `FINISHED_OUTPUT_HEAD_CHARS` (4 000 chars) head — the latter is a
+ * character cap, not a byte cap, and neither is exported to this module. The sentence this preview has to make
  * honest (`cachedHeadLine`) reports UTF-8 BYTES, so the cap that has to hold is bytes:
  * 4 KB. No existing constant says that, hence the number here (contract D4: "复用现有常量，
  * 没有就取 4096").

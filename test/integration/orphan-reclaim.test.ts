@@ -786,7 +786,8 @@ test("#456 A5: a leftover in ANOTHER store is found through the bounded surface,
 		assert.equal(overview.details?.error, undefined, overview.text);
 		assert.match(overview.text, /worker-0 — state=orphaned \(terminal gone, work done\)/, overview.text);
 		assert.match(overview.text, /^store=/m, "a foreign row names the store it came from");
-		assert.match(overview.text, /^store=.*old$/m, overview.text);
+		// #450/#463: the line now carries the store, the run and the run's age (`<label> · <runId> · today`).
+		assert.match(overview.text, /^store=~?\/?.*old · r-[0-9a-z]+ · (today|\d+d old)$/m, overview.text);
 		assert.match(overview.text, /\(1 orphaned\)/, "the header counts the foreign leftover as orphaned, not live");
 		assert.doesNotMatch(overview.text, /Status · 1 live child/, "a leftover is never a live child");
 

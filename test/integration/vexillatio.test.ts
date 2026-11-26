@@ -258,9 +258,18 @@ test("vexillatio dispatches a utility agent, strips lineage, and returns its col
 			assert.match(text, /utility output for scout/);
 			assert.match(text, /sessionFile:/);
 			assert.equal(supervisor.spawns.length, 1);
-			const details = result.details as { async?: boolean; stillRunning?: string[] } | undefined;
+			const details = result.details as { async?: boolean; stillRunning?: string[]; ledgerReads?: string[] } | undefined;
 			assert.equal(details?.async, false);
 			assert.equal(details?.stillRunning, undefined, "settled utilities need no stillRunning detail");
+			// P4a (§3 D3/D3b): the settled text went out verbatim, so its artifact is READ.
+			// Before this, "a blocking success never notifies twice" rested on `release()`
+			// winning the race against the watch, not on the ledger predicate.
+			assert.match(text, /full text: /);
+			assert.equal(
+				(Array.isArray(details?.ledgerReads) ? details.ledgerReads.length : undefined),
+				1,
+				`a settled utility declares its artifact read: ${JSON.stringify(details)}`,
+			);
 
 			const env = supervisor.spawns[0]?.input.env;
 			assert.equal(env?.PI_SUBAGENT_CHILD, "1");
