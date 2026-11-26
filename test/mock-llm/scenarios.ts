@@ -68,7 +68,10 @@ export const spawnScoutScenario: MockScript = {
 		},
 		{
 			name: "spawn",
-			when: { promptIncludes: "subagent" },
+			// The mock's trigger word, not its tool name: a caller prompt that mentions EITHER
+			// dispatch tool asks for this recon dispatch (`subagent` is what the docs and the QA
+			// scripts have always sent; `vexillatio` is the tool the call actually uses now).
+			when: { promptMatches: "subagent|vexillatio" },
 			then: {
 				type: "tool_call",
 				name: "vexillatio",

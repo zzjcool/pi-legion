@@ -9,7 +9,8 @@
 // TWO passes, one command:
 //
 //   Run A — settings carry `subagents.crossMachine.enabled: true` and NOTHING else:
-//           a1 role policy, a2 machine list, b zero-config launch, c remote artefact,
+//           a1 recon-never-crosses (vexillatio vs host), a2 machine list, b zero-config
+//           launch, c remote artefact,
 //           d0 the CURRENT zero-config behaviour: the collect is refused by the
 //           worktree-ownership guard, which MASKS the missing read-back host entry
 //           (root cause is swallowed first: src/runs/remote.ts:976-982), and no
@@ -80,7 +81,7 @@ const PROMPT = {
 		'Then reply with the words "RESULT: done" followed by this run\'s token, and stop.',
 	].join("\n"),
 	scout: [
-		`Use the subagent tool exactly once: subagent({ agent: "scout", host: ${JSON.stringify(XM_ENV.host)}, hostCwd: ${JSON.stringify(XM_ENV.hostCwd)}, task: "probe" }).`,
+		`Use the vexillatio tool exactly once: vexillatio({ agent: "scout", host: ${JSON.stringify(XM_ENV.host)}, hostCwd: ${JSON.stringify(XM_ENV.hostCwd)}, task: "probe" }).`,
 		"Then reply with the tool result text verbatim and stop. Do not retry and do not fall back to a local run.",
 	].join("\n"),
 	unknownHost: [
@@ -214,6 +215,17 @@ function lastSubagentResult(toolResults) {
 	return [...toolResults].reverse().find((entry) => entry.toolName === "subagent");
 }
 
+/**
+ * The LAST tool result of `toolName` in this step.
+ *
+ * a1 collects `vexillatio` (recon), everything else `subagent`. Parameterized on
+ * purpose: hard-coding one name would make the a1 migration a silent no-op — the
+ * lookup would find nothing and the assertion would grade the pi stdout instead.
+ */
+function lastToolResultOf(toolResults, toolName) {
+	return [...toolResults].reverse().find((entry) => entry.toolName === toolName);
+}
+
 /** Where a remote worktree for `child` must live, per `remote-worktree.ts`. */
 function expectedWorktreePath(child) {
 	const base = XM_ENV.hostCwd.replace(/\/+$/, "");
@@ -242,8 +254,8 @@ function worktreeFacts(child) {
 
 // ─────────────────────────────────────────────────────────── the two passes
 
-/** a1: scout + host=remote is refused by the role policy. */
-async function assertRolePolicy() {
+/** a1: recon is `vexillatio`'s, and a utility child cannot cross machines. */
+async function assertUtilityCannotCross() {
 	await ensureMocks([{ port: MOCK_PORTS.parent, scriptName: "scout.json" }]);
 	const before = new Set(runIds());
 	const worktreesBefore = remoteWorktreeList();
@@ -254,11 +266,16 @@ async function assertRolePolicy() {
 		sentinel: "A1_TOOL_RESULT",
 	});
 	const tool = stepToolResults(step);
-	const toolResult = lastSubagentResult(tool.results);
+	const toolResult = lastToolResultOf(tool.results, "vexillatio");
 	const text = toolResult?.text ?? `${step.output}\n${step.raw}`;
 	const run = findStepRun(before, tool.sessionPath);
-	return assertThat("a1", "role-policy", () => {
-		const missing = ["allowRoles", "'centurion'", "'scout'"].filter((needle) => !text.includes(needle));
+	return assertThat("a1", "utility-cannot-cross", () => {
+		// `dispatch-boundary-v1`: D1 sends recon through `vexillatio` (subagent refuses a
+		// utility target), and a utility dispatch carrying a host is then refused by the
+		// orchestrator (utility = in-process hard leaf). Both halves are product facts.
+		const missing = ["cannot carry a utility dispatch", "read-only helpers run in-process"].filter(
+			(needle) => !text.includes(needle),
+		);
 		const worktreesAfter = remoteWorktreeList();
 		const newWorktrees = worktreesAfter.text
 			.split("\n")
@@ -673,7 +690,7 @@ async function runLaunchScenario() {
 	const nonceA = nonce();
 	// The mocks read these files, so they must exist before the first one starts.
 	installScenarios(scenarioDir(), nonceA, { childName: "centurion-0" });
-	await assertRolePolicy();
+	await assertUtilityCannotCross();
 	await assertMachineList();
 	const passA = await launchPass({ label: "launch-a", childName: "centurion-0", nonceValue: nonceA });
 	assertLaunchSucceeded(passA);

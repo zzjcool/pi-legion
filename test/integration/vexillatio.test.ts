@@ -432,7 +432,9 @@ test("subagent refuses a utility target before any side effect (dispatch-boundar
 		assert.equal(
 			existsSync(path.join(cwd, ".pi-subagents", "runs")),
 			false,
-			"the store is not even materialised (no run.json, no legion.db)",
+			// `.pi-subagents` itself may exist (the session-errors log lives next to it);
+			// what D1 forbids is a RUN: no `runs/<runId>/run.json`, no `legion.db`.
+			"no run directory was minted (no run.json, no legion.db)",
 		);
 	});
 });

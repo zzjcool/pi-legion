@@ -198,7 +198,7 @@ L1 只证明模型可达。镜像自带的包照样能跑模型，但本仓库�
 ### 只看这几行判断通过
 
 ```
-XM_ASSERT a1 PASS role-policy            # scout+host 被拒，文案含 allowRoles/'centurion'/'scout'
+XM_ASSERT a1 PASS utility-cannot-cross # 侦察走 vexillatio；带 host 的 utility 派发被拒（cannot carry a utility dispatch）
 XM_ASSERT a2 PASS machine-list           # 未知机器被拒，文案含 hc machine ls + 真实的 `lists: remote` 片段
 XM_ASSERT b  PASS launch                 # 零配置（只有 enabled:true）启动成功
 XM_ASSERT c  PASS remote-artifact        # 远端真出现 .pi-worktrees/<child> + pi-subagent/remote/… 分支 + 本轮 nonce 文件

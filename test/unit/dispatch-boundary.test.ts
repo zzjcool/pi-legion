@@ -1,37 +1,74 @@
 /**
- * `dispatch-boundary-v1` D4 — the package's own headline examples must not teach a
- * call that D1 now refuses.
+ * `dispatch-boundary-v1` D4 — the package's own teaching surfaces must not show a call
+ * that D1 now refuses.
  *
  * Once `subagent` rejects a `utility: true` target, a doc that still says
  * `subagent({ agent: "scout", … })` is teaching the model a call that fails every
  * time — playbook #303 ("documented path is a dead end") as a shipped artifact.
- * `README.md` and `skills/pi-legion/SKILL.md` are the two that carry the headline
- * examples (the skill travels in the tarball and lands in the system prompt), so
- * they are pinned here: the forbidden SHAPE is refused, and the replacement call is
- * required to still be present, so deleting the recon guidance cannot pass either.
+ *
+ * Two classes of surface are pinned here:
+ *
+ * - D4's documents. `README.md` and `skills/pi-legion/SKILL.md` carry the headline
+ *   examples (the skill travels in the tarball and lands in the system prompt);
+ *   `examples/subagents-parent-context.md` is the `subagents.parentContext` convention
+ *   file README recommends, i.e. it lands in a real session's prompt too; the two
+ *   `docs/reports/*` files and the runbook ship inside the npm package (the
+ *   `package.json` `files` allowlist covers all of `docs/`).
+ * - D4-plus (appendix A): the RUNTIME nag in `src/extension/scout-guard.ts`, which is a
+ *   teaching surface with no doc status at all — it fires mid-session and used to say
+ *   "未派发 subagent … 拆 scout" (naming the wrong tool for the action it asks for).
+ *
+ * For every document the forbidden SHAPE is refused; for the two example docs the
+ * replacement call is also required to still be present, so deleting the recon
+ * guidance outright cannot pass either.
  *
  * The scan is a line window rather than one flat regex: a call may be written on one
- * line or spread over the next few (`subagent({\n  agent: "scout",`), and both forms
- * are the same mistake.
+ * line or spread over the next few (`subagent({\n  agent: "scout",`), and `docs/reports/
+ * xm-harness.md` spells it without parentheses at all (`subagent{agent:"scout", …}`).
+ * Both the paren-less opener and the 12-line spread are pinned by their own test.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { scoutGuardReminder } from "../../src/extension/scout-guard.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-/** Every document held to the D4 rule. `docs/design.md` §9.3 states the boundary too. */
-const DOCS = ["README.md", "skills/pi-legion/SKILL.md", "docs/design.md"] as const;
+/**
+ * Every document held to the D4 rule (appendix A extended the list past the three
+ * original surfaces). `docs/design.md` §9.3 states the boundary itself.
+ */
+const DOCS = [
+	"README.md",
+	"skills/pi-legion/SKILL.md",
+	"docs/design.md",
+	"examples/subagents-parent-context.md",
+	"docs/runbooks/cross-machine-live-e2e.md",
+	"docs/reports/cross-machine-host-discovery.md",
+	"docs/reports/xm-harness.md",
+] as const;
 
 /** The two documents that must ALSO keep the replacement call (they teach the shapes). */
 const DOCS_WITH_EXAMPLES = ["README.md", "skills/pi-legion/SKILL.md"] as const;
 
-const OPEN_CALL = /subagent\s*\(/i;
+/**
+ * A `subagent` call opener: `subagent(`, `subagent (`, and — the loose spelling this
+ * repo really uses — `subagent{`. The `(` is optional on purpose: requiring it let
+ * `docs/reports/xm-harness.md`'s `subagent{agent:"scout", host:"remote"}` through.
+ */
+const OPEN_CALL = /subagent\s*\(?\s*\{/i;
 const UTILITY_TARGET = /agent\s*:\s*["'`]scout["'`]/i;
-/** Upper bound on how many extra lines one multi-line call may span. */
-const WINDOW = 6;
+/**
+ * Upper bound on how many extra lines one multi-line call may span.
+ *
+ * 6 was too small: a reviewer's 12-line `subagent({ … })` (every field on its own line,
+ * `agent: "scout"` at line 8) scanned GREEN. A real call cannot be longer than this
+ * without being unreasonable; a scanner that misses a plausible hand-formatted example
+ * is worse than useless.
+ */
+const WINDOW = 12;
 
 /** Bracket depth of a snippet: `(` / `{` / `[` open, their closers return it. */
 function depthOf(text: string): number {
@@ -91,7 +128,42 @@ test("the D4 scan is not vacuous: it catches the retired shape, in both spelling
 	assert.deepEqual(doomedScoutDispatches('subagent({ agent: "scout", task: "t" })'), ["line 1"]);
 	assert.deepEqual(doomedScoutDispatches("subagent( {agent:'scout', task: 't'})"), ["line 1"]);
 	assert.deepEqual(doomedScoutDispatches('subagent({\n\tagent: "scout",\n\ttask: "t",\n})'), ["line 1"]);
+	// Appendix A blind spot 1: the PAREN-LESS opener (`docs/reports/xm-harness.md`'s own
+	// spelling) used to be invisible to a scanner that required `(`.
+	assert.deepEqual(doomedScoutDispatches('subagent{agent:"scout", host:"remote"}'), ["line 1"]);
+	// Appendix A blind spot 2: a 12-line call whose `agent:` sits on line 8.
+	const spread = [
+		"subagent({",
+		'\tmodel: "m",',
+		'\tpreset: "p",',
+		"\tverify: [\"npm test\"],",
+		"\tworktree: false,",
+		'\thost: "vps",',
+		'\thostCwd: "/srv/app",',
+		'\tagent: "scout",',
+		'\ttask: "t",',
+		'\tname: "recon",',
+		'\tcwd: ".",',
+		"})",
+	].join("\n");
+	assert.deepEqual(doomedScoutDispatches(spread), ["line 1"], "a 12-line call must not scan green");
 	// And it leaves the two legitimate shapes alone.
 	assert.deepEqual(doomedScoutDispatches('subagent({ agent: "worker", task: "t" })'), []);
 	assert.deepEqual(doomedScoutDispatches('vexillatio({ task: "t", agent: "scout" })'), []);
+	assert.deepEqual(doomedScoutDispatches('subagent{agent:"centurion", host:"remote"}'), []);
+});
+
+test("the scout-guard nag points recon at vexillatio (runtime teaching surface)", () => {
+	// Appendix A: the steer message is read mid-session, by a model that is about to
+	// dispatch. "未派发 subagent … 拆 scout" names the tool D1 refuses; the copy has to
+	// carry the one that works. Logic untouched — this is the reminder string only.
+	const reminder = scoutGuardReminder(8);
+	assert.match(reminder, /vexillatio/, `the nag must name the recon tool: ${reminder}`);
+	assert.match(reminder, /scout/, `the nag must still name the role: ${reminder}`);
+	assert.match(reminder, /8/, "the copy still carries the threshold");
+	assert.doesNotMatch(
+		reminder,
+		/未派发 subagent/,
+		`recon must not be described as a bare subagent dispatch: ${reminder}`,
+	);
 });
