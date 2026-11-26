@@ -260,7 +260,7 @@ them by hand.
 | Path | Role |
 | --- | --- |
 | `index.ts` | Pi extension entry: parent tool + child-guard branch |
-| `src/agents/` | role cards: frontmatter parsing + validation, `subagent({ action: "list" })` payload |
+| `src/agents/` | role cards: frontmatter parsing + validation, the payload behind the injected parent roster and `/legion agents` |
 | `src/supervisor/` | spawn backends (`RpcSupervisor` / `InProcessSupervisor` / `TerminalSupervisor`) arbitrated by `RoutingSupervisor` |
 | `src/legion/` | shared team state: `legion.db` schema, phase machine, node tree, mail, stall notice |
 | `src/hc/` | `hc connect` JSON-RPC client — the hc-terminal transport behind the terminal backend |
@@ -289,8 +289,8 @@ it there and add a test that imports from the API path.
 
 ## Agent definitions
 
-A frontmatter key that is parsed but ignored is listed on
-`subagent({ action: "list" })` as `⚠ not enforced yet`. If you start honouring
+A frontmatter key that is parsed but ignored is flagged as `⚠ not enforced yet` in
+two places: the `/legion agents` listing and the `subagent` launch output. If you start honouring
 a field, **remove it from `UNENFORCED_FIELDS`** in `src/agents/agents.ts` in
 the same change, and add a test that it is no longer reported.
 

@@ -17,7 +17,7 @@
  * action, a `required` list, or a `modelFacing` flag. The first is a verbatim copy
  * of the README's second column (it drifted on day one), the second cannot express
  * the real rules (`wait` and `launch` are "one of two"), and the third was `true`
- * fourteen times over. Prose belongs to `README.md`; the machine rule belongs to
+ * for every action there was. Prose belongs to `README.md`; the machine rule belongs to
  * {@link ActionSpec.params}.
  */
 

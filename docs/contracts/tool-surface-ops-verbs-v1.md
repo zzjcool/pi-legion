@@ -99,4 +99,20 @@ launch 6  retire 2   list 1    extend 1     diagnose 1            abort 1   reco
 1. 不删 `diagnose`、`extend`、`recover`、`retire`（2b/2c，需产品判断 + 宿主机制前置）。
 2. 不拆工具、不改工具名、不改白名单、不改角色卡。
 3. 不碰 inert-param 硬拒表的结构（`section` 仍属于 `diagnose`；`ACTION_NAMES` 少一项后
-   求逆推导会自动跟上，`inert-params.test.ts:44-61` 的手写治理锚点表**必须同步删掉 `list`**）。
+   求逆推导会自动跟上）。
+
+---
+
+## 附录 A — review 后遗留项（本契约**不**改，单独决策）
+
+1. **未知 action 的错误文案会撒谎**。`index.ts:3600-3605` 的通用分支对**任何**未知动作回
+   `` `name` is required for the "<x>" action. `` —— `action:"list"` 与 `action:"bogus"` 得到逐字同构
+   的答复。历史上下文里可能还带着 `list`，诚实答复应是
+   `unknown action "list" — removed; the roster is in your system prompt`。
+   属既存行为，非本契约引入，但它现在对 `list` 特别容易误导。
+2. **`renderAgentList`（`index.ts:7554`）已无生产消费者**，但有 4 条测试逐字断言它
+   （`test/unit/teams.test.ts:818/820/828/832`）。保留是为了不白丢那四条断言；
+   要清就单独做一次（把那四条断言迁到 `/legion agents` 的 `renderAgentsListing`）。
+3. `docs/archive/**` 与 `docs/audits/**` 里的 `action=list` 是历史快照，**不修**。
+4. `src/extension/slash.ts:38,53` 的 `action: "list"` 是 `/legion team list` 的命令 AST，
+   **不是**工具 action，不得混淆。
