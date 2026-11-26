@@ -1,11 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import piLegion from "../../index.ts";
+import { runInChildContext } from "../../src/supervisor/child-context.ts";
 import {
 	forbiddenDispatchReason,
 	PARENT_PLAYBOOK,
 	shellChunks,
 	TOOL_DESCRIPTION,
 } from "../../src/extension/playbook.ts";
+import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 test("playbook text describes the backend-neutral launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /subagent\(\{ agent:/);
@@ -89,13 +95,15 @@ test("legacy herdr commands remain available for manual v0.16.x workflows", () =
 
 test("playbook keeps the explicit wait action available", () => {
 	assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true` when you need blocking results/);
-	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire/);
+	// The enumeration is derived from `ACTION_NAMES` (D1), so its ORDER is the
+	// surface's order, not a hand-written one: assert membership, not adjacency.
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\bwait\b/);
 });
 
 test("playbook describes event-driven waits and graceful stop", () => {
 	assert.match(PARENT_PLAYBOOK, /use `stop` to gracefully retire one child or all tracked children/);
-	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire, stop/);
-	assert.match(TOOL_DESCRIPTION, /it is event-driven/);
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\bstop\b/);
+	assert.match(TOOL_DESCRIPTION, /`wait` is event-driven/);
 	assert.match(TOOL_DESCRIPTION, /Esc does not retire children/);
 });
 
@@ -113,10 +121,23 @@ test("playbook documents status overview vs single child (#145)", () => {
 	assert.match(TOOL_DESCRIPTION, /with `name` returns that one child/);
 });
 
-test("playbook requires name or all for wait (#161)", () => {
-	assert.match(TOOL_DESCRIPTION, /`wait` REQUIRES `name` or `all: true`/);
-	assert.match(TOOL_DESCRIPTION, /action: "wait", all: true/);
-	assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true`/);
+test("wait requires name or all: the schema owns the rule, the description no longer repeats it (#161)", async () => {
+	const harness = playbookHarness();
+	try {
+		// tool-surface-dedup-v1 B4: the description's `wait REQUIRES …` half-sentence
+		// was a second copy of this rule, and the two could drift apart unnoticed. The
+		// schema is now the single machine-facing copy.
+		assert.match(
+			harness.actionDescription(),
+			/wait REQUIRES name or all:true \(mutually exclusive\)/,
+		);
+		assert.doesNotMatch(TOOL_DESCRIPTION, /`wait` REQUIRES/, "the duplicate must be gone from the description");
+		// The example is a call SHAPE, not a rule — it stays.
+		assert.match(TOOL_DESCRIPTION, /action: "wait", all: true/);
+		assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true`/);
+	} finally {
+		await harness.cleanup();
+	}
 });
 
 test("playbook says steer queues at a turn boundary and stop is the interrupt (#313)", () => {
@@ -133,10 +154,14 @@ test("playbook says steer queues at a turn boundary and stop is the interrupt (#
 	// …and that `stop` is what actually interrupts.
 	assert.match(PARENT_PLAYBOOK, /To actually stop a child, use `stop`/);
 	assert.match(PARENT_PLAYBOOK, /`force: true` is the hard variant/);
-	// TOOL_DESCRIPTION embeds PARENT_PLAYBOOK, so it inherits the paragraph —
-	// asserting it here pins the embedding (no second copy to drift).
-	assert.match(TOOL_DESCRIPTION, /`steer` is a queue, not an interrupt/);
-	assert.match(TOOL_DESCRIPTION, /To actually stop a child, use `stop`/);
+	// tool-surface-dedup-v1 D2 reverses the old pin: the text has ONE source but
+	// only ONE model-visible injection point (the systemPrompt, from
+	// `before_agent_start`). The description answers HOW to call, never WHEN or
+	// WHETHER — so these sentences are asserted on the playbook alone, and the
+	// description is asserted NOT to embed it (see the dedicated D2 test below).
+	assert.match(PARENT_PLAYBOOK, /`steer` is a queue, not an interrupt/);
+	assert.match(PARENT_PLAYBOOK, /To actually stop a child, use `stop`/);
+	assert.equal(TOOL_DESCRIPTION.includes(PARENT_PLAYBOOK), false);
 	// Numbering stays contiguous and item 8 sits before the unnumbered
 	// "Utility agents …" paragraph (D7: append, never renumber items 1-7).
 	const item7 = PARENT_PLAYBOOK.indexOf("\n7. ");
@@ -175,9 +200,10 @@ test("playbook draws the abort-vs-stop boundary and names abort where steer cann
 	assert.match(PARENT_PLAYBOOK, /queued steering\/follow-up messages are dropped first/);
 	assert.match(PARENT_PLAYBOOK, /`clearQueued: false` keeps them/);
 	assert.match(PARENT_PLAYBOOK, /A timeout receipt is not a failure/);
-	// TOOL_DESCRIPTION carries the action and the same boundary as one sentence
-	// (it embeds PARENT_PLAYBOOK, so this also pins the embedding).
-	assert.match(TOOL_DESCRIPTION, /stop, abort, diagnose/);
+	// TOOL_DESCRIPTION carries the action (derived from ACTION_NAMES, D1) and the
+	// same boundary as one sentence of its own.
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\babort\b/);
+	assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\bdiagnose\b/);
 	assert.match(
 		TOOL_DESCRIPTION,
 		/`abort` stops the child's current turn but keeps its context and session \(child stays alive and continuable; queued messages are dropped first\); `stop` is the one that takes the process down\./,
@@ -188,4 +214,171 @@ test("playbook draws the abort-vs-stop boundary and names abort where steer cann
 		PARENT_PLAYBOOK + TOOL_DESCRIPTION,
 		/headless RPC|via RPC|RPC child|RPC launch/i,
 	);
+});
+
+// ---------------------------------------------------------------------------
+// tool-surface-dedup-v1 D2 — the description no longer carries the playbook
+// ---------------------------------------------------------------------------
+
+test("D2: the tool description does not embed the playbook — one text, one injection point", async () => {
+	const harness = playbookHarness();
+	try {
+		// What the description is FOR: how to call — the derived Actions line, the
+		// param contract, the abort/stop boundary.
+		assert.match(TOOL_DESCRIPTION, /^Roles: /);
+		assert.match(TOOL_DESCRIPTION, /Actions: [^.]*\blaunch \(default\)/);
+		assert.match(TOOL_DESCRIPTION, /`abort` stops the child's current turn/);
+		assert.match(TOOL_DESCRIPTION, /`stop` is the one that takes the process down/);
+		// What it must NOT do: repeat WHEN/WHETHER. What this can actually prove is the
+		// only thing a string assertion CAN prove: no playbook paragraph was pasted in
+		// verbatim. It does NOT catch a paraphrase — that stays a review question, and
+		// claiming otherwise here would make this comment a lie.
+		assert.equal(TOOL_DESCRIPTION.includes(PARENT_PLAYBOOK), false);
+		assert.doesNotMatch(TOOL_DESCRIPTION, /Pi Legion playbook/);
+		for (const paragraph of PARENT_PLAYBOOK.split("\n")) {
+			assert.equal(
+				TOOL_DESCRIPTION.includes(paragraph),
+				false,
+				`the description must not carry a playbook paragraph: ${paragraph.slice(0, 60)}…`,
+			);
+		}
+		// The playbook text itself is unchanged by the move; the gate that injects it is
+		// pinned by the dedicated test below, not by a claim about another file.
+		assert.match(PARENT_PLAYBOOK, /^Pi Legion playbook/);
+		// B4: the diagnose parenthetical is gone — `providers` was never a section id
+		// (`DOCTOR_SECTIONS` has 11, and `providers` is not one of them). The schema's
+		// `action` description is the remaining machine-facing copy, and it points at
+		// the real source instead of carrying a second enumeration.
+		assert.doesNotMatch(TOOL_DESCRIPTION, /providers/, "the invalid section list must not come back");
+		assert.doesNotMatch(TOOL_DESCRIPTION, /\(host vs child/, "the parenthetical must not come back");
+		assert.match(harness.actionDescription(), /optional section filters like \/legion doctor/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// tool-surface-dedup-v1 B3 — the gate that actually injects the playbook
+// ---------------------------------------------------------------------------
+
+const ENV_KEYS = [
+	"PI_CODING_AGENT_DIR",
+	"PI_LEGION_EXTRA_AGENT_DIRS",
+	"PI_SUBAGENT_CHILD",
+	"PI_SUBAGENT_ALLOW_NESTED",
+	"PI_LEGION_DB",
+	"PI_LEGION_NODE_ID",
+	"PI_SUBAGENT_UTILITY_CHILD",
+];
+
+/**
+ * A real `piLegion` registration in a throwaway agent dir: it captures the
+ * `before_agent_start` handler and the `subagent` schema, nothing else runs.
+ *
+ * `systemPromptOptions.selectedTools` is passed straight through, because that
+ * array is what the gate actually reads — the earlier coverage of this file went
+ * around the gate (an empty options object), which is why deleting the injection
+ * left the whole suite green.
+ */
+function playbookHarness() {
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-playbook-"));
+	const agentDir = path.join(cwd, "agent-config");
+	const extraAgentsDir = path.join(cwd, "extra-agents");
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(extraAgentsDir, { recursive: true });
+	writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ subagents: { disableBuiltins: true } }),
+	);
+	const previous = new Map(ENV_KEYS.map((name) => [name, process.env[name]]));
+	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const tools = new Map<string, unknown>();
+	const pi = {
+		registerTool(value: unknown) {
+			tools.set((value as { name: string }).name, value);
+		},
+		registerCommand() {},
+		registerMessageRenderer() {},
+		sendMessage() {},
+		events: { emit() {} },
+		on(name: string, handler: (...args: unknown[]) => unknown) {
+			handlers.set(name, handler);
+		},
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_LEGION_EXTRA_AGENT_DIRS = extraAgentsDir;
+	for (const name of ENV_KEYS.slice(2)) delete process.env[name];
+	piLegion(pi as never, { supervisor: new FakeSupervisor({ immediateTimeout: false }) });
+	const tool = tools.get("subagent") as
+		| { parameters?: { properties?: Record<string, { description?: string }> } }
+		| undefined;
+	return {
+		/** The `action` field's description exactly as the model receives it. */
+		actionDescription(): string {
+			return tool?.parameters?.properties?.action?.description ?? "";
+		},
+		/**
+		 * Drive `before_agent_start` the way the host does. `selectedTools` is passed
+		 * only when the caller names it, so "the host said nothing" stays distinct from
+		 * "the host said no dispatch tools".
+		 */
+		beforeAgentStart(options: { selectedTools?: string[] } = {}): string {
+			const handler = handlers.get("before_agent_start");
+			assert.ok(handler, "`before_agent_start` must be registered");
+			const result = handler(
+				{
+					systemPrompt: "base prompt",
+					systemPromptOptions: options.selectedTools ? { selectedTools: options.selectedTools } : {},
+				},
+				{ cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+			) as { systemPrompt?: string } | undefined;
+			return result?.systemPrompt ?? "";
+		},
+		async cleanup() {
+			await handlers.get("session_shutdown")?.();
+			for (const [name, value] of previous) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			rmSync(cwd, { recursive: true, force: true });
+		},
+	};
+}
+
+test("D2: `before_agent_start` is the playbook's ONE model-visible injection point", async () => {
+	const harness = playbookHarness();
+	try {
+		// (a) a session that may dispatch gets the playbook — either dispatch tool is
+		// enough, and it survives next to unrelated tools.
+		for (const selectedTools of [["subagent"], ["vexillatio"], ["bash", "subagent", "edit"]]) {
+			const prompt = harness.beforeAgentStart({ selectedTools });
+			assert.ok(
+				prompt.includes(PARENT_PLAYBOOK),
+				`selectedTools=[${selectedTools.join(", ")}] must get the playbook`,
+			);
+		}
+		// A host that names no tools at all cannot be narrowed — the pre-existing
+		// default stays (this is what every other harness in the suite relies on).
+		assert.ok(harness.beforeAgentStart().includes(PARENT_PLAYBOOK), "no selectedTools means no filter");
+
+		// (b) a session that cannot dispatch anything gets no prompt from this gate.
+		for (const selectedTools of [["bash", "edit"], []]) {
+			const prompt = harness.beforeAgentStart({ selectedTools });
+			assert.equal(
+				prompt.includes(PARENT_PLAYBOOK),
+				false,
+				`selectedTools=[${selectedTools.join(", ")}] must not get the playbook`,
+			);
+		}
+
+		// (c) a utility child is a hard leaf: it never holds the dispatch tools, so it
+		// never gets the parent playbook — whatever the tool selection says.
+		const utility = await runInChildContext(
+			{ allowNested: false, utility: true, spawnMode: "inprocess", role: "scout" },
+			async () => harness.beforeAgentStart({ selectedTools: ["subagent"] }),
+		);
+		assert.equal(utility.includes(PARENT_PLAYBOOK), false, "a utility child must not get the parent playbook");
+	} finally {
+		await harness.cleanup();
+	}
 });

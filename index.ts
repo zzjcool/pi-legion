@@ -19,7 +19,7 @@ import type {
 	ExtensionContext,
 	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TLiteral } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
@@ -107,6 +107,12 @@ import {
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { renderSpawnResult } from "./src/extension/spawn-render.ts";
 import { appendInprocessModelHint } from "./src/extension/spawn-hints.ts";
+import {
+	ACTION_NAMES,
+	inertParamsFor,
+	inertParamsMessage,
+	type ActionName,
+} from "./src/extension/action-surface.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { CHILD_ROLE_ENV } from "./src/extension/child-guard.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
@@ -315,26 +321,26 @@ const TaskItem = Type.Object({
 	),
 });
 
+/**
+ * tool-surface-dedup-v1 D1: the action union's literals come from {@link ACTION_NAMES}.
+ * There is no second literal list here to fall out of sync with the README table,
+ * `docs/design.md` §9.3 or the model-facing `Actions:` line.
+ *
+ * The mapped type is load-bearing: `Type.Union` computes its `Static` type by
+ * destructuring a TUPLE (`Types extends [Left, ...Right]`), so handing it a plain
+ * mapped ARRAY makes `Static` collapse to `never` — `action` would then accept
+ * nothing and every caller's `action: "wait"` stops compiling.
+ */
+const ActionLiterals = ACTION_NAMES.map((action) => Type.Literal(action)) as [
+	TLiteral<ActionName>,
+	...TLiteral<ActionName>[],
+];
+
 const SubagentParams = Type.Object({
 	action: Type.Optional(
 		Type.Union(
-			[
-				Type.Literal("launch"),
-				Type.Literal("continue"),
-				Type.Literal("steer"),
-				Type.Literal("abort"),
-				Type.Literal("resume"),
-				Type.Literal("retire"),
-				Type.Literal("status"),
-				Type.Literal("collect"),
-				Type.Literal("list"),
-				Type.Literal("wait"),
-				Type.Literal("stop"),
-				Type.Literal("diagnose"),
-				Type.Literal("extend"),
-				Type.Literal("recover"),
-			],
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor. extend = defer the `may be looping` REMINDER for one child only; it addresses this node's own direct children (an unknown or already-ended child is refused, and `runId` does not apply), it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`. recover = collect a CROSS-MACHINE child a previous session launched and no longer holds (name it; no run store, no runId): it reads that child's transcript from its machine, grades it with the collect rules, settles the ledger row, and answers with the collect text. A child still LIVE on that machine is reported as such and nothing is settled; a second call answers `already settled` with the recorded outcome. `/legion status` lists what is recoverable." },
+			ActionLiterals,
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` REMINDER for one child only; it addresses this node's own direct children (an unknown or already-ended child is refused, and `runId` does not apply), it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`. recover = collect a CROSS-MACHINE child a previous session launched and no longer holds (name it; no run store, no runId): it reads that child's transcript from its machine, grades it with the collect rules, settles the ledger row, and answers with the collect text. A child still LIVE on that machine is reported as such and nothing is settled; a second call answers `already settled` with the recorded outcome. `/legion status` lists what is recoverable." },
 		),
 	),
 	agent: Type.Optional(
@@ -2496,6 +2502,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			const action = params.action ?? "launch";
 			if (signal?.aborted && action !== "stop") {
 				return ok("interrupted (parent turn ended; children still running)");
+			}
+			// tool-surface-dedup-v1 D3: a field that was explicitly given but that this
+			// action never reads is REFUSED, not silently dropped. A model that passes
+			// `force: true` to a `collect` believes it forced something; answering with a
+			// collect receipt is how that belief survives.
+			//
+			// AFTER the abort net on purpose: an aborted turn already has its one honest
+			// answer (`interrupted (…)`), and turning that into INVALID_PARAMS because the
+			// call happened to carry an inert field would be a behaviour change nobody
+			// asked for. Still before the first side effect (no store, no catalog, no
+			// spawn).
+			const inert = inertParamsFor(action, params);
+			if (inert.length > 0) {
+				return fail(inertParamsMessage(inert, action), ErrorCodes.INVALID_PARAMS);
 			}
 			// Master switch: refuse NEW launches with a pointer to the toggle;
 			// control actions (status/collect/wait/…) must stay available so a

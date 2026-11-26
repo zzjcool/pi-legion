@@ -46,6 +46,7 @@ import { createSessionRuntime, type WaitResult } from "../../src/extension/runti
 import { RunStore } from "../../src/runs/store.ts";
 import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
 import { currentChildContext, runInChildContext } from "../../src/supervisor/child-context.ts";
+import { PARENT_PLAYBOOK } from "../../src/extension/playbook.ts";
 import { CHILD_ROLE_ENV } from "../../src/extension/child-guard.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import {
@@ -1940,7 +1941,12 @@ test("R6: an in-process child's roster drops the role it actually runs as", asyn
 		);
 		assert.equal(child.includes("- centurion ["), false);
 		assert.match(child, /- worker \[/);
-		assert.match(child, /call the matching name immediately/, "the playbook is still there");
+		// 附录 B3: the assertion this replaces matched roster prose ("call the matching
+		// name immediately" is `formatAgentRoster`), so it proved nothing about the
+		// playbook. Assert the playbook TEXT — the harness passes no `selectedTools`,
+		// so this pins the injection itself.
+		assert.match(child, /call the matching name immediately/, "the roster is still there");
+		assert.ok(child.includes(PARENT_PLAYBOOK), "the child prompt carries the parent playbook");
 	} finally {
 		await harness.cleanup();
 	}

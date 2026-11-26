@@ -542,7 +542,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 | 工具 | 可用者 | 作用 |
 | --- | --- | --- |
-| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 13 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `retire` / `status` / `collect` / `list` / `wait` / `stop` / `diagnose` / `extend` |
+| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 14 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `retire` / `status` / `collect` / `list` / `wait` / `stop` / `diagnose` / `extend` / `recover` |
 | `vexillatio` | 宿主会话（utility child 自身不注册） | 只派 read-only utility agent（`scout`），永远 leaf |
 | `legion_mail` / `legion_tree` / `legion_phase` | **子进程**（`registerTools: true`，root 为 `false`） | 发信 / 看子树 / 请求阶段迁移 |
 

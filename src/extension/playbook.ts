@@ -1,6 +1,16 @@
 /**
- * Parent-side child dispatch guidance shared by tool descriptions and prompts.
+ * Parent-side child dispatch guidance, plus the `subagent` tool description.
+ *
+ * `PARENT_PLAYBOOK` answers WHEN and WHETHER to call the tool; `TOOL_DESCRIPTION`
+ * answers HOW. The playbook reaches the model through `before_agent_start`
+ * (systemPrompt) — plus the blocked-notice helper at the bottom — and is NOT
+ * embedded in the tool description (tool-surface-dedup-v1 D2: one text, one
+ * model-visible injection point, no second copy to drift).
+ *
+ * The action list in the description is DERIVED from `ACTION_NAMES` (D1).
  */
+
+import { ACTION_NAMES } from "./action-surface.ts";
 
 export const PLAYBOOK_NAME = "pi-legion-playbook";
 
@@ -21,11 +31,20 @@ export const PARENT_PLAYBOOK = [
 	"Forbidden: direct bash access to legion.db, or launching child Pi processes by hand (use the subagent tool).",
 ].join("\n");
 
+/**
+ * D1: the action enumeration is DERIVED, never re-typed. `launch` keeps its
+ * "(default)" marker because it is the one action the schema calls
+ * optional-with-a-default, and the model should read that from the same sentence.
+ */
+const ACTIONS_ENUMERATION = ACTION_NAMES.map((action) =>
+	action === "launch" ? `${action} (default)` : action,
+).join(", ");
+
 export const TOOL_DESCRIPTION = [
-	PARENT_PLAYBOOK,
 	"Roles: the system prompt lists every loaded role. Prefer the matching role over doing that work yourself.",
 	"Launch is async by default. Outcomes come from the child session JSONL. In non-interactive `pi --print` / JSON mode, shutdown waits for those children before retiring them; pass `async: false` or call `wait`/`collect` in the same turn to fold the result into the print output.",
-	"Actions: launch (default), continue, steer, resume, status, collect, wait, list, retire, stop, abort, diagnose. `status` with no name (or `all: true`) returns a live-children overview; with `name` returns that one child (unknown → NOT_FOUND). `diagnose` prints the Legion doctor report (host vs child extensions/providers/models/memory). `wait` REQUIRES `name` or `all: true` (mutually exclusive); it is event-driven and returns when a child settles, times out, or the parent turn is interrupted; a timeout leaves children running and returns structured decisions for the parent. Esc does not retire children — use `stop` / `stop`+`force:true` (or exit the session) to retire them. Example: `subagent({ action: \"wait\", all: true })` or `subagent({ action: \"wait\", name: \"worker-0\" })`.",
+	`Actions: ${ACTIONS_ENUMERATION}.` +
+		" `status` with no name (or `all: true`) returns a live-children overview; with `name` returns that one child (unknown → NOT_FOUND). `diagnose` prints the Legion doctor report. `wait` is event-driven and returns when a child settles, times out, or the parent turn is interrupted; a timeout leaves children running and returns structured decisions for the parent. Esc does not retire children — use `stop` / `stop`+`force:true` (or exit the session) to retire them. Example: `subagent({ action: \"wait\", all: true })` or `subagent({ action: \"wait\", name: \"worker-0\" })`.",
 	"`abort` stops the child's current turn but keeps its context and session (child stays alive and continuable; queued messages are dropped first); `stop` is the one that takes the process down. Example: `subagent({ action: \"abort\", name: \"worker-0\" })` (add `clearQueued: false` to keep the queued messages).",
 ].join(" ");
 
