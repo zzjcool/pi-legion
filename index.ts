@@ -331,7 +331,7 @@ const TaskItem = Type.Object({
  * mapped ARRAY makes `Static` collapse to `never` — `action` would then accept
  * nothing and every caller's `action: "wait"` stops compiling.
  */
-const ActionLiterals = ACTION_NAMES.map((action) => Type.Literal(action)) as unknown as [
+const ActionLiterals = ACTION_NAMES.map((action) => Type.Literal(action)) as [
 	TLiteral<ActionName>,
 	...TLiteral<ActionName>[],
 ];
@@ -2500,17 +2500,22 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		): Promise<AgentToolResult<unknown>> {
 			runtime.bind(ctx);
 			const action = params.action ?? "launch";
+			if (signal?.aborted && action !== "stop") {
+				return ok("interrupted (parent turn ended; children still running)");
+			}
 			// tool-surface-dedup-v1 D3: a field that was explicitly given but that this
 			// action never reads is REFUSED, not silently dropped. A model that passes
 			// `force: true` to a `collect` believes it forced something; answering with a
-			// collect receipt is how that belief survives. This runs after `action` is
-			// resolved and before the first side effect (no store, no catalog, no spawn).
+			// collect receipt is how that belief survives.
+			//
+			// AFTER the abort net on purpose: an aborted turn already has its one honest
+			// answer (`interrupted (…)`), and turning that into INVALID_PARAMS because the
+			// call happened to carry an inert field would be a behaviour change nobody
+			// asked for. Still before the first side effect (no store, no catalog, no
+			// spawn).
 			const inert = inertParamsFor(action, params);
 			if (inert.length > 0) {
 				return fail(inertParamsMessage(inert, action), ErrorCodes.INVALID_PARAMS);
-			}
-			if (signal?.aborted && action !== "stop") {
-				return ok("interrupted (parent turn ended; children still running)");
 			}
 			// Master switch: refuse NEW launches with a pointer to the toggle;
 			// control actions (status/collect/wait/…) must stay available so a

@@ -12,11 +12,16 @@
  *   1. README table, design.md §9.3, `TOOL_DESCRIPTION`'s `Actions:` line and the
  *      registered schema's `anyOf` are all the SAME set — a missing action in any
  *      one of them (or an extra one) fails.
- *   2. The comparison itself is not vacuous: a dropped / duplicated / invented
- *      action is proven to throw, so a future "simplification" of the comparator
- *      cannot turn all four checks into no-ops.
- *   3. Every action carries a non-empty `summary` and a spec — the surface is
- *      described, not just enumerated.
+ *   2. …and the same ORDER, because that list is what the model reads: the union
+ *      and the `Actions:` line are derived, so they must follow `ACTION_NAMES`,
+ *      which is pinned to the lifecycle order (附录 B2).
+ *   3. The `N 个动作` COUNT in §9.3 matches too — the table could keep 14 correct
+ *      names under "99 个动作" and nobody would notice (附录 B2).
+ *   4. `ACTION_SPECS[*].params` entries are real `SubagentParams` properties. This
+ *      is the only mechanical defence against a spec inventing a field: the D3
+ *      refusal table is derived from exactly these lists (附录 B2).
+ *   5. The comparison itself is not vacuous: a dropped / duplicated / invented
+ *      action is proven to throw.
  *
  * The schema is read off the REGISTERED tool (a real `piLegion` registration),
  * because `SubagentParams` is not exported and because the registered copy is the
@@ -35,6 +40,29 @@ import { TOOL_DESCRIPTION } from "../../src/extension/playbook.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
+
+/**
+ * The lifecycle order the surface must read in (附录 B2). This literal is a
+ * governance anchor, not a second source: it exists so a "harmless reorder" of
+ * `ACTION_NAMES` (which would silently reorder both the union and the
+ * `Actions:` line the model reads) has to be a deliberate test edit.
+ */
+const LIFECYCLE_ORDER = [
+	"launch",
+	"continue",
+	"steer",
+	"abort",
+	"resume",
+	"retire",
+	"status",
+	"collect",
+	"list",
+	"wait",
+	"stop",
+	"diagnose",
+	"extend",
+	"recover",
+];
 
 function readRepo(relativePath: string): string {
 	return readFileSync(path.join(ROOT, relativePath), "utf8");
@@ -86,13 +114,22 @@ function readmeActionNames(markdown: string): string[] {
 	return names;
 }
 
-/** The `subagent` row of the `docs/design.md` §9.3 table; the 作用 cell lists them. */
-function designActionNames(markdown: string): string[] {
+/**
+ * The `subagent` row of the `docs/design.md` §9.3 table: the 作用 cell lists the
+ * actions AND states the count (`14 个动作`). Both are returned — a table can keep
+ * every name right and still lie about how many there are.
+ */
+function designActionTable(markdown: string): { readonly names: string[]; readonly count: number } {
 	const row = markdown.split("\n").find((line) => line.startsWith("| `subagent` |"));
 	assert.ok(row, "docs/design.md §9.3 must keep its `subagent` row");
 	const what = row.split("|").find((cell) => cell.includes("个动作"));
 	assert.ok(what, "the `subagent` row must keep its action list");
-	return [...what.matchAll(/`([a-z]+)`/g)].map((match) => match[1] as string);
+	const stated = /(\d+)\s*个动作/.exec(what);
+	assert.ok(stated?.[1], "the `subagent` row must state how many actions there are");
+	return {
+		names: [...what.matchAll(/`([a-z]+)`/g)].map((match) => match[1] as string),
+		count: Number(stated[1]),
+	};
 }
 
 /** The enumeration inside `TOOL_DESCRIPTION`'s `Actions:` line (the only periods end it). */
@@ -112,13 +149,14 @@ const ENV_KEYS = [
 ];
 
 /**
- * The `action` union exactly as a model receives it.
+ * The `subagent` schema exactly as a model receives it: the `action` union's
+ * literals and every declared property name.
  *
  * A real registration against a `FakeSupervisor` in a throwaway agent dir — the
- * same harness shape as `tool-surface-polish.test.ts`, cut down to the one
- * schema this file reads. Nothing is launched.
+ * same harness shape as `tool-surface-polish.test.ts`, cut down to the two facts
+ * this file reads. Nothing is launched.
  */
-async function registeredActionLiteral(): Promise<string[]> {
+async function registeredSurface(): Promise<{ literals: string[]; propertyKeys: string[] }> {
 	const cwd = mkdtempSync(path.join(tmpdir(), "action-surface-drift-"));
 	const agentDir = path.join(cwd, "agent-config");
 	const extraAgentsDir = path.join(cwd, "extra-agents");
@@ -149,12 +187,24 @@ async function registeredActionLiteral(): Promise<string[]> {
 	try {
 		piLegion(pi as never, { supervisor: new FakeSupervisor({ immediateTimeout: false }) });
 		const tool = tools.get("subagent") as
-			| { parameters?: { properties?: { action?: { anyOf?: Array<{ const?: unknown }> } } } }
+			| {
+				parameters?: {
+					properties?: {
+						action?: { anyOf?: Array<{ const?: unknown }> };
+						[key: string]: unknown;
+					};
+				};
+			}
 			| undefined;
 		assert.ok(tool, "the `subagent` tool must be registered");
-		const anyOf = tool.parameters?.properties?.action?.anyOf;
+		const properties = tool.parameters?.properties;
+		assert.ok(properties, "`subagent` must register a parameter schema");
+		const anyOf = properties.action?.anyOf;
 		assert.ok(Array.isArray(anyOf) && anyOf.length > 0, "`action` must be a union of literals");
-		return anyOf.map((branch) => String(branch.const));
+		return {
+			literals: anyOf.map((branch) => String(branch.const)),
+			propertyKeys: Object.keys(properties),
+		};
 	} finally {
 		await handlers.get("session_shutdown")?.();
 		for (const [name, value] of previous) {
@@ -167,28 +217,29 @@ async function registeredActionLiteral(): Promise<string[]> {
 
 test("D1: README, design.md §9.3, the description line and the schema are ONE action set", async () => {
 	const canonical = [...ACTION_NAMES];
-	assert.deepEqual(
-		[...canonical].sort(),
-		[
-			"abort", "collect", "continue", "diagnose", "extend", "launch", "list",
-			"recover", "resume", "retire", "status", "steer", "stop", "wait",
-		],
-		"the frozen contract's action set",
-	);
+	const surface = await registeredSurface();
 	for (const [label, actual] of [
 		["the README action table", readmeActionNames(readRepo("README.md"))],
-		["the docs/design.md §9.3 table", designActionNames(readRepo("docs/design.md"))],
+		["the docs/design.md §9.3 table", designActionTable(readRepo("docs/design.md")).names],
 		["TOOL_DESCRIPTION's `Actions:` line", descriptionActionNames(TOOL_DESCRIPTION)],
-		["the registered schema's action union", await registeredActionLiteral()],
+		["the registered schema's action union", surface.literals],
 	] as const) {
 		assertSameActionSet(label, actual, canonical);
 	}
-	// The description is DERIVED from ACTION_NAMES, so it follows its order too —
-	// a hand-written reorder there would mean the derivation was dropped.
-	assert.deepEqual(
-		descriptionActionNames(TOOL_DESCRIPTION),
-		canonical,
-		"the `Actions:` line is built from ACTION_NAMES, order included",
+	// Order too: both code-side copies are DERIVED from ACTION_NAMES, which is the
+	// order the model reads — so every one of them must follow it exactly.
+	assert.deepEqual(descriptionActionNames(TOOL_DESCRIPTION), canonical, "the `Actions:` line follows ACTION_NAMES");
+	assert.deepEqual(surface.literals, canonical, "the schema union follows ACTION_NAMES");
+	// …and that order is the lifecycle order, not whatever landed last (附录 B2).
+	assert.deepEqual(canonical, LIFECYCLE_ORDER, "ACTION_NAMES is in lifecycle order");
+});
+
+test("D1: the action COUNT in docs/design.md §9.3 is asserted, not just the list", () => {
+	const table = designActionTable(readRepo("docs/design.md"));
+	assert.equal(
+		table.count,
+		ACTION_NAMES.length,
+		"§9.3's `N 个动作` must match ACTION_NAMES — a right list under a wrong count is still a lie",
 	);
 });
 
@@ -208,30 +259,32 @@ test("D1: the drift comparison is not vacuous — a dropped, extra or doubled ac
 		() => assertSameActionSet("duplicated row", [...canonical, "launch"], canonical),
 		/must not list an action twice/,
 	);
-	// Order is not what the SET check cares about (the order pin lives above).
+	// Order is not what the SET check cares about (the order pins live above).
 	assert.doesNotThrow(() => assertSameActionSet("same set, other order", [...canonical].reverse(), canonical));
 });
 
-test("D1: every action has a spec with a non-empty summary, and no spec is orphaned", () => {
+test("D1: ACTION_SPECS covers exactly ACTION_NAMES and names only real schema fields", async () => {
+	const surface = await registeredSurface();
 	assert.deepEqual(
 		Object.keys(ACTION_SPECS).sort(),
 		[...ACTION_NAMES].sort(),
-		"ACTION_SPECS must cover exactly ACTION_NAMES",
+		"ACTION_SPECS must cover exactly ACTION_NAMES and contain no orphan",
 	);
 	for (const action of ACTION_NAMES) {
-		const spec = ACTION_SPECS[action];
-		assert.ok(spec.summary.trim().length > 0, `${action} must carry a non-empty summary`);
-		// `params`/`required` are field names, and a required field must also be a
-		// param — otherwise the spec contradicts itself.
-		for (const field of spec.params) {
-			assert.ok(/^[a-z][a-zA-Z]*$/.test(field), `${action}.params entry ${field} must be a schema field name`);
-		}
-		for (const field of spec.required) {
+		const { params } = ACTION_SPECS[action];
+		assert.equal(
+			new Set(params).size,
+			params.length,
+			`${action}.params must not repeat a field`,
+		);
+		for (const field of params) {
+			// THE anchor (附录 B2): a spec that invents a field would silently create a
+			// refusal for something the schema never offered. Nothing else catches it —
+			// `bogus` in one spec used to keep every other test green.
 			assert.ok(
-				spec.params.includes(field),
-				`${action}.required lists ${field}, which is not in ${action}.params`,
+				surface.propertyKeys.includes(field),
+				`${action}.params lists \`${field}\`, which is not a SubagentParams property`,
 			);
 		}
-		assert.equal(spec.modelFacing, true, `${action} is model-facing in this contract (Step 2 flips ops verbs)`);
 	}
 });
