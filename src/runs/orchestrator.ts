@@ -2233,7 +2233,7 @@ export class Orchestrator {
 	 * shadow the real owner's `launchQueue` settings.
 	 */
 	private existingAdmissionQueue(): AdmissionQueue<LaunchQueuePayload> | undefined {
-		// §6.1/§13.6: a control-action instance (stop/status/collect) must reach the
+		// §6.1/§13.6: a control-action instance (stop/status/wait) must reach the
 		// queue a SIBLING instance created — otherwise `subagent stop <queued>` is a
 		// silent no-op and `status` reports it as "queue lost". `peek` is read-only on
 		// purpose: acquiring here would install an empty queue with default bounds and

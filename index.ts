@@ -2521,7 +2521,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				return fail(inertParamsMessage(inert, action), ErrorCodes.INVALID_PARAMS);
 			}
 			// Master switch: refuse NEW launches with a pointer to the toggle;
-			// control actions (status/collect/wait/…) must stay available so a
+			// control actions (status/wait/…) must stay available so a
 			// disable with live children remains observable and collectable.
 			if (!subagentsEnabled(ctx.cwd) && (action === "launch" || !action)) {
 				return fail(
