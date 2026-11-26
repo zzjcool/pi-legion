@@ -155,7 +155,7 @@ test("tool classification: read counts, edit/write reset, only launches dispatch
 	assert.equal(classifyScoutToolCall("subagent", { tasks: [{ agent: "scout", task: "look" }] }), "dispatch");
 	assert.equal(classifyScoutToolCall("vexillatio", { task: "survey" }), "dispatch");
 	assert.equal(classifyScoutToolCall("subagent", { action: "status" }), "ignore");
-	assert.equal(classifyScoutToolCall("subagent", { action: "collect", name: "worker-0" }), "ignore");
+	assert.equal(classifyScoutToolCall("subagent", { action: "wait", name: "worker-0" }), "ignore");
 	assert.equal(classifyScoutToolCall("subagent", { action: "continue", name: "worker-0" }), "ignore");
 	assert.equal(classifyScoutToolCall("codemode", { code: "1" }), "ignore");
 	assert.equal(classifyScoutToolCall("bash", {}), "ignore");

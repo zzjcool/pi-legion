@@ -339,7 +339,7 @@ const SubagentParams = Type.Object({
 	action: Type.Optional(
 		Type.Union(
 			ActionLiterals,
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a collect/wait budget or the child's own timeout, and never restarts, revives or steers it. recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `collect`; a still-live child is only reported. `/legion status` lists what is recoverable." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a wait budget or the child's own timeout, and never restarts, revives or steers it. recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `wait`; a still-live child is only reported. `/legion status` lists what is recoverable." },
 		),
 	),
 	agent: Type.Optional(
@@ -433,7 +433,7 @@ const SubagentParams = Type.Object({
 	name: Type.Optional(
 		Type.String({
 			description:
-				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On wait: REQUIRED unless all:true (mutually exclusive with all). On other control actions (stop/collect/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
+				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On wait: REQUIRED unless all:true (mutually exclusive with all). On other control actions (stop/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
 		}),
 	),
 	all: Type.Optional(
@@ -444,7 +444,7 @@ const SubagentParams = Type.Object({
 	runId: Type.Optional(
 		Type.String({
 			description:
-				'control actions (status/collect/stop/continue/resume/steer/abort): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
+				'control actions (status/stop/continue/resume/steer/abort): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "status", name: "worker-0", runId: "r-4fd626ee" }).',
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -455,7 +455,7 @@ const SubagentParams = Type.Object({
 	ms: Type.Optional(
 		Type.Number({
 			description:
-				'extend only: the new long-running reminder radius in ms (positive integer). Omit to keep the radius already in force. It is a REMINDER setting — it never changes a collect/wait budget or the child\'s own timeoutMs. Example: subagent({ action: "extend", name: "worker-0", ms: 1800000 }).',
+				'extend only: the new long-running reminder radius in ms (positive integer). Omit to keep the radius already in force. It is a REMINDER setting — it never changes a wait budget or the child\'s own timeoutMs. Example: subagent({ action: "extend", name: "worker-0", ms: 1800000 }).',
 		}),
 	),
 	force: Type.Optional(
@@ -3702,14 +3702,6 @@ async function controlAction(input: {
 
 	if (action === "steer") return steerChild(ctx);
 	if (action === "abort") return abortChild(ctx);
-	if (action === "collect")
-		return collectChild(
-			ctx,
-			input.signal,
-			mailSeamOf(input.legion),
-			artifactBytesLookup(input.legion),
-			verificationLookup(input.legion),
-		);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
 	return fail(`unhandled action: ${action}`, ErrorCodes.INVALID_PARAMS);
@@ -3823,13 +3815,13 @@ function scopeRunIdFor(input: {
 /**
  * Actions that may only ever act on this session's own direct child (#312).
  *
- * `extend` belongs here for a different reason than the other three: its state lives
+ * `extend` belongs here for a different reason than the other two: its state lives
  * in THIS session's postman, which only knows `getChildren(db, this.node)`. A record
  * resolved from another run would be answered "not a child of this node" a moment
  * later, so the strict refusal — which names the candidates — is the honest answer
  * the description promises.
  */
-const STRICT_SCOPE_ACTIONS = new Set(["collect", "continue", "resume", "extend"]);
+const STRICT_SCOPE_ACTIONS = new Set(["continue", "resume", "extend"]);
 
 /**
  * stall-notice D5 — `subagent({action:"extend", name, ms?})`.
@@ -4073,6 +4065,14 @@ export async function abortChild(
 
 /**
  * Wait for the child's current turn and derive its outcome from the session.
+ *
+ * collect-merge-v1 D1: this is RETAINED INTERNAL CAPABILITY, not a dead branch. The
+ * `collect` ACTION is gone (the model-facing read verb is `wait`, which renders its
+ * finished snapshots through the same `renderCollect`), so nothing in `controlAction`
+ * dispatches here any more. The seam stays because it is the collect-shaped path the
+ * `mailPreemptedCollect` bail and the `result-ledger-v1` D3b "delivery declares the
+ * read" contract are asserted against directly (`ledger-read-marking`,
+ * `wait-mail-preempt`) — deleting it would drop that coverage, not the action.
  *
  * Exported alongside `waitAction` for the index-layer unit tests.
  */
@@ -4850,7 +4850,7 @@ async function launchFamily(input: {
 
 	if (isAsync && session.handles.length > 0) {
 		session.results.push(
-			"↳ async: a completion message is queued when each child finishes. It wakes this session when idle; otherwise it is delivered after the current turn. Use wait or collect for results. Do not tell children to message the parent.",
+			"↳ async: a completion message is queued when each child finishes. It wakes this session when idle; otherwise it is delivered after the current turn. Use wait for results. Do not tell children to message the parent.",
 		);
 	}
 

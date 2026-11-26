@@ -208,7 +208,7 @@ That shutdown waits for each live async child to settle, bounded by the
 child's turn timeout, and only then retires whatever is still running. A
 child killed by that shutdown is recorded as aborted because the parent
 session shut down, not because the model produced no reply. To include the
-child's result in the same print turn, call `wait` or `collect` before the
+child's result in the same print turn, call `wait` before the
 turn ends, or launch with `async: false`. To stop children explicitly, use
 `subagent({ action: "stop", name: "worker-0" })` or
 `subagent({ action: "stop", all: true })`; this runs the normal graceful-retire
@@ -227,12 +227,11 @@ the model-facing `Actions:` line and `docs/design.md` §9.3 stop agreeing.
 | `abort` | Interrupt the child's current turn and keep its session, so it stays continuable. The child is not torn down — that is `stop`. |
 | `resume` | The same revive path as `continue`, used to pick a saved child back up (receipt says `Resumed`). |
 | `status` | One child's snapshot with `name`; without `name`, the live-children overview. |
-| `collect` | Wait for the child's current turn and derive its outcome from its session. |
 | `wait` | Event-driven wait for `name` or `all: true`; a timeout retires nothing. |
 | `stop` | Graceful stop of one child or of every live child; `force: true` hard-retires. |
 | `diagnose` | The `/legion doctor` self-check returned as tool output, with an optional `section`. |
-| `extend` | Defer the "may be looping" reminder for one direct child by `ms`. Reminder only: it never changes a collect/wait budget or the child's own timeout, and never restarts, revives or steers the child. |
-| `recover` | Adopt a cross-machine child a PREVIOUS session launched: `name` only — no `runId`, the record lives in no run store here. Reads its transcript from that machine, grades it with the collect rules, settles the ledger row and answers like `collect`; a still-live child is only reported. `/legion status` lists what is recoverable. |
+| `extend` | Defer the "may be looping" reminder for one direct child by `ms`. Reminder only: it never changes a wait budget or the child's own timeout, and never restarts, revives or steers the child. |
+| `recover` | Adopt a cross-machine child a PREVIOUS session launched: `name` only — no `runId`, the record lives in no run store here. Reads its transcript from that machine, grades it with the wait rules, settles the ledger row and answers like `wait`; a still-live child is only reported. `/legion status` lists what is recoverable. |
 
 ### Stopping async subagents yourself
 

@@ -32,7 +32,6 @@ export const ACTION_NAMES = [
 	"abort",
 	"resume",
 	"status",
-	"collect",
 	"wait",
 	"stop",
 	"diagnose",
@@ -49,7 +48,7 @@ export interface ActionSpec {
 	 * Two groups are deliberately absent: `action` itself, and the resolution
 	 * fields `cwd` / `hostCwd` / `host` / `agentScope` — `execute` reads all of
 	 * them for EVERY action before dispatch (`cwdIsRemote`, the store, the
-	 * catalog), so repeating them twelve times would say nothing and, worse,
+	 * catalog), so repeating them eleven times would say nothing and, worse,
 	 * would make them look single-consumer. `name` / `all` / `runId` / `message` /
 	 * `model` are genuinely read by several actions and ARE listed per action —
 	 * which is exactly how {@link PARAM_OWNER_ACTIONS} tells a single consumer
@@ -81,9 +80,6 @@ export const ACTION_SPECS: Readonly<Record<ActionName, ActionSpec>> = {
 	},
 	status: {
 		params: ["name", "all", "runId"],
-	},
-	collect: {
-		params: ["name", "runId"],
 	},
 	wait: {
 		params: ["name", "all", "timeoutMs"],
@@ -163,11 +159,11 @@ export function inertParamsFor(action: ActionName, params: Record<string, unknow
  * and the way out.
  *
  * For a single control-owned field this reads exactly:
- * `force is only read by action "stop" (got action "collect"). Drop it or call action:"stop".`
+ * `force is only read by action "stop" (got action "wait"). Drop it or call action:"stop".`
  *
  * The "call action:X" half is offered only when the owner is a CONTROL action.
  * When the owner is `launch` it is withheld: the description tells the model to
- * `wait`/`collect` in the same turn, so answering `call action:"launch"` would
+ * `wait` in the same turn, so answering `call action:"launch"` would
  * argue against the paragraph the model just read. Those calls get `Drop it.`
  */
 export function inertParamsMessage(inert: readonly string[], action: ActionName): string {

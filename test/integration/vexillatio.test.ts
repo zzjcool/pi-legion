@@ -370,11 +370,18 @@ test("non-legion children can control utility agents dispatched through vexillat
 			assert.match(status.content[0]?.text ?? "", /scout-0/);
 
 			const collected = await invoke(pi, "subagent", {
-				action: "collect",
+				action: "wait",
 				name: "scout-0",
 			}, context(cwd));
-			assert.equal((collected.details as { error?: string } | undefined)?.error, undefined);
-			assert.match(collected.content[0]?.text ?? "", /utility output for scout/);
+			// collect-merge-v1 D2 (accepted gap, option (a)): `wait` resolves names
+			// from THIS session's runtime only (active jobs, then the finished cache) —
+			// it never reads the run store, which is how the deleted `collect` reached a
+			// child `vexillatio` dispatched with its own handles. The utility result is
+			// delivered by the dispatch itself (the `── scout-0 ──` block above), so this
+			// probe is pinned as NOT_FOUND: the gap stays visible, and a future "wait
+			// falls back to run.json" lands here on purpose instead of silently.
+			assert.equal((collected.details as { error?: string } | undefined)?.error, ErrorCodes.NOT_FOUND);
+			assert.match(collected.content[0]?.text ?? "", /unknown child/i);
 		},
 	);
 });

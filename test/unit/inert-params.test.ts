@@ -2,7 +2,7 @@
  * tool-surface-dedup-v1 D3 — an inert parameter is REFUSED, not silently dropped.
  *
  * The schema is a flat bag: every consumer sees all 25 fields, so `subagent({
- * action: "collect", force: true })` used to run a plain collect and answer with
+ * action: "wait", force: true })` used to run a plain wait and answer with
  * a receipt — the caller believed it forced something. Only params whose ONE
  * consumer is proven are hardened; `name` / `all` / `runId` / `message` / `model`
  * are read by several actions and stay permissive, and the resolution fields
@@ -129,25 +129,25 @@ test("D3: a provided field is inert on every action except its owner", () => {
 test("D3: only an explicitly provided value counts as provided", () => {
 	// A caller that spreads a config carries `undefined` for keys it did not set;
 	// refusing that would punish the spread, not the mistake.
-	assert.deepEqual(inertParamsFor("collect", { name: "worker-0", force: undefined }), []);
-	assert.deepEqual(inertParamsFor("collect", {}), []);
+	assert.deepEqual(inertParamsFor("status", { name: "worker-0", force: undefined }), []);
+	assert.deepEqual(inertParamsFor("status", {}), []);
 	// `false` / `0` / `""` ARE provided — they are choices, not absences.
-	assert.deepEqual(inertParamsFor("collect", { force: false }), ["force"]);
-	assert.deepEqual(inertParamsFor("collect", { timeoutMs: 0 }), ["timeoutMs"]);
-	assert.deepEqual(inertParamsFor("collect", { section: "" }), ["section"]);
+	assert.deepEqual(inertParamsFor("status", { force: false }), ["force"]);
+	assert.deepEqual(inertParamsFor("status", { timeoutMs: 0 }), ["timeoutMs"]);
+	assert.deepEqual(inertParamsFor("status", { section: "" }), ["section"]);
 });
 
 test("D3: multi-consumer params, the resolution fields and the documented exclusions stay permissive", () => {
 	// `name`/`all`/`runId`/`message`/`model` are read by several actions.
 	const control = { name: "worker-0", runId: "r-1", message: "go on", model: "p/m" };
-	for (const action of ["continue", "steer", "abort", "resume", "status", "collect"] as const) {
+	for (const action of ["continue", "steer", "abort", "resume", "status"] as const) {
 		assert.deepEqual(inertParamsFor(action, control), [], `${action} reads the control fields`);
 	}
 	assert.deepEqual(inertParamsFor("stop", { name: "worker-0", all: true, force: true }), []);
 	assert.deepEqual(inertParamsFor("wait", { all: true, timeoutMs: 50 }), []);
 	// 附录 B1: a cross-machine revive passes `host` (and `cwd`) on a control action.
 	assert.deepEqual(inertParamsFor("resume", { name: "worker-0", message: "go", host: "build-box" }), []);
-	assert.deepEqual(inertParamsFor("collect", { name: "worker-0", cwd: "/tmp", hostCwd: "/r", agentScope: "both" }), []);
+	assert.deepEqual(inertParamsFor("status", { name: "worker-0", cwd: "/tmp", hostCwd: "/r", agentScope: "both" }), []);
 	// EXCLUDED by the contract: `wait` ignores `runId` (it returns before scope
 	// resolution). That inconsistency is a separate decision, so it must NOT be
 	// refused here — this assertion is the pin that it stays untouched.
@@ -158,7 +158,7 @@ test("D3: multi-consumer params, the resolution fields and the documented exclus
 
 test("D3: every offending field is reported, sorted", () => {
 	assert.deepEqual(
-		inertParamsFor("collect", { name: "worker-0", timeoutMs: 1, ms: 2, force: true, clearQueued: false }),
+		inertParamsFor("status", { name: "worker-0", timeoutMs: 1, ms: 2, force: true, clearQueued: false }),
 		["clearQueued", "force", "ms", "timeoutMs"],
 		"sorted, so the message reads the same way however the specs are ordered",
 	);
@@ -171,18 +171,18 @@ test("D3: every offending field is reported, sorted", () => {
 test("D3: the refusal text names the field, its action, the action used, and both ways out", () => {
 	// The contract's own example, character for character.
 	assert.equal(
-		inertParamsMessage(["force"], "collect"),
-		'force is only read by action "stop" (got action "collect"). Drop it or call action:"stop".',
+		inertParamsMessage(["force"], "status"),
+		'force is only read by action "stop" (got action "status"). Drop it or call action:"stop".',
 	);
 	// Several control-owned fields: one clause each, then a single actionable tail.
 	// `inertParamsFor` hands the message a SORTED list; the message echoes that order.
 	assert.equal(
-		inertParamsMessage(["ms", "timeoutMs"], "collect"),
-		'ms is only read by action "extend"; timeoutMs is only read by action "wait" (got action "collect"). ' +
+		inertParamsMessage(["ms", "timeoutMs"], "status"),
+		'ms is only read by action "extend"; timeoutMs is only read by action "wait" (got action "status"). ' +
 			'Drop them or call the action that reads each (ms → action:"extend", timeoutMs → action:"wait").',
 	);
 	// 附录 B1: a `launch`-owned field never suggests switching to `launch` — the
-	// description tells the model to `wait`/`collect` in the same turn, so that
+	// description tells the model to `wait` in the same turn, so that
 	// advice would argue against the paragraph the model just read.
 	assert.equal(
 		inertParamsMessage(["async"], "wait"),
@@ -201,7 +201,7 @@ test("D3: the refusal text names the field, its action, the action used, and bot
 	// Every field must remain resolvable to a real action — a message that says
 	// `only read by action "undefined"` is worse than no message.
 	for (const field of Object.keys(PARAM_OWNER_ACTIONS)) {
-		const text = inertParamsMessage([field], "collect");
+		const text = inertParamsMessage([field], "status");
 		assert.match(text, /only read by action "[a-z]+"/, `${field} must name a real action`);
 		assert.doesNotMatch(text, /action:"launch"/, `${field}: launch is never the suggested fix`);
 	}
@@ -303,12 +303,12 @@ test("D3: execute refuses an inert param before it resolves anything", async () 
 		// name resolution this would answer `unknown child: ghost`, which is exactly
 		// the silent-drop failure the contract is about. The code + wording are the
 		// load-bearing evidence here; `supervisor.calls` is empty either way for a
-		// collect (nothing would have been spawned), so it proves nothing on its own.
-		const refused = await harness.invoke({ action: "collect", name: "ghost", force: true });
+		// wait (nothing would have been spawned), so it proves nothing on its own.
+		const refused = await harness.invoke({ action: "wait", name: "ghost", force: true });
 		assert.equal(refused.details?.error, ErrorCodes.INVALID_PARAMS);
 		assert.match(
 			refused.text,
-			/^force is only read by action "stop" \(got action "collect"\)\. Drop it or call action:"stop"\.$/,
+			/^force is only read by action "stop" \(got action "wait"\)\. Drop it or call action:"stop"\.$/,
 		);
 		assert.doesNotMatch(refused.text, /unknown child/i, "the gate must precede child resolution");
 
@@ -336,7 +336,7 @@ test("D3: an aborted turn still answers `interrupted`, inert field or not", asyn
 		// carried an inert field would be an unannounced behaviour change.
 		const controller = new AbortController();
 		controller.abort();
-		const interrupted = await harness.call({ action: "collect", name: "ghost", force: true }, controller.signal);
+		const interrupted = await harness.call({ action: "wait", name: "ghost", force: true }, controller.signal);
 		assert.equal(interrupted.details?.error, undefined, "an aborted turn is not a param error");
 		assert.equal(interrupted.text, "interrupted (parent turn ended; children still running)");
 	} finally {
@@ -362,6 +362,23 @@ test("D3: execute still runs a legal call that looks similar", async () => {
 		// And a stop with `force` is untouched by the gate.
 		const stop = await harness.invoke({ action: "stop", name: "ghost", force: true });
 		assert.doesNotMatch(stop.text, /only read by action/, "force is legal on stop");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("collect-merge-v1 D2: `runId` on `wait` is accepted and ignored, never refused", async () => {
+	const harness = indexHarness();
+	try {
+		// `collect` was the only read verb that read `runId`, and `wait` never did;
+		// collect-merge-v1 accepted that gap (D2 option (a)) instead of teaching `wait` a
+		// second scope. `runId` is multi-consumer, so the inert gate cannot refuse it
+		// either: the call must reach the ordinary wait answer, not a param error. This
+		// is what a caller of the deleted action actually meets.
+		const waited = await harness.invoke({ action: "wait", name: "ghost", runId: "r-4fd626ee" });
+		assert.notEqual(waited.details?.error, ErrorCodes.INVALID_PARAMS, "runId is not an inert-param refusal");
+		assert.doesNotMatch(waited.text, /only read by action/, "no refusal clause is invented for runId");
+		assert.match(waited.text, /unknown child/i, "the call ran the ordinary wait path, ignoring runId");
 	} finally {
 		await harness.cleanup();
 	}

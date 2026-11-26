@@ -298,11 +298,9 @@ async function postmanTick(db: DatabaseSync): Promise<string[]> {
 	return injected;
 }
 
-/** The minimum a `collect` needs to reach the runtime seam (nothing below uses it). */
+/** The minimum the internal collect seam needs to reach the runtime (nothing below uses it). */
 function collectFixture(runtime: SessionRuntime, store: RunStore, cwd: string) {
 	return {
-		action: "collect",
-		params: { action: "collect", name: CHILD },
 		name: CHILD,
 		supervisor: new FakeSupervisor(),
 		onBudgetRefused: () => ({ ok: false, message: "no budget" }),
