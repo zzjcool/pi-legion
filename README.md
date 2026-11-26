@@ -226,7 +226,6 @@ the model-facing `Actions:` line and `docs/design.md` §9.3 stop agreeing.
 | `retire` | Retire the child while preserving its outcome and session for a later resume. |
 | `status` | One child's snapshot with `name`; without `name`, the live-children overview. |
 | `collect` | Wait for the child's current turn and derive its outcome from its session. |
-| `list` | List the loaded roles, with the active team and any team warnings on top when they are not the default. |
 | `wait` | Event-driven wait for `name` or `all: true`; a timeout retires nothing. |
 | `stop` | Graceful stop of one child or of every live child; `force: true` hard-retires. |
 | `diagnose` | The `/legion doctor` self-check returned as tool output, with an optional `section`. |

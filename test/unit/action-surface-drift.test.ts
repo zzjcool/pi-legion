@@ -15,8 +15,8 @@
  *   2. …and the same ORDER, because that list is what the model reads: the union
  *      and the `Actions:` line are derived, so they must follow `ACTION_NAMES`,
  *      which is pinned to the lifecycle order (附录 B2).
- *   3. The `N 个动作` COUNT in §9.3 matches too — the table could keep 14 correct
- *      names under "99 个动作" and nobody would notice (附录 B2).
+ *   3. The `N 个动作` COUNT in §9.3 matches too — the table could keep every name
+ *      right under "99 个动作" and nobody would notice (附录 B2).
  *   4. `ACTION_SPECS[*].params` entries are real `SubagentParams` properties. This
  *      is the only mechanical defence against a spec inventing a field: the D3
  *      refusal table is derived from exactly these lists (附录 B2).
@@ -56,7 +56,6 @@ const LIFECYCLE_ORDER = [
 	"retire",
 	"status",
 	"collect",
-	"list",
 	"wait",
 	"stop",
 	"diagnose",
@@ -116,7 +115,7 @@ function readmeActionNames(markdown: string): string[] {
 
 /**
  * The `subagent` row of the `docs/design.md` §9.3 table: the 作用 cell lists the
- * actions AND states the count (`14 个动作`). Both are returned — a table can keep
+ * actions AND states the count (`13 个动作`). Both are returned — a table can keep
  * every name right and still lie about how many there are.
  */
 function designActionTable(markdown: string): { readonly names: string[]; readonly count: number } {

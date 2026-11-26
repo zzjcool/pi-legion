@@ -943,7 +943,8 @@ function applyHerdrFields(config: AgentConfig, fm: AgentFrontmatter): void {
 
 /**
  * Fields that are parsed and validated but that the runtime does NOT act on
- * yet. They are surfaced (tool output, `subagent action=list`) instead of being
+ * yet. They are surfaced (two carriers: the `/legion agents` listing and the launch
+ * output's `⚠ … sets fields that are not enforced yet` warning) instead of being
  * silently dropped, because a frontmatter key that looks accepted but does
  * nothing is worse than an unknown one: the user believes it is in effect.
  *
@@ -1170,7 +1171,7 @@ export function formatAgentList(agents: AgentConfig[], maxItems = 50): string {
 
 /**
  * Roster injected into the parent system prompt so the model can pick a role
- * without calling `action=list` first. Custom user/project agents (search, …)
+ * without a role-list tool call. Custom user/project agents (search, …)
  * only exist here — they are not hardcoded in the playbook.
  */
 export function formatAgentRoster(agents: AgentConfig[]): string {

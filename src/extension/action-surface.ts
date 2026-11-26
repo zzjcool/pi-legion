@@ -17,7 +17,7 @@
  * action, a `required` list, or a `modelFacing` flag. The first is a verbatim copy
  * of the README's second column (it drifted on day one), the second cannot express
  * the real rules (`wait` and `launch` are "one of two"), and the third was `true`
- * fourteen times over. Prose belongs to `README.md`; the machine rule belongs to
+ * for every action there was. Prose belongs to `README.md`; the machine rule belongs to
  * {@link ActionSpec.params}.
  */
 
@@ -34,7 +34,6 @@ export const ACTION_NAMES = [
 	"retire",
 	"status",
 	"collect",
-	"list",
 	"wait",
 	"stop",
 	"diagnose",
@@ -51,7 +50,7 @@ export interface ActionSpec {
 	 * Two groups are deliberately absent: `action` itself, and the resolution
 	 * fields `cwd` / `hostCwd` / `host` / `agentScope` — `execute` reads all of
 	 * them for EVERY action before dispatch (`cwdIsRemote`, the store, the
-	 * catalog), so repeating them fourteen times would say nothing and, worse,
+	 * catalog), so repeating them thirteen times would say nothing and, worse,
 	 * would make them look single-consumer. `name` / `all` / `runId` / `message` /
 	 * `model` are genuinely read by several actions and ARE listed per action —
 	 * which is exactly how {@link PARAM_OWNER_ACTIONS} tells a single consumer
@@ -89,12 +88,6 @@ export const ACTION_SPECS: Readonly<Record<ActionName, ActionSpec>> = {
 	},
 	collect: {
 		params: ["name", "runId"],
-	},
-	// `list` renders the catalog and the loaded roles. The only field it consumes is
-	// `agentScope`, and that is a resolution field read before dispatch for every
-	// action — so `list` itself reads nothing from the call.
-	list: {
-		params: [],
 	},
 	wait: {
 		params: ["name", "all", "timeoutMs"],

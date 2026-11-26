@@ -2541,15 +2541,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				: { agents: catalog.agents, team: catalog.team, warnings: catalog.teamWarnings };
 			const agents = selectedTeam.agents;
 			const team = selectedTeam.team;
-			const teamWarnings = teamName
-				? [...selectedTeam.warnings, ...catalog.utilityWarnings]
-				: selectedTeam.warnings;
 			runtime.setJoinConfig({
 				mode: settings.joinMode ?? DEFAULT_JOIN_MODE,
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
 			});
 
-			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
 			if (action === "diagnose") {
 				let sections;
 				try {
@@ -7541,6 +7537,20 @@ export async function waitAction(input: {
 	};
 }
 
+/**
+ * The loaded-roles catalog, with the active team and its warnings on top.
+ *
+ * No longer reachable from the tool: `list` was removed from the action set
+ * (`docs/contracts/tool-surface-ops-verbs-v1.md` D1) because the roster is already
+ * injected into the parent system prompt — `renderParentRoster` below, built on
+ * `formatAgentRoster` (`src/agents/agents.ts`) — so the model never needed a tool
+ * call to learn which roles exist. Kept because `test/unit/teams.test.ts` still
+ * pins this text (active-team line, warning line, legacy no-agents message) byte
+ * for byte; deleting it would only drop that coverage. The `⚠ not enforced yet`
+ * disclosure it renders is not lost either: `/legion agents`
+ * (`src/extension/slash.ts`) and the launch output (`effective.unenforcedFields`)
+ * carry the same warning.
+ */
 export function renderAgentList(
 	agents: AgentConfig[],
 	team: ActiveTeam,

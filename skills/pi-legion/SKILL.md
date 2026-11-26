@@ -22,7 +22,8 @@ subagent({ tasks: [
 ] })
 ```
 
-The loaded roles are whatever `subagent({ action: "list" })` reports; this
+The loaded roles are the roster injected into this session's system prompt —
+read it there and call a role by name, there is no action that lists them. This
 package bundles only three of them — `centurion`, `worker`, and `scout`.
 
 That is the dispatch path: Pi Legion starts children as `AgentSession`s inside

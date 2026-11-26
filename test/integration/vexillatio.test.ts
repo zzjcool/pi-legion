@@ -636,7 +636,12 @@ test("vexillatio tasks[] keeps and retires both timed-out utilities independentl
 		async ({ pi, cwd }) => {
 			const footer: CapturedFooter = {};
 			writeProjectSubagentSettings(cwd, { joinMode: "each" });
-			await invoke(pi, "subagent", { action: "list" }, context(cwd, { footer }));
+			// The project `joinMode` reaches the shared runtime through the `subagent`
+			// tool's execute — the only caller of `runtime.setJoinConfig` — so without one
+			// `subagent` call first, vexillatio would still be joining and both notices
+			// below would arrive as ONE message. `status` is the cheapest action that gets
+			// there: it starts nothing, retires nothing and touches no widget.
+			await invoke(pi, "subagent", { action: "status" }, context(cwd, { footer }));
 
 			const result = await invoke(pi, "vexillatio", {
 				task: "Wait for both independent utility tasks.",
