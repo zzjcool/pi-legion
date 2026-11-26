@@ -53,7 +53,6 @@ const LIFECYCLE_ORDER = [
 	"steer",
 	"abort",
 	"resume",
-	"retire",
 	"status",
 	"collect",
 	"wait",
@@ -115,7 +114,7 @@ function readmeActionNames(markdown: string): string[] {
 
 /**
  * The `subagent` row of the `docs/design.md` §9.3 table: the 作用 cell lists the
- * actions AND states the count (`13 个动作`). Both are returned — a table can keep
+ * actions AND states the count (`12 个动作`). Both are returned — a table can keep
  * every name right and still lie about how many there are.
  */
 function designActionTable(markdown: string): { readonly names: string[]; readonly count: number } {

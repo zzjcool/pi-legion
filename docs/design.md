@@ -33,7 +33,7 @@
 2. **执行结果只从 session jsonl 推导**：`deriveOutcome`（`src/shared/session.ts`）读最后一个 turn 的 `stopReason` 与 `lastTurnOutput`；backend 只提供 settle 信号。
 3. **backend 由 launch 推导，不是卡片字段**：`spawnMode` 不在 `AGENT_FRONTMATTER_FIELDS`（`src/agents/agents.ts`），卡片写了会在加载期抛错（`#290`）。
 4. **回收是显式、分级、可审计的**：`retire` = 优雅；`stop` = 优雅 retire；`stop --force` = 直接硬化回收（`RetireOptions.graceful = false`）。
-5. **ESC 不回收子 agent**：中断父 turn 只返回 `interrupted (parent turn ended; children still running)`（`index.ts`，`esc-no-retire-v3`），回收只走 `/legion stop`、`subagent({action:"stop"|"retire"})` 或进程退出。
+5. **ESC 不回收子 agent**：中断父 turn 只返回 `interrupted (parent turn ended; children still running)`（`index.ts`，`esc-no-retire-v3`），回收只走 `/legion stop`、`subagent({action:"stop"})` 或进程退出。
 
 ---
 
@@ -285,12 +285,11 @@ CREATE TABLE nodes (
 
 ## 5. 回收策略
 
-### 5.1 三个入口
+### 5.1 两个入口
 
 | 入口 | 语义 | 代码 |
 | --- | --- | --- |
-| `subagent({ action: "retire" })` | 优雅回收；已回收的是 no-op | `retireChild`（`index.ts`）→ `Orchestrator.retire` |
-| `subagent({ action: "stop" })` / `/legion stop [name|all]` | 同优雅回收；`stopAction` 按 run 作用域解析名字（`#312`） | `legion-stop.ts` / `index.ts` |
+| `subagent({ action: "stop" })` / `/legion stop [name|all]` | 优雅回收；`stopAction` 按 run 作用域解析名字（`#312`） | `legion-stop.ts` / `index.ts` |
 | `subagent({ action: "stop", force: true })` / `/legion stop --force` | 硬回收：跳过优雅阶段，直接硬化链 | `RetireOptions.graceful = false`（`src/shared/types.ts`） |
 
 ### 5.2 RPC 后端的回收顺序（`RpcSupervisor.retireChild`）
@@ -542,7 +541,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 | 工具 | 可用者 | 作用 |
 | --- | --- | --- |
-| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 13 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `retire` / `status` / `collect` / `wait` / `stop` / `diagnose` / `extend` / `recover` |
+| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 12 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `status` / `collect` / `wait` / `stop` / `diagnose` / `extend` / `recover` |
 | `vexillatio` | 宿主会话（utility child 自身不注册） | 只派 read-only utility agent（`scout`），永远 leaf |
 | `legion_mail` / `legion_tree` / `legion_phase` | **子进程**（`registerTools: true`，root 为 `false`） | 发信 / 看子树 / 请求阶段迁移 |
 

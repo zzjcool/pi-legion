@@ -223,13 +223,12 @@ the model-facing `Actions:` line and `docs/design.md` §9.3 stop agreeing.
 | `steer` | Send `message` to a running child without waiting for its reply. Not an interrupt: the text queues at the child's next turn boundary. |
 | `abort` | Interrupt the child's current turn and keep its session, so it stays continuable. The child is not torn down — that is `stop`. |
 | `resume` | The same revive path as `continue`, used to pick a saved child back up (receipt says `Resumed`). |
-| `retire` | Retire the child while preserving its outcome and session for a later resume. |
 | `status` | One child's snapshot with `name`; without `name`, the live-children overview. |
 | `collect` | Wait for the child's current turn and derive its outcome from its session. |
 | `wait` | Event-driven wait for `name` or `all: true`; a timeout retires nothing. |
 | `stop` | Graceful stop of one child or of every live child; `force: true` hard-retires. |
 | `diagnose` | The `/legion doctor` self-check returned as tool output, with an optional `section`. |
-| `extend` | Defer the "may be looping" reminder for one direct child by `ms`. It never restarts or revives the child. |
+| `extend` | Defer the "may be looping" reminder for one direct child by `ms`. It never changes a collect/wait budget and never restarts, revives or steers the child. |
 | `recover` | Collect a cross-machine child a PREVIOUS session launched: read its transcript from that machine, grade it with the collect rules, settle the ledger row and return the collect text. A still-live child is only reported. |
 
 ### Stopping async subagents yourself

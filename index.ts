@@ -96,7 +96,6 @@ import {
 	applyOnBlockedPolicy,
 	followUpFor,
 } from "./src/extension/blocked.ts";
-import { formatAlreadyRecycled } from "./src/extension/recycle.ts";
 import {
 	artifactReadCall,
 	completionStatusOf,
@@ -340,7 +339,7 @@ const SubagentParams = Type.Object({
 	action: Type.Optional(
 		Type.Union(
 			ActionLiterals,
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` REMINDER for one child only; it addresses this node's own direct children (an unknown or already-ended child is refused, and `runId` does not apply), it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`. recover = collect a CROSS-MACHINE child a previous session launched and no longer holds (name it; no run store, no runId): it reads that child's transcript from its machine, grades it with the collect rules, settles the ledger row, and answers with the collect text. A child still LIVE on that machine is reported as such and nothing is settled; a second call answers `already settled` with the recorded outcome. `/legion status` lists what is recoverable." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check; optional section filters like /legion doctor (the `section` parameter lists every section id — do not repeat the list here). extend = defer the `may be looping` reminder for one direct child by `ms`. Reminder only: it never changes a collect/wait budget or the child's own timeout, and never restarts, revives or steers it. recover = adopt a child a PREVIOUS session launched on another machine: `name` required, no `runId`. It settles the ledger row and answers like `collect`; a still-live child is only reported. `/legion status` lists what is recoverable." },
 		),
 	),
 	agent: Type.Optional(
@@ -3318,7 +3317,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
- * Act on an EXISTING child: status, steer, collect, retire, continue, resume.
+ * Act on an EXISTING child: status, steer, collect, stop, continue, resume.
  *
  * The extension stays loaded for the session, but a control call may arrive
  * after a reload — so the orchestrator is rebuilt from `run.json` when we do
@@ -3638,7 +3637,7 @@ async function controlAction(input: {
 			return fail(notDirectChildMessage(action, params.name, hit.candidates), ErrorCodes.NOT_FOUND);
 		}
 	}
-	// `steer`/`abort`/`retire` keep their pre-#312 reach (one unambiguous record
+	// `steer`/`abort` keep their pre-#312 reach (one unambiguous record
 	// outside this session's run stays addressable); the scope run is still tried
 	// first, so the common case never depends on the fallback.
 	const found =
@@ -3699,7 +3698,6 @@ async function controlAction(input: {
 			artifactBytesLookup(input.legion),
 			verificationLookup(input.legion),
 		);
-	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
 	return fail(`unhandled action: ${action}`, ErrorCodes.INVALID_PARAMS);
@@ -4233,30 +4231,6 @@ export async function collectChild(
 		// #384: never leave a 250ms timer behind a finished collect.
 		stopPolling?.();
 		if (mail) endMailHold(mail.nodeId);
-	}
-}
-
-/** Retire the child while preserving its outcome and session for resume. */
-async function retireChild(
-	ctx: ChildContext,
-): Promise<AgentToolResult<unknown>> {
-	try {
-		const live = ctx.orchestrator
-			.childrenSnapshot()
-			.find((child) => child.name === ctx.name);
-		if (live?.state === "retired") {
-			ctx.runtime.release(ctx.name);
-			return ok(formatAlreadyRecycled(ctx.name, live.sessionFile));
-		}
-		ctx.runtime.release(ctx.name);
-		const child = await ctx.orchestrator.retire(ctx.name);
-		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
-		return ok(
-			`Retired ${ctx.name} (execution=${child.execution?.status ?? "unknown"}). ` +
-				`Child stopped; session kept for resume: ${child.sessionFile}`,
-		);
-	} catch (error) {
-		return fail(`retire failed: ${String(error)}`, ErrorCodes.RETIRE_FAILED);
 	}
 }
 
