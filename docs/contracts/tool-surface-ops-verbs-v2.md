@@ -21,9 +21,15 @@
 **为什么零能力损失**：`stop` + `name` 是严格超集——`stopAction` 走同一个 retire 回调，
 另外还有 `cancelWatch` 与 `force`（SIGTERM→SIGKILL）。`retire` 既不能 `all` 也不能 `force`。
 
-**记录的行为变化**（可接受，因为它消灭了一个歧义）：already-retired 的回执从两种措辞
-合并成一种——`retire` 原走 `formatAlreadyRecycled`，`stop` 走 `… already-settled`。
-删除后只剩后者。这正是 `tool-surface-dedup-v1` 里 E4 想要的"一个动词不应有两种结局"。
+**记录的行为变化**（可接受）：删除前有**三种** already-retired 措辞（`retire` 的
+`formatAlreadyRecycled`、`stop` 的 `No non-retired children to stop. X is already retired …`、
+以及汇总的 `Retired N already-settled child: …`）。**删除后剩两种**（后两者），所以本契约
+"合并成一种"属**早期误写**，实际只减一种。真正的收益是：**同一个"优雅回收"语义不再有
+两个动作入口**，而不是措辞归一。
+
+**回执信息不得丢失**（review 补充）：`retire` 的回执带 `Session kept for resume: <sessionFile>`
+与 `execution=`，`stop` 原本两者都缺。删除 `retire` 的同时必须把这些信息补回 `stop` 的回执——
+否则模型不知道子节点可以 `resume`，而那是这条回执的主要价值。
 
 **不许**：不要把 `retire` 保留成别名、不要给它加 `force`、不要改 `stop` 的语义。
 
