@@ -180,9 +180,10 @@ export function inertParamsFor(action: ActionName, params: Record<string, unknow
   散文的唯一位面是 `README.md`；`required` 的二选一也无法用扁平数组表达。
 - **`PARAM_OWNER_ACTIONS` 改为从 `ACTION_SPECS.params` 求逆推导**（只保留单 owner 字段），
   不再手写 16 项。手写的契约表保留在测试里作为治理锚点（`inert-params.test.ts:44-61`）。
-- **`ACTION_NAMES` 改回生命周期序**（`launch, continue, steer, abort, resume, retire, status,
-  collect, list, wait, stop, diagnose, extend, recover`），使派生的 `Actions:` 行与 schema union
-  都回到可读顺序。
+- **`ACTION_NAMES` 保持生命周期序**（`launch, continue, steer, abort, resume, retire, status,
+  collect, list, wait, stop, diagnose, extend, recover`）。**更正**：本条最初写成「改回」，是错判——
+  从第一版起就是生命周期序，不存在可读性退化。真正的交付是把这个顺序用 `LIFECYCLE_ORDER`
+  字面量**钉住**（防日后「无害重排」）。
 - **新增锚点**：`ACTION_SPECS[*].params` 的每一项必须是 `SubagentParams.properties` 的真 key
   （否则就是文档里凭空多一个字段）。
 - **`docs/design.md` 的“N 个动作”数字也要断言**（现只比清单，把 `14` 改 `99` 仍绿）。
@@ -209,7 +210,15 @@ export function inertParamsFor(action: ActionName, params: Record<string, unknow
 **但有一句必须先删**：描述里 `diagnose prints the Legion doctor report
 (host vs child extensions/providers/models/memory)` 的括号清单与 schema `action` 字段的说法
 不一致，且 `providers` **不是合法 section id**（真源 `src/extension/legion-doctor.ts:100-112`）。
-→ 删掉括号清单，让 schema 那份（唯一与真源一致）承担。同理删 `wait REQUIRES …` 的重复半句。
+→ 删掉括号清单，让 schema 那份承担。**更正**：本条最初说 schema 那份「唯一与真源一致」，
+也是错判——它只列了 11 个 section 里的 7 个（缺 `summary`/`crossmachine`/`errors`/`next`）。
+实际结论：**两份都不全，所以两份都不该枚举**。`action` 描述里的括号已删，完整清单只保留在
+`section` 参数描述（`index.ts:480`，11/11）与 `DOCTOR_SECTIONS` 真源。
+遗留：`src/extension/legion-commands.ts:754` 的 slash 命令 autocomplete 文案仍是 7 项（人类 UI，
+非模型可见，另计）。
+
+同理删掉描述里 `wait REQUIRES name or all: true (mutually exclusive)` 这个与 schema 重复的半句
+（保留的依据由 schema 的 `action` 字段承担，`playbook.test.ts:124` 已钉住）。
 
 ### B5 D3 位置与类型
 
