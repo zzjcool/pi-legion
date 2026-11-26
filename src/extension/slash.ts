@@ -383,7 +383,7 @@ export function renderToggleStatus(input: {
 			lines.push(
 				input.enabled
 					? "New launches are accepted again; the roster returns with the next turn."
-					: "No new launches; the roster and the bash dispatch guard are off from the next turn. Existing children are untouched — status/collect/wait keep working.",
+					: "No new launches; the roster and the bash dispatch guard are off from the next turn. Existing children are untouched — status/wait keep working.",
 			);
 			break;
 		case "already-on":

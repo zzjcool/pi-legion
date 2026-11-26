@@ -238,6 +238,94 @@ test("#312 extend: a unique candidate elsewhere is refused, not silently adopted
 	}
 });
 
+test("#312 wait: the session's own worker-0 wins over a live same-named node in another run", async () => {
+	const harness = indexHarness();
+	try {
+		// A child this session owns but does not track in memory — the restarted /
+		// reloaded case, and the only one where `wait` has to resolve a NAME through the
+		// store instead of the runtime's own job table (A2/D5: the store fallback).
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		await harness.addOwnChild("worker-0", "exited", '{"ok": true, "reason": "own-worker-0-ok"}');
+		const decoyRunId = await harness.decoyRun(
+			"worker-0",
+			"working",
+			'{"ok": false, "reason": "decoy-failed-elsewhere"}',
+		);
+
+		const collected = await harness.invoke({ action: "wait", name: "worker-0" });
+		// The direct child's own result, and nothing from the decoy — the silent
+		// wrong-node read is the whole bug. The decoy is LIVE and newer, which is
+		// exactly what the pre-#312 preference (live first, then newest) chose.
+		assert.match(collected.text, /own-worker-0-ok/);
+		assert.doesNotMatch(collected.text, /decoy-failed-elsewhere/);
+		assert.match(collected.text, /acceptance: accepted/);
+		assert.doesNotMatch(collected.text, new RegExp(decoyRunId));
+		assert.notEqual(collected.details?.error, ErrorCodes.NOT_FOUND);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 wait: a name that is not a direct child is refused with every candidate runId", async () => {
+	const harness = indexHarness();
+	try {
+		// The session owns a run, but no worker-0 in it.
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		const first = await harness.decoyRun("worker-0", "exited", '{"ok": false, "reason": "one"}');
+		const second = await harness.decoyRun("worker-0", "retired", '{"ok": false, "reason": "two"}');
+
+		const collected = await harness.invoke({ action: "wait", name: "worker-0" });
+		assert.equal(collected.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(collected.text, /ambiguous/);
+		// Both runs named, so the caller can pick one instead of guessing.
+		assert.match(collected.text, new RegExp(`run ${first}`));
+		assert.match(collected.text, new RegExp(`run ${second}`));
+		assert.match(collected.text, /state exited/);
+		assert.match(collected.text, /state retired/);
+		// A refusal must not look like a result.
+		assert.doesNotMatch(collected.text, /acceptance:/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 wait: a unique candidate elsewhere is refused, not silently adopted", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		const decoy = await harness.decoyRun("worker-0", "exited", '{"ok": false, "reason": "not-mine"}');
+
+		const collected = await harness.invoke({ action: "wait", name: "worker-0" });
+		assert.equal(collected.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(collected.text, /not a direct child of this session/);
+		assert.match(collected.text, new RegExp(`run ${decoy}`));
+		// The two levers the caller actually has are named.
+		assert.match(collected.text, /runId/);
+		assert.match(collected.text, /parent/);
+		assert.doesNotMatch(collected.text, /not-mine/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("A2/D5 guard: `wait` on a name that exists NOWHERE is still `unknown child`", async () => {
+	// The store fallback must not turn "a store directory exists" into a hit: the
+	// session has a run (so `directRunId` is known) and the store has records, but no
+	// node carries this name. The answer stays the pre-existing NOT_FOUND, including
+	// the store list that makes a typo debuggable (#270).
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		const collected = await harness.invoke({ action: "wait", name: "nobody-here" });
+		assert.equal(collected.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(collected.text, /unknown child/i);
+		assert.match(collected.text, /nobody-here/);
+		assert.doesNotMatch(collected.text, /acceptance:/, "a miss is not a result");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
 test("#312 status: two same-named candidates elsewhere is an ambiguity, not a pick", async () => {
 	const harness = indexHarness();
 	try {

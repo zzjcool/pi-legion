@@ -227,7 +227,7 @@ the model-facing `Actions:` line and `docs/design.md` §9.3 stop agreeing.
 | `abort` | Interrupt the child's current turn and keep its session, so it stays continuable. The child is not torn down — that is `stop`. |
 | `resume` | The same revive path as `continue`, used to pick a saved child back up (receipt says `Resumed`). |
 | `status` | One child's snapshot with `name`; without `name`, the live-children overview. |
-| `wait` | Event-driven wait for `name` or `all: true`; a timeout retires nothing. |
+| `wait` | Event-driven wait for `name` or `all: true`; a timeout retires nothing. A `name` this session's runtime does not track is resolved from the run store (a `/reload`ed session reading its own earlier child, a `vexillatio` utility child released at dispatch). |
 | `stop` | Graceful stop of one child or of every live child; `force: true` hard-retires. |
 | `diagnose` | The `/legion doctor` self-check returned as tool output, with an optional `section`. |
 | `extend` | Defer the "may be looping" reminder for one direct child by `ms`. Reminder only: it never changes a wait budget or the child's own timeout, and never restarts, revives or steers the child. |

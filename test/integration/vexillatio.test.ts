@@ -373,15 +373,11 @@ test("non-legion children can control utility agents dispatched through vexillat
 				action: "wait",
 				name: "scout-0",
 			}, context(cwd));
-			// collect-merge-v1 D2 (accepted gap, option (a)): `wait` resolves names
-			// from THIS session's runtime only (active jobs, then the finished cache) —
-			// it never reads the run store, which is how the deleted `collect` reached a
-			// child `vexillatio` dispatched with its own handles. The utility result is
-			// delivered by the dispatch itself (the `── scout-0 ──` block above), so this
-			// probe is pinned as NOT_FOUND: the gap stays visible, and a future "wait
-			// falls back to run.json" lands here on purpose instead of silently.
-			assert.equal((collected.details as { error?: string } | undefined)?.error, ErrorCodes.NOT_FOUND);
-			assert.match(collected.content[0]?.text ?? "", /unknown child/i);
+			// A2/D5: the utility child's handles are released at dispatch, so the parent's
+			// runtime never tracks it — this is the path `wait`'s STORE fallback exists for
+			// (it replaced the deleted `collect`, whose only reach was `run.json`).
+			assert.equal((collected.details as { error?: string } | undefined)?.error, undefined);
+			assert.match(collected.content[0]?.text ?? "", /utility output for scout/);
 		},
 	);
 });

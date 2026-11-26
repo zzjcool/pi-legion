@@ -367,14 +367,15 @@ test("D3: execute still runs a legal call that looks similar", async () => {
 	}
 });
 
-test("collect-merge-v1 D2: `runId` on `wait` is accepted and ignored, never refused", async () => {
+test("collect-merge-v1 D2/A1: `runId` on `wait` is accepted and ignored, never refused", async () => {
 	const harness = indexHarness();
 	try {
-		// `collect` was the only read verb that read `runId`, and `wait` never did;
-		// collect-merge-v1 accepted that gap (D2 option (a)) instead of teaching `wait` a
-		// second scope. `runId` is multi-consumer, so the inert gate cannot refuse it
-		// either: the call must reach the ordinary wait answer, not a param error. This
-		// is what a caller of the deleted action actually meets.
+		// A BEHAVIOUR pin, not a contract pin. The contract's正文 claimed the inert-param
+		// gate would REFUSE `runId` on `wait`; 附录 A (A1) corrected that: `runId` is
+		// multi-consumer (7 actions read it), so the gate cannot refuse it and it is
+		// silently ignored. That is why the deleted `collect({name, runId})` has no
+		// verbatim equivalent: the field is not a member of wait's contract, it is just
+		// not enforceable. `wait` never read it and (非目标 3) still does not.
 		const waited = await harness.invoke({ action: "wait", name: "ghost", runId: "r-4fd626ee" });
 		assert.notEqual(waited.details?.error, ErrorCodes.INVALID_PARAMS, "runId is not an inert-param refusal");
 		assert.doesNotMatch(waited.text, /only read by action/, "no refusal clause is invented for runId");
