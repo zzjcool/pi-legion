@@ -291,8 +291,15 @@ test("ops-verbs-v2 D3/D2: `extend` and `recover` are the frozen text, verbatim",
 			-1,
 			"`recover` must be the contract's text, character for character",
 		);
-		// …and each one exactly once: a "third variant" left in front of the new text
-		// would still satisfy `indexOf`, so the count is the assertion that matters.
+		// Each frozen marker appears exactly once. Stated precisely, because the FIRST
+		// version of this comment over-claimed: these two assertions guarantee (i) the
+		// frozen paragraph is present character for character and (ii) no SECOND
+		// `extend = ` / `recover = ` block was added beside it. They do NOT promise the
+		// surrounding prose cannot grow a contradicting sentence — review injected one
+		// ("… still never changes the child's own timeout") that reused neither marker,
+		// stayed inside the 950-character budget, and left all three tests green.
+		// Closing that hole is a different guard (semantic, or a whole-field snapshot);
+		// this comment must not claim it is here.
 		assert.equal(description.split("extend = ").length - 1, 1, "`extend` is described exactly once");
 		assert.equal(description.split("recover = ").length - 1, 1, "`recover` is described exactly once");
 	} finally {
@@ -313,15 +320,39 @@ test("ops-verbs-v2: the `action` description stays inside its 950-character budg
 	}
 });
 
-test("ops-verbs-v2: the description names no `retire` action", async () => {
-	// Acceptance assertion 2: the machine-facing copy must not offer a removed
-	// action. English verb uses ("… to retire them") describe behaviour that still
-	// exists and are deliberately not matched.
+/**
+ * The shapes that make `retire` read as an ACTION NAME in a schema description.
+ *
+ * The criterion, written down so it is reviewable rather than implied:
+ *   1. a backticked token  — `` `retire` ``
+ *   2. a slash-separated action list — `status/collect/…/retire)`
+ *   3. an explicit call shape — `action: "retire"`
+ *
+ * English uses of the verb are deliberately NOT matched: `stop` really does retire
+ * a child, so `force`'s own description says "hard-retire … graceful retire", and
+ * the `action` description says a finished child reports as "already retired". Those
+ * describe behaviour that still exists. Flagging them would make the guard either
+ * red on correct text or so vague it proves nothing.
+ */
+const RETIRE_ACTION_SHAPES = /`retire`|\/retire\b|action: *"retire"/;
+
+test("ops-verbs-v2: NO parameter description names a `retire` action", async () => {
+	// Acceptance assertion 2, widened after review. The first version read only
+	// `properties.action.description`, and `runId`'s description kept saying
+	// "control actions (…/retire)" — a model-visible instruction to call a removed
+	// action, three fields away from the one string that was being checked. A guard
+	// scoped to the field that happens to be named in the contract is not a guard.
 	const harness = playbookHarness();
 	try {
-		const description = harness.actionDescription();
-		assert.doesNotMatch(description, /`retire`/);
-		assert.doesNotMatch(description, /\bretire =/);
+		const properties = harness.properties();
+		assert.ok(
+			Object.keys(properties).length > 10,
+			"the schema must still declare its fields — an empty map would pass vacuously",
+		);
+		const offending = Object.entries(properties)
+			.filter(([, spec]) => RETIRE_ACTION_SHAPES.test(spec.description ?? ""))
+			.map(([field]) => field);
+		assert.deepEqual(offending, [], "no parameter description may name a `retire` action");
 	} finally {
 		await harness.cleanup();
 	}
@@ -386,6 +417,10 @@ function playbookHarness() {
 		/** The `action` field's description exactly as the model receives it. */
 		actionDescription(): string {
 			return tool?.parameters?.properties?.action?.description ?? "";
+		},
+		/** Every declared parameter's description, exactly as the model receives it. */
+		properties(): Record<string, { description?: string }> {
+			return tool?.parameters?.properties ?? {};
 		},
 		/**
 		 * Drive `before_agent_start` the way the host does. `selectedTools` is passed

@@ -523,8 +523,8 @@ export class RunStore {
 	 *
 	 * ## Why this is cached (#344)
 	 *
-	 * Every control call (`collect` / `status` / `steer` / `abort` / `retire` /
-	 * `continue`) used to start here, so a store with 352 runs paid 352
+	 * Every control call (`collect` / `status` / `steer` / `abort` / `continue`)
+	 * used to start here, so a store with 352 runs paid 352
 	 * `readFileSync` + `JSON.parse` (26ms) per call, synchronously, on the parent's
 	 * event loop — and the cost grew with every run ever written. The control
 	 * paths now resolve a scoped name with a single `readRun` and only fall back

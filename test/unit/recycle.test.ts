@@ -5,6 +5,10 @@ import {
 	formatAlreadyRecycled,
 } from "../../src/extension/recycle.ts";
 
+// Retention test (tool-surface-ops-verbs-v2 D1): `formatAlreadyRecycled` lost its
+// last caller when the `retire` action was deleted. It is kept because
+// `src/api.ts` re-exports it as a published surface — so the copy stays pinned
+// here rather than being dropped along with the action.
 test("formatAlreadyRecycled is a no-op explanation, not a new close", () => {
 	const text = formatAlreadyRecycled("worker-0", "/tmp/w.jsonl");
 	assert.match(text, /Already retired worker-0/);

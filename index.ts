@@ -441,7 +441,7 @@ const SubagentParams = Type.Object({
 	runId: Type.Optional(
 		Type.String({
 			description:
-				'control actions (status/collect/stop/continue/resume/steer/abort/retire): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
+				'control actions (status/collect/stop/continue/resume/steer/abort): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -6831,9 +6831,10 @@ function settledFromJob(job: { state: string; settledAt?: number }): StopSettled
 /**
  * Resolve ONE named target from a persisted record.
  *
- * A `retired` record yields no target plus a note carrying its outcome and retire
- * time — otherwise the caller learns only "nothing to stop", which is exactly how
- * a child that finished a second earlier reads as a failed stop.
+ * A `retired` record yields no target plus a note carrying its outcome, retire
+ * time and session file — otherwise the caller learns only "nothing to stop",
+ * which is exactly how a child that finished a second earlier reads as a failed
+ * stop, and the resume credential (the session file) is lost with it.
  */
 function stopResolutionFromRecord(child: ChildRecord, runId: string): StopResolution {
 	if (child.state === "retired") {
@@ -6848,20 +6849,27 @@ function stopResolutionFromJob(job: {
 	name: string;
 	runId: string;
 	state: string;
+	/** Resume credential carried on the tracked job (`TrackedJobInput.sessionFile`). */
+	sessionFile: string;
 	settledAt?: number;
 }): StopResolution {
-	if (job.state === "retired") return { targets: [], note: `${job.name} is already retired.` };
+	if (job.state === "retired") {
+		return { targets: [], note: `${job.name} is already retired. Session kept for resume: ${job.sessionFile}` };
+	}
 	const settled = settledFromJob(job);
 	return { targets: [{ name: job.name, runId: job.runId, ...(settled ? { settled } : {}) }] };
 }
 
-/** `worker-2 is already retired (execution: success, retired at 2026-…).` */
+/** `worker-2 is already retired (execution: success, retired at 2026-…)` + the session path. */
 function retiredRecordNote(child: ChildRecord): string {
 	const bits: string[] = [];
 	const status = child.execution?.status;
 	if (status) bits.push(`execution: ${status}`);
 	if (child.retiredAt) bits.push(`retired at ${child.retiredAt}`);
-	return `${child.name} is already retired${bits.length > 0 ? ` (${bits.join(", ")})` : ""}.`;
+	const head = `${child.name} is already retired${bits.length > 0 ? ` (${bits.join(", ")})` : ""}.`;
+	// The session file is the resume credential. `retire` used to hand it back and
+	// deleting that action must not be how a caller loses the way back to a child.
+	return `${head} Session kept for resume: ${child.sessionFile}`;
 }
 
 /** ` (execution: success, settled at 2026-…)`, or "" when nothing is known. */
@@ -7137,6 +7145,32 @@ export async function stopAction(input: {
 	const stopped: string[] = [];
 	const reaped: string[] = [];
 	const failures: string[] = [];
+	/**
+	 * What a STOPPED child's receipt says about it, read from the record the retire
+	 * chain has just written.
+	 *
+	 * The deleted `retire` action answered with `execution=…` and the session path;
+	 * merging the two receipts into one wording (tool-surface-dedup-v1 E4) did not
+	 * license dropping the facts. The session file IS the resume credential — a
+	 * caller told only "Stopped 1 child" has lost the way back to it. Read AFTER the
+	 * retire so the status is the settled one, which is also what `collect`/`resume`
+	 * will read. `execution: unknown` is spelled out instead of omitted: a record
+	 * that carries no execution yet would otherwise read like a missing fact.
+	 *
+	 * Empty when the caller wired no store (runtime-only `stopAction` callers): the
+	 * receipt then says exactly what it always said rather than inventing a path.
+	 */
+	const stoppedDetail = (runId: string, name: string): string => {
+		const record = input.store?.readRun(runId)?.children.find((child) => child.name === name);
+		if (!record) return "";
+		const bits = [`execution: ${record.execution?.status ?? "unknown"}`];
+		// Capitalised on purpose: `Session kept for resume: <path>` is the canonical
+		// token this receipt has always carried, so ONE grep finds every answer that
+		// hands a resume credential back — the stopped child here and the
+		// already-retired child in `retiredRecordNote`.
+		if (record.sessionFile) bits.push(`Session kept for resume: ${record.sessionFile}`);
+		return ` (${bits.join(", ")})`;
+	};
 	for (const target of targets) {
 		const { name, runId } = target;
 		try {
@@ -7148,7 +7182,7 @@ export async function stopAction(input: {
 			// A child that had already finished is reaped, not stopped: "Stopped 1
 			// child" for a success claims an interruption that never happened.
 			if (target.settled) reaped.push(`${name}${stopSettledNote(target.settled)}`);
-			else stopped.push(name);
+			else stopped.push(`${name}${stoppedDetail(runId, name)}`);
 		} catch (error) {
 			// If the retire chain fails, restore the completion watcher so a
 			// still-live child is not orphaned by the explicit stop attempt.

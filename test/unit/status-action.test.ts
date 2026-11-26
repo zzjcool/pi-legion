@@ -661,6 +661,12 @@ test("#209-3 stop retires a foreign record that exists in the store", async () =
 		assert.doesNotMatch(result.text, /not tracked by this session/);
 		assert.equal(result.details?.error, undefined, result.text);
 		assert.match(result.text, /Stopped 1 child: worker-2/);
+		// tool-surface-ops-verbs-v2 rework: deleting the `retire` action must not take
+		// the facts its receipt carried with it. The session file IS the resume
+		// credential, and the outcome is what tells a caller whether it interrupted
+		// anything.
+		assert.match(result.text, /execution: \S+/);
+		assert.match(result.text, /Session kept for resume: \/tmp\/worker-2\.jsonl/);
 
 		// The persisted record actually moved to retired.
 		const runFile = path.join(harness.cwd, ".pi-subagents", "runs", "r-dead0003", "run.json");
@@ -693,8 +699,10 @@ test("#209-3 stop on an already-retired foreign record reports nothing to stop",
 		assert.doesNotMatch(result.text, /not tracked by this session/);
 		assert.match(result.text, /No non-retired children to stop/);
 		// The reply says WHICH state the child is in, so a stop that lost the race
-		// against its own retire does not read like a failed stop.
+		// against its own retire does not read like a failed stop — and it still hands
+		// back the session file, which is the only way to resume that child.
 		assert.match(result.text, /worker-2 is already retired \(execution: success\)\./);
+		assert.match(result.text, /Session kept for resume: \/tmp\/worker-2\.jsonl/);
 	} finally {
 		await harness.cleanup();
 	}
