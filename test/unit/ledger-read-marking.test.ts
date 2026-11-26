@@ -319,12 +319,13 @@ test("P4a: a collect that bails before delivering declares NOTHING (persistChild
 		} as unknown as Orchestrator;
 
 		const result = await collectChild(collectFixture(fixture, runtime, failingOrchestrator));
-		assert.match(textOf(result), /collect failed/, "the tool call failed, so the snapshot reached nobody");
+		assert.match(textOf(result), /no result: store unreachable/, "the tool call failed, so the snapshot reached nobody");
+		assert.doesNotMatch(textOf(result), /collect/, "the answer names no deleted action");
 		assert.equal((result.details as { error?: string }).error, "NOT_FOUND");
 		assert.deepEqual(declaredReads(result), [], "a bail declares no read");
 
 		const settled = await settle(result, runtime, legionOf(fixture.db));
-		assert.match(textOf(settled), /collect failed/, "settling a failure changes nothing");
+		assert.match(textOf(settled), /no result: store unreachable/, "settling a failure changes nothing");
 
 		const artifactId = `${fixture.runId}/${CHILD}/r1`;
 		assert.ok(artifactById(fixture.db, artifactId), "positive control: the artifact the snapshot named exists");

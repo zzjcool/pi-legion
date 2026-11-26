@@ -299,10 +299,21 @@ test("#312 wait: a unique candidate elsewhere is refused, not silently adopted",
 		assert.equal(collected.details?.error, ErrorCodes.NOT_FOUND);
 		assert.match(collected.text, /not a direct child of this session/);
 		assert.match(collected.text, new RegExp(`run ${decoy}`));
-		// The two levers the caller actually has are named.
-		assert.match(collected.text, /runId/);
-		assert.match(collected.text, /parent/);
+		// A2/A1 review fix: `wait` never reads `runId` (multi-consumer, so even the inert
+		// gate cannot refuse it — it is silently ignored). The old wording told the model
+		// to "pass `runId`", an instruction `wait` cannot honour: it would reissue the same
+		// refused call forever. The refusal must name the actions that DO take the field.
+		assert.doesNotMatch(collected.text, /pass `runId`/, "wait must not promise a field it ignores");
+		assert.match(collected.text, /`status`/, "the levers named are real: status reads the run");
+		assert.match(collected.text, /`stop`/, "the levers named are real: stop retires the run");
+		assert.match(collected.text, /parent/, "the parent-scope route is still named");
 		assert.doesNotMatch(collected.text, /not-mine/);
+		assert.doesNotMatch(collected.text, /collect/, "no deleted action is named");
+		// `runId` may only appear where it actually works — the status/stop sentence.
+		const runIdLines = collected.text.split("\n").filter((line) => line.includes("runId"));
+		assert.equal(runIdLines.length, 1, "runId is mentioned exactly once");
+		assert.match(runIdLines[0] ?? "", /`status`/, "the runId mention is in the status/stop context");
+		assert.match(runIdLines[0] ?? "", /`stop`/, "the runId mention is in the status/stop context");
 	} finally {
 		await harness.cleanup();
 	}
@@ -321,6 +332,34 @@ test("A2/D5 guard: `wait` on a name that exists NOWHERE is still `unknown child`
 		assert.match(collected.text, /unknown child/i);
 		assert.match(collected.text, /nobody-here/);
 		assert.doesNotMatch(collected.text, /acceptance:/, "a miss is not a result");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("A2/A1: `wait` refuses in the SAME words with and without a `runId` (the field is ignored)", async () => {
+	// The review repro: `wait({name, runId})` answered with text identical to
+	// `wait({name})`, because `wait` never reads `runId` — so any advice to "pass
+	// `runId`" is unfollowable and the model would retry the same refused call forever.
+	// Both refusal shapes are pinned for byte equality here.
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		// Shape 1 — one candidate elsewhere: the strict-scope refusal.
+		const onlyDecoy = await harness.decoyRun("worker-0", "exited", '{"ok": false, "reason": "not-mine"}');
+		const plain = await harness.invoke({ action: "wait", name: "worker-0" });
+		const scoped = await harness.invoke({ action: "wait", name: "worker-0", runId: onlyDecoy });
+		assert.equal(scoped.text, plain.text, "runId changes nothing — the two refusals are byte-identical");
+		assert.equal(scoped.details?.error, plain.details?.error, "same code too");
+
+		// Shape 2 — two candidates: the ambiguity refusal, same equality.
+		await harness.decoyRun("worker-0", "retired", '{"ok": false, "reason": "two"}');
+		const ambiguousPlain = await harness.invoke({ action: "wait", name: "worker-0" });
+		const ambiguousScoped = await harness.invoke({ action: "wait", name: "worker-0", runId: onlyDecoy });
+		assert.equal(ambiguousScoped.text, ambiguousPlain.text, "identical under the ambiguity refusal as well");
+		assert.equal(ambiguousScoped.details?.error, ambiguousPlain.details?.error);
+		assert.match(ambiguousPlain.text, /ambiguous/, "positive control: this really is the ambiguity shape");
+		assert.doesNotMatch(ambiguousPlain.text, /pass `runId`/, "the ambiguity refusal does not promise wait a runId");
 	} finally {
 		await harness.cleanup();
 	}

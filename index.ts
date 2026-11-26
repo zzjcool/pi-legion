@@ -108,6 +108,7 @@ import { renderSpawnResult } from "./src/extension/spawn-render.ts";
 import { appendInprocessModelHint } from "./src/extension/spawn-hints.ts";
 import {
 	ACTION_NAMES,
+	ACTION_SPECS,
 	inertParamsFor,
 	inertParamsMessage,
 	type ActionName,
@@ -315,7 +316,7 @@ const TaskItem = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
+				"Commands the extension runs itself in the child worktree when the child's result is delivered; first non-zero exit rejects the verdict. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 });
@@ -390,7 +391,7 @@ const SubagentParams = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; a non-zero exit rejects the child's verdict as `rejected (attested)`, while an all-green run only raises the level to `verified` and leaves the status the child reported. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
+				"Verification commands the extension runs itself in the child worktree when the child's result is delivered (launch only). Each must exit 0; a non-zero exit rejects the child's verdict as `rejected (attested)`, while an all-green run only raises the level to `verified` and leaves the status the child reported. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 	phases: Type.Optional(
@@ -449,7 +450,7 @@ const SubagentParams = Type.Object({
 	),
 	timeoutMs: Type.Optional(
 		Type.Number({
-			description: "wait: per-child timeout in ms; event-driven completion returns early (default: the smallest role `timeoutMs` among the targets, else 900000 (15m))",
+			description: "wait: per-child timeout in ms; event-driven completion returns early (default: the smallest role `timeoutMs` among the targets, else 900000 (15m)). A `name` this session's runtime does not track (resolved from the run store) is read at its role's turn budget instead — this value does not bound that read.",
 		}),
 	),
 	ms: Type.Optional(
@@ -3998,7 +3999,7 @@ export function extendStallNotice(
 		: `${result.loopRadiusMs}ms`;
 	return ok(
 		`Extended the stall-notice clock for ${result.childName}: the next long-running reminder is due ${radius} from now. ` +
-			"This defers the REMINDER only — it does not extend a collect/wait budget (that is the role's timeoutMs), " +
+			"This defers the REMINDER only — it does not extend a wait budget (that is the role's timeoutMs), " +
 			"does not restart or revive the child, and is not `continue` or `steer`.",
 	);
 }
@@ -4018,7 +4019,38 @@ function ambiguousChildMessage(
 	return (
 		`${name} is ambiguous: ${candidates.length} nodes carry that name and none of them is a direct child of this session, so \`${action}\` will not guess.\n` +
 		describeChildScopeCandidates(candidates) +
-		"\nPass `runId` to name the run that holds the one you mean."
+		"\n" +
+		(readsRunId(action)
+			? "Pass `runId` to name the run that holds the one you mean."
+			: noRunIdScopeHint(action))
+	);
+}
+
+/**
+ * Does this action read `runId` at all? Derived from the frozen spec table, so a
+ * wording can never promise a field its action ignores.
+ */
+function readsRunId(action: string): boolean {
+	const spec = Object.hasOwn(ACTION_SPECS, action)
+		? ACTION_SPECS[action as ActionName]
+		: undefined;
+	return spec?.params.includes("runId") ?? false;
+}
+
+/**
+ * The way out for an action with NO cross-run locator (`wait`, A2/A1 review).
+ *
+ * `wait` never reads `runId` (collect-merge-v1 非目标 3) and `runId` is multi-consumer,
+ * so the inert gate does not refuse it either — it is silently ignored. Telling the
+ * model to "pass `runId`" would therefore be an instruction it cannot follow: it would
+ * reissue the same refused call forever. The field is named ONLY where it really works
+ * (`status` reads, `stop` retires), which is the one escape hatch that exists.
+ */
+function noRunIdScopeHint(action: string): string {
+	return (
+		`\`${action}\` resolves names in this session's scope only and has no cross-run locator. ` +
+		"To act on one of them, read it with `status` or retire it with `stop` — both take the `runId` listed above — " +
+		"or address it through its parent's scope."
 	);
 }
 
@@ -4028,18 +4060,24 @@ function ambiguousChildMessage(
  * `collect` used to reach into whatever run `pickChildByName` preferred, which
  * is how a parent chasing its own FAILED `worker-0` was handed another run's
  * SUCCESSFUL one — the silent wrong node. The candidates are named so the caller
- * can either pass `runId` or go through the node's parent instead.
+ * can either pass `runId` (for an action that reads it) or go through the node's
+ * parent instead.
  */
 function notDirectChildMessage(
 	action: string,
 	name: string,
 	candidates: readonly ChildScopeCandidate[],
 ): string {
-	return (
+	const head =
 		`${name} is not a direct child of this session, so \`${action}\` cannot act on it. ` +
 		`${candidates.length} node(s) carry that name:\n` +
 		describeChildScopeCandidates(candidates) +
-		`\n\`${action}\` only acts on this session's direct children; pass \`runId\`, or address the node through its parent's scope, to reach a grandchild.`
+		"\n";
+	return (
+		head +
+		(readsRunId(action)
+			? `\`${action}\` only acts on this session's direct children; pass \`runId\`, or address the node through its parent's scope, to reach a grandchild.`
+			: noRunIdScopeHint(action))
 	);
 }
 
@@ -4202,6 +4240,20 @@ export async function abortChild(
  *
  * Exported alongside `waitAction` for the index-layer unit tests.
  */
+/**
+ * The model-facing text for a collect-seam failure.
+ *
+ * `wait` now routes a store-only target through this seam (A2/D5), so a plain
+ * `wait({name})` can answer with this line: it must not name the deleted `collect`
+ * action, and it must not wrap a miss the error already explains
+ * (`unknown child: …`) in a second, different-looking failure. One neutral wrapper,
+ * the real reason once — the code (`NOT_FOUND`) carries the rest.
+ */
+function collectFailureText(error: unknown): string {
+	const reason = (error instanceof Error ? error.message : String(error)).replace(/^Error: /, "");
+	return `no result: ${reason}`;
+}
+
 export async function collectChild(
 	ctx: ChildContext,
 	signal?: AbortSignal,
@@ -4364,7 +4416,11 @@ export async function collectChild(
 		if (!foreignJob) ctx.runtime.release(ctx.name);
 		return deliver(collected);
 	} catch (error) {
-		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
+		// A2/D5: `wait` routes a store-only target through this seam, so this answer is
+		// model-facing on a plain `wait({name})` too. It therefore names no deleted action
+		// and does not restate a miss the error already explains (`unknown child: …`):
+		// one neutral wrapper, the real reason once, the same NOT_FOUND code.
+		return fail(collectFailureText(error), ErrorCodes.NOT_FOUND);
 	} finally {
 		// #384: never leave a 250ms timer behind a finished collect.
 		stopPolling?.();
@@ -5473,7 +5529,7 @@ async function collectInline(session: LaunchSession, signal?: AbortSignal): Prom
 				await session.orchestrator.retire(name);
 			}
 		} catch (error) {
-			session.results.push(`✗ ${name}: collect failed: ${String(error)}`);
+			session.results.push(`✗ ${name}: ${collectFailureText(error)}`);
 		}
 	}
 }
@@ -5913,7 +5969,7 @@ async function launchUtilityFamily(input: {
 				await handle.retire().catch(() => {});
 				input.runtime.release(handle.name);
 			}
-			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
+			return `✗ ${handle.name}: ${collectFailureText(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
 	const holdNodeId = legion?.nodeId;

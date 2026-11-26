@@ -864,8 +864,8 @@ test("extend: a receipt that says exactly what it did and did NOT do", async () 
 		assert.equal(errorOf(result), undefined);
 		assert.match(text, /next long-running reminder is due 5400000ms from now/);
 		// D5's three "does NOT" clauses, verbatim in the receipt: a caller that reads
-		// only this line must not conclude that a collect budget moved.
-		assert.match(text, /does not extend a collect\/wait budget/);
+		// only this line must not conclude that a wait budget moved.
+		assert.match(text, /does not extend a wait budget/);
 		assert.match(text, /does not restart or revive the child/);
 		assert.match(text, /is not `continue` or `steer`/);
 
@@ -1279,7 +1279,7 @@ test("extend through `subagent({action:'extend'})`: receipt, unknown name, ended
 		assert.equal(extended.error, undefined, extended.text);
 		assert.match(extended.text, /Extended the stall-notice clock for worker-0/);
 		assert.match(extended.text, /due 120000ms from now/);
-		assert.match(extended.text, /does not extend a collect\/wait budget/);
+		assert.match(extended.text, /does not extend a wait budget/);
 
 		// 2. A name nobody has: the same NOT_FOUND path as every other control action.
 		const unknown = await harness.invoke({ action: "extend", name: "ghost" });

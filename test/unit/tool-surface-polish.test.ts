@@ -335,9 +335,10 @@ test("D2: both launch-level `verify` fields say they are NOT the legion-verify f
 			assert.match(description, /NOT the contract's ```legion-verify fence/, label);
 			assert.match(description, /supervisor/, `${label}: names who runs the fence one`);
 			assert.match(description, /`verifying`/, `${label}: names the phase it is run in`);
-			// The distinction is separate from the collect-time attestation, not a
-			// replacement for it.
-			assert.match(description, /collect time/, `${label}: keeps the original promise`);
+			// The distinction is separate from the delivery-time attestation, not a
+			// replacement for it (the phrase names no action: `collect` is gone).
+			assert.match(description, /when the child's result is delivered/, `${label}: keeps the original promise`);
+			assert.doesNotMatch(description, /collect/, `${label}: names no deleted action`);
 		}
 	} finally {
 		await harness.cleanup();
