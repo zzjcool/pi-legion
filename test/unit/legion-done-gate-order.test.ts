@@ -391,6 +391,11 @@ test("#P0 D11: the supervisor will not complete a team whose pass belongs to ano
 			1,
 			"the agent is told why, once",
 		);
+		// demo-findings F3 / D3: the nudge names the ORDER — a pass is only current for
+		// the tree it measured, so the commit has to happen BEFORE verifying. The
+		// trigger itself is untouched (one nudge per distinct mismatch, pinned above).
+		const nudge = messages.find((message) => /checkout changed after legion-verify passed/.test(message)) ?? "";
+		assert.match(nudge, /commit or squash BEFORE entering verifying, then verify again/i, "the nudge says when to commit");
 		postman.stop();
 	} finally {
 		db.close();

@@ -114,8 +114,40 @@ unverified criteria — these gate the verdict:
    `legion-doctor` 在这两种情形下分别输出 `(log …)` / `(in-memory only; no log file on disk)`。
 
 ## 非目标
-
 1. 不改 F1 的 `pendingCriteria` 语义（它永远不影响 `status` —— 这是既有设计，只是文案说错了）。
 2. 不跳过中断 turn 的 verify（用户明确保留）。
 3. 不改 digest 算法、STALE 判据、nudge 触发条件。
 4. 不改 `acceptance` 的 `rejected`/`unknown` 对**正常完成**turn 的既有判据。
+
+---
+
+## 附录 A — 实现后修正（以本附录为准）
+
+### A1 正文写错了状态名
+
+正文说「`execution.status !== "completed"`」。实际类型是：
+
+```ts
+ExecutionStatus = "success" | "failed" | "aborted" | "truncated" | "running" | "unknown"
+```
+
+**没有 `completed`，也没有 `stopped`**。
+
+### A2 `interrupted` 只认 `aborted`（必须收窄）
+
+第一轮实现用了 `execution.status !== "success"`，后果：
+
+- **`unknown` 被吞进去**。而 `unknown` 是跨机路径 D14 的地盘——“机器没测到，把原因告诉父节点”，它的 reason 带 `on host '<host>'`。
+  被 D2 覆盖后，该细节丢掉，一条既有跨机用例的附带断言被迫改写。**这是回退，不允许**。
+- `failed` / `truncated` 也被一并改判。那是另外两种 turn，各有自己的语义，本轮没有证据支持改它们。
+
+**决定**：`interrupted` 的判据**恰好是 `execution.status === "aborted"`**。
+只有它对应“父节点主动打断了这一轮”（演示里 `sleep 45` 被 abort 的那个）。
+
+要求的回归断言：
+
+1. `aborted` + 父 verify 失败 → `status: "unknown"`、reason 含 `not assessed`；
+2. `aborted` + 父 verify 成功 → 仍是 `unknown`，reason 说明 verify 跑过且通过；
+3. **`unknown`（跨机机器失败）不受影响**：仍是 D14 的 `unknown`，reason **保留 `on host '<host>'`**；
+4. `failed` / `truncated` 不受影响（保持既有判据）；
+5. 该用例的附带断言恢复原样。

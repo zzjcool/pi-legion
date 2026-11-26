@@ -113,6 +113,11 @@ export interface SessionErrorSummary {
 	total: number;
 	byCode: Record<string, number>;
 	recent: SessionErrorRecord[];
+	/**
+	 * Address of the on-disk journal — present ONLY when that file actually exists
+	 * (demo-findings F4 / D4). A count kept in the in-memory ring has no address,
+	 * and naming a path nobody can read is worse than naming none.
+	 */
 	logPath?: string;
 	logBytes: number;
 	large: boolean;
@@ -155,9 +160,16 @@ export function summarizeSessionErrors(opts?: {
 	const logPath = sessionErrorsLogPath(opts?.storeRoot);
 	let logBytes = 0;
 	let disk: SessionErrorRecord[] = [];
+	// demo-findings F4 / D4: `logPath` is an ADDRESS, so it is only handed out when a
+	// file is actually there. It used to be computed unconditionally, and doctor then
+	// printed a path to a file that had never been written (the count came from the
+	// in-memory ring). The `statSync` below already answers the question; its success
+	// is now what decides the field.
+	let logExists = false;
 	if (logPath) {
 		try {
 			logBytes = fs.statSync(logPath).size;
+			logExists = true;
 			disk = readLogRecords(logPath);
 		} catch {
 			logBytes = 0;
@@ -174,7 +186,7 @@ export function summarizeSessionErrors(opts?: {
 		total: source.length,
 		byCode,
 		recent: recentSlice,
-		logPath,
+		logPath: logExists ? logPath : undefined,
 		logBytes,
 		large: logBytes >= largeBytes,
 		truncated: source.length > recentLimit,

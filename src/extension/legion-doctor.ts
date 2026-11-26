@@ -915,7 +915,10 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		const errN = issues.filter((i) => i.severity === "error").length;
 		const warnN = issues.filter((i) => i.severity === "warning").length;
 		push(`- status: ${errN ? "FAIL" : warnN ? "WARN" : "OK"} (${errN} error(s), ${warnN} warning(s))`);
-		push(`- session errors: ${sessionErrors.total}${sessionErrors.logPath ? ` (log ${homeize(sessionErrors.logPath, home)})` : ""}`);
+		// demo-findings F4 / D4: a count with no file behind it gets no path. The old
+		// line pointed at a `session-errors.jsonl` that was never written, which sends
+		// the reader to `cat` a file that does not exist.
+		push(`- session errors: ${sessionErrors.total}${sessionErrors.logPath ? ` (log ${homeize(sessionErrors.logPath, home)})` : " (in-memory only; no log file on disk)"}`);
 		push(`- spawnMode (sample/default): ${spawnMode}`);
 		if (isInprocess) {
 			push(`- child backend: inprocess (ModelRuntime; no --no-extensions argv); inherit: ${inheritGlobal ? "yes" : "no"}`);

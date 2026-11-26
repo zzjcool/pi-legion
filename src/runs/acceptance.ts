@@ -130,6 +130,25 @@ function truncateReason(text: string): string {
 }
 
 /**
+ * demo-findings F2 / D2 (+ appendix A2): what an ABORTED turn gets instead of a
+ * verdict. `interrupted` is exactly `execution.status === "aborted"` — the parent
+ * killed this round — and nothing else: `unknown`, `failed` and `truncated` keep
+ * their own judgement.
+ *
+ * The commands still run — the parent's own verify is the one measurement of the
+ * worktree that exists, and skipping it leaves the parent with nothing. What must
+ * not survive is the verdict: an aborted turn that wrote nothing cannot be
+ * "rejected" for its work, which is the same self-contradiction `unknown` exists
+ * for ("a verdict about work that was not measured"). The tail keeps the parent's
+ * measurement visible: it DID run, and its answer still says something about the
+ * tree even though it says nothing about this turn.
+ */
+const INTERRUPTED_VERIFY_FAILED_REASON =
+	"turn was interrupted, so its work was not assessed — the parent's verify still ran and failed";
+const INTERRUPTED_VERIFY_PASSED_REASON =
+	"turn was interrupted, so its work was not assessed — the parent's verify still ran and passed";
+
+/**
  * Default verify runner: waits for a tree-wide verify slot (see
  * verify-queue.ts), then runs the command with its full timeout — queue wait
  * is not charged against `timeoutMs`.
@@ -309,6 +328,22 @@ export async function applyVerification(
 		criteria?: AcceptanceCriterion[];
 		run?: VerifyRunner;
 		timeoutMs?: number;
+		/**
+		 * demo-findings F2 / D2 (+ appendix A2): the parent ABORTED this collect's
+		 * turn — i.e. `execution.status === "aborted"` at the call site, which is the
+		 * only place that knows it. This module must never re-derive it, and the
+		 * predicate is not "anything incomplete": `unknown` (the cross-machine
+		 * path's own answer, D14) and `failed` / `truncated` keep their existing
+		 * judgement untouched.
+		 *
+		 * The commands still run; only the VERDICT changes. A red command is not a
+		 * verdict about an aborted turn's work (`rejected` would claim work nobody
+		 * measured was assessed), and a green one cannot make such a turn `verified`.
+		 * Both answers are `unknown` and say which one happened.
+		 *
+		 * Absent ⇒ every pre-D2 answer is byte-identical.
+		 */
+		interrupted?: boolean;
 	},
 ): Promise<AcceptanceResult> {
 	// No `acceptance.status === "accepted"` gate here on purpose (#393). The
@@ -386,6 +421,17 @@ export async function applyVerification(
 		}
 		const output = `${result.stdout}\n${result.stderr}`.trim();
 		if (result.code === 0) continue;
+		// demo-findings F2 / D2: a red command on an ABORTED turn is a fact about the
+		// tree, not a rejection of work that was never assessed.
+		if (opts.interrupted) {
+			return {
+				...acceptance,
+				status: "unknown",
+				level: "attested",
+				reason: INTERRUPTED_VERIFY_FAILED_REASON,
+				pendingCriteria: carried,
+			};
+		}
 		const where = result.host ? ` on host '${result.host}'` : "";
 		return {
 			...acceptance,
@@ -398,6 +444,19 @@ export async function applyVerification(
 	// The machine is part of the fact: "verified by `npm test`" on ANOTHER host is a
 	// claim about that machine's checkout, and the verdict must say so (S3).
 	const verifiedReason = `verified by ${commands.map((c) => `\`${c}\``).join(" && ")}${ranOn ? ` on host '${ranOn}'` : ""}`;
+	// demo-findings F2 / D2: the commands passed, but they judged the TREE, not a
+	// turn that never produced anything. `verified` is a claim about evidence for
+	// THIS turn's work, so it is withheld here — the fact (and whose it is) is in
+	// the reason instead.
+	if (opts.interrupted) {
+		return {
+			...acceptance,
+			status: "unknown",
+			level: "attested",
+			reason: INTERRUPTED_VERIFY_PASSED_REASON,
+			pendingCriteria: carried,
+		};
+	}
 	if (acceptance.status !== "accepted") {
 		// The commands did pass, so the level is `verified` — but the status the
 		// child reported stands verbatim, and its reason is kept alongside ours

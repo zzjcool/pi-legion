@@ -3588,6 +3588,19 @@ export class Orchestrator {
 			: await applyVerification(derived, {
 				cwd: child.worktreePath ?? this.cwd,
 				criteria: child.pendingCriteria,
+				// demo-findings F2 / D2 (+ appendix A2): whether the parent ABORTED this turn
+				// is a fact only this frame holds, so it is handed in explicitly —
+				// `acceptance.ts` must never guess it from the parsed transcript. The
+				// predicate is exactly `aborted`: that is the one `ExecutionStatus` that
+				// means "the parent interrupted this round" (the demo's `sleep 45` kill).
+				// It is NOT the other incomplete statuses — `unknown` is the cross-machine
+				// path's own answer (D14: "that machine could not measure it", reason keeps
+				// `on host '<host>'`), and `failed` / `truncated` are separate turn
+				// semantics with their own existing judgement. Widening this expression is
+				// how those three get silently re-judged. The verify still runs either way —
+				// the contract keeps that on purpose — but its answer about an aborted
+				// turn's work is `unknown`, never `rejected`.
+				interrupted: execution.status === "aborted",
 				run: remoteVerify && child.host
 					? (command, _cwd, timeoutMs) => remoteVerify({
 						host: child.host as string,

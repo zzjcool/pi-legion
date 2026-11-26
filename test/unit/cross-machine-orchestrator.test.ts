@@ -448,6 +448,11 @@ test("S3/B1: `host` + `verify` runs the command on THAT machine — never in thi
 			// The budget is the collect deadline's remainder (the pre-S3 semantics); the
 			// remote runner clamps it to hc's ceiling and announces that.
 			assert.ok((remote[0]!.timeoutMs ?? 0) > 0 && (remote[0]!.timeoutMs ?? 0) <= 900_000, `budget ${remote[0]!.timeoutMs}`);
+			// demo-findings appendix A2: this turn is `unknown` (the harness writes no
+			// transcript), NOT `aborted` — so it is not D2's interrupted turn and keeps
+			// the pre-D2 answer verbatim, `on host '<host>'` included. This case is the
+			// guard against widening the `interrupted` predicate back to every
+			// incomplete status.
 			assert.equal(collected.acceptance.level, "verified");
 			assert.match(String(collected.acceptance.reason), /on host '/);
 		} finally {
